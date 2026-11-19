@@ -1,6 +1,7 @@
 import { createHash, createPublicKey, randomUUID } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import type { IncomingMessage } from 'node:http';
+import { envValue } from '../../env.js';
 import { getDb } from '../../db/connection.js';
 import { registerMigration } from '../../db/migrations/index.js';
 import { clientAddress } from '../../modules/device-auth/gate.js';
@@ -11,7 +12,10 @@ import type { ErrorBody, ErrorCode, Peer, SessionInfo, SessionRegisterRequest } 
 export const PEER_PROTOCOL = 1;
 export const limits = {
   maxTextBytes: 32768,
-  hopLimit: 20,
+  get hopLimit() {
+    const value = Number(envValue('PEER_HOP_LIMIT'));
+    return Number.isSafeInteger(value) && value > 0 ? value : 20;
+  },
   queueTtlMs: 86400000,
   offlineQueueMax: 100,
   machineRate: { limit: 60, windowMs: 600000 },
@@ -139,7 +143,12 @@ export async function revokeMachine(id: string) {
       Date.now(),
       id,
     );
-    await db.run("UPDATE peer_sessions SET status='ended' WHERE machine_id=?", id);
+    const { endRemote } = await import('./lifecycle.js');
+    const sessions = await db.all<{ key: string }>(
+      "SELECT key FROM peer_sessions WHERE machine_id=? AND status<>'ended'",
+      id,
+    );
+    for (const session of sessions) await endRemote(id, session.key);
     return result.changes;
   });
   if (changed) {
@@ -220,6 +229,7 @@ export interface RemoteSession {
   name: string;
   project: string;
   status: SessionInfo['status'];
+  registry_json: string;
   registered_at: number;
   updated_at: number;
 }
@@ -251,14 +261,7 @@ export async function registerSession(
       project = label(request.project);
     const id = prior?.id ?? 'ps_' + randomUUID();
     let name =
-      prior &&
-      prior.project === project &&
-      JSON.parse(
-        (await db.get<{ registry_json: string }>('SELECT registry_json FROM peer_sessions WHERE id=?', id))!
-          .registry_json,
-      ).name === request.name
-        ? prior.name
-        : base;
+      prior && prior.project === project && JSON.parse(prior.registry_json).name === request.name ? prior.name : base;
     const address = () => name + '@' + project + ':' + machine.name;
     for (
       let suffix = 2;
@@ -290,15 +293,41 @@ export async function registerSession(
   meshChanged();
   return session;
 }
+const activeAgents = new WeakMap<ReturnType<typeof getDb>, Set<string>>();
+export function agentStatus(agentId: string): 'busy' | 'idle' {
+  return activeAgents.get(getDb())?.has(agentId) ? 'busy' : 'idle';
+}
+export async function refreshAgentStatus() {
+  const db = getDb();
+  const running = await db.all<{ id: string; agent_group_id: string }>(
+    `SELECT s.id,s.agent_group_id FROM sessions s JOIN mesh_members m ON m.agent_group_id=s.agent_group_id WHERE s.container_status IN ('running','idle')`,
+  );
+  const busy = new Set<string>();
+  if (running.length) {
+    const { withExistingMailboxSession } = await import('../../session-manager.js');
+    for (const s of running) {
+      if (busy.has(s.agent_group_id)) continue;
+      const record = await withExistingMailboxSession(s.agent_group_id, s.id, (m) => m.getContainerState());
+      if (record?.turn === 'working' && Date.now() - Date.parse(record.updatedAt) < 15000) busy.add(s.agent_group_id);
+    }
+  }
+  const previous = activeAgents.get(db) ?? new Set();
+  activeAgents.set(db, busy);
+  if (previous.size !== busy.size || [...busy].some((id) => !previous.has(id))) meshChanged();
+}
 export async function listPeers(): Promise<Peer[]> {
   const db = getDb();
-  const agents = await db.all<Peer>(`SELECT m.address, 'agent' AS kind, a.name, NULL AS machine,NULL AS project,
-    CASE WHEN EXISTS(SELECT 1 FROM sessions s WHERE s.agent_group_id=a.id AND s.container_status='running') THEN 'busy' ELSE 'idle' END AS status,
+  const agents = await db.all<
+    Peer & { agentId: string }
+  >(`SELECT m.agent_group_id AS agentId,m.address, 'agent' AS kind, a.name, NULL AS machine,NULL AS project,
+    'idle' AS status,
     NULL AS lastSeen FROM mesh_members m JOIN agent_groups a ON a.id=m.agent_group_id`);
   const sessions = await db.all<Peer>(`SELECT s.address,'session' AS kind,s.name,m.name AS machine,s.project,
     s.status,m.last_seen_at AS lastSeen FROM peer_sessions s JOIN peer_machines m ON m.id=s.machine_id
     WHERE s.status<>'ended' AND m.revoked_at IS NULL`);
-  return [...agents, ...sessions].sort((a, b) => a.address.localeCompare(b.address));
+  return [...agents.map(({ agentId, ...peer }) => ({ ...peer, status: agentStatus(agentId) })), ...sessions].sort(
+    (a, b) => a.address.localeCompare(b.address),
+  );
 }
 export function checkedText(text: string) {
   if (!text.trim()) fail(400, 'empty_text', 'Write a non-empty message.');
@@ -311,11 +340,13 @@ export function inboundContent(
   remote: RemoteSession,
   message: { text: string },
   replyTo?: { id: string; sender: string; text: string },
+  failureNotice = false,
 ) {
   return JSON.stringify({
     text: checkedText(message.text),
     sender: remote.address + ' (Claude Code session)',
     senderId: 'peer:' + remote.machine,
     ...(replyTo ? { replyTo } : {}),
+    ...(failureNotice ? { failureNotice: true } : {}),
   });
 }

@@ -21,3 +21,25 @@ const types = await compile(
   },
 );
 await writeFile(new URL('types.ts', dir), types);
+
+const requestSchemas = {};
+function includeSchema(name) {
+  if (Object.hasOwn(requestSchemas, name)) return;
+  const schema = components.schemas[name];
+  requestSchemas[name] = schema;
+  for (const match of JSON.stringify(schema).matchAll(/"#\/components\/schemas\/(\w+)"/g)) includeSchema(match[1]);
+}
+for (const name of [
+  'HelloRequest',
+  'SessionRegisterRequest',
+  'HumanTurnRequest',
+  'SessionEndRequest',
+  'HeartbeatRequest',
+  'ReportsRequest',
+  'SendRequest',
+])
+  includeSchema(name);
+await writeFile(
+  new URL('requests.json', dir),
+  JSON.stringify({ components: { schemas: requestSchemas } }, null, 2) + '\n',
+);

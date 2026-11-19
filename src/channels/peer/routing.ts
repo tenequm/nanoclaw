@@ -4,10 +4,13 @@ import { getSession, findSessionForAgent, createSession } from '../../db/session
 import { createMessagingGroupIfAbsent, getMessagingGroup } from '../../db/messaging-groups.js';
 import { isUniqueViolation } from '../../db/errors.js';
 import { writeSessionMessage } from '../../session-manager.js';
+import { advanceDelivery, transition, queueNotice } from './lifecycle.js';
+import { basename } from 'node:path';
 import { requestWake } from '../../request-wake.js';
 import { consumeRateLimit } from '../../modules/device-auth/rate-limit.js';
 import type { Session } from '../../types.js';
 import {
+  agentStatus,
   checkedText,
   checkEpoch,
   fail,
@@ -46,7 +49,7 @@ async function actor(id: string): Promise<Actor> {
   return {
     id,
     address: member.address,
-    status: session.container_status === 'running' ? 'busy' : 'idle',
+    status: agentStatus(session.agent_group_id),
     context: group ? group.channel_type : 'peer',
   };
 }
@@ -265,10 +268,10 @@ async function queue(sender: Actor, target: Actor, scope: string, input: Send): 
     a,
     b,
   );
-  const count = (input.origin === 'human' ? 0 : conversation!.hops) + 1;
-  if (count > limits.hopLimit)
-    fail(409, 'hop_limit', 'Conversation hop limit reached.', { hop: { count: count - 1, limit: limits.hopLimit } });
-  if (target.status === 'offline') {
+  const next = (input.origin === 'human' ? 0 : conversation!.hops) + 1;
+  const stopped = next > limits.hopLimit;
+  const count = Math.min(next, limits.hopLimit);
+  if (!stopped && target.status === 'offline') {
     const queued = await db.get<{ n: number }>(
       "SELECT COUNT(*) AS n FROM peer_messages WHERE recipient=? AND state='queued' AND expires_at>?",
       target.id,
@@ -283,7 +286,7 @@ async function queue(sender: Actor, target: Actor, scope: string, input: Send): 
   const result: SendResponse = {
     message: {
       id: input.id,
-      state: 'queued',
+      state: stopped ? 'refused' : 'queued',
       to: { address: target.address, kind: target.remote ? 'session' : 'agent', status: target.status },
       endpoint: (to ?? from)!,
       hop: { count, limit: limits.hopLimit },
@@ -291,15 +294,16 @@ async function queue(sender: Actor, target: Actor, scope: string, input: Send): 
       expiresAt: now + limits.queueTtlMs,
     },
   };
-  await db.run(
-    'UPDATE peer_conversations SET hops=?,chain=? WHERE id=?',
-    count,
-    JSON.stringify(chain),
-    conversation!.id,
-  );
+  if (!stopped)
+    await db.run(
+      'UPDATE peer_conversations SET hops=?,chain=? WHERE id=?',
+      count,
+      JSON.stringify(chain),
+      conversation!.id,
+    );
   await db.run(
     `INSERT INTO peer_messages(row_id,id,sender,recipient,sender_scope,source_id,request_hash,conversation_id,text,
-    response,state,failure_notice,notify_idle,created_at,expires_at) VALUES (?,?,?,?,?,?,?,?,?,?,'queued',?,?,?,?)`,
+    response,state,failure_notice,notify_idle,created_at,expires_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
     row,
     input.id,
     sender.id,
@@ -310,11 +314,36 @@ async function queue(sender: Actor, target: Actor, scope: string, input: Send): 
     conversation!.id,
     input.text,
     JSON.stringify(result),
+    result.message.state,
     +input.failure,
     +input.notify,
     now,
     result.message.expiresAt,
   );
+  if (stopped) {
+    const message = 'Conversation paused after ' + count + ' messages. A human turn resets the limit.';
+    for (const [recipient, other, ref] of [
+      [target, sender, from],
+      [sender, target, to],
+    ] as const) {
+      if (recipient.remote)
+        await appendEvent(
+          recipient.remote.machine_id,
+          {
+            kind: 'limit',
+            session: recipient.remote.key,
+            endpoint: ref!,
+            hop: result.message.hop,
+            stopped: { id: input.id, direction: recipient === target ? 'in' : 'out' },
+            message,
+            at: now,
+          },
+          row,
+        );
+      else if (!input.failure) await queueNotice(recipient.id, other.id, message);
+    }
+    return result;
+  }
   if (target.remote) {
     await appendEvent(
       target.remote.machine_id,
@@ -340,7 +369,7 @@ async function queue(sender: Actor, target: Actor, scope: string, input: Send): 
       conversation!.id,
       target.id,
     );
-    const content = inboundContent(sender.remote!, input, prior && { ...prior, sender: target.address });
+    const content = inboundContent(sender.remote!, input, prior && { ...prior, sender: target.address }, input.failure);
     await db.run(
       'INSERT INTO peer_inbound(id,hub_session,remote_id,content,created_at,message_row) VALUES (?,?,?,?,?,?)',
       row,
@@ -374,8 +403,15 @@ async function deliverInbound() {
   }>('SELECT * FROM peer_inbound ORDER BY rowid LIMIT 100');
   for (const job of jobs) {
     const session = await getSession(job.hub_session);
-    if (!session || !(await db.get('SELECT 1 FROM mesh_members WHERE agent_group_id=?', session.agent_group_id)))
+    if (!session || !(await db.get('SELECT 1 FROM mesh_members WHERE agent_group_id=?', session.agent_group_id))) {
+      await db.transaction(async () => {
+        const row =
+          job.message_row && (await db.get<MessageRow>('SELECT * FROM peer_messages WHERE row_id=?', job.message_row));
+        if (row) await transition(row, 'refused', 'not_member', Date.now());
+        await db.run('DELETE FROM peer_inbound WHERE id=?', job.id);
+      });
       continue;
+    }
     try {
       await writeSessionMessage(session.agent_group_id, session.id, {
         id: 'peer-' + job.id,
@@ -390,12 +426,10 @@ async function deliverInbound() {
     }
     await requestWake(session, 'inbound-message');
     await db.transaction(async () => {
-      if (job.message_row)
-        await db.run(
-          "UPDATE peer_messages SET state='accepted',sent_at=? WHERE row_id=? AND state='queued'",
-          Date.now(),
-          job.message_row,
-        );
+      if (job.message_row) {
+        const row = await db.get<MessageRow>('SELECT * FROM peer_messages WHERE row_id=?', job.message_row);
+        if (row) await advanceDelivery(row, 'accepted', null, Date.now());
+      }
       await db.run('DELETE FROM peer_inbound WHERE id=?', job.id);
     });
   }
@@ -431,7 +465,41 @@ export async function sendRemote(machineId: string, request: SendRequest, hash: 
     });
   });
   await drainInbound();
+  if (
+    result.message.state === 'refused' &&
+    (await getDb().get(
+      "SELECT 1 FROM peer_events e JOIN peer_messages m ON m.row_id=e.message_row WHERE m.sender_scope=? AND m.source_id=? AND e.kind='limit'",
+      machineId,
+      request.id,
+    ))
+  )
+    fail(409, 'hop_limit', 'Conversation is paused until a human takes part.', { hop: result.message.hop });
   return result;
+}
+
+export function peerText(content: Record<string, unknown>) {
+  const string = (value: unknown) => (typeof value === 'string' ? value : '');
+  const parts: string[] = [];
+  if (content.type === 'ask_question') {
+    parts.push(string(content.title), string(content.question));
+    if (Array.isArray(content.options))
+      for (const option of content.options) parts.push(string(option?.label ?? option));
+  } else {
+    const card = content.card as { title?: string; description?: string; children?: unknown[] } | undefined;
+    parts.push(
+      string(content.fallbackText) ||
+        string(content.text) ||
+        [card?.title, card?.description].filter(Boolean).join('\n'),
+    );
+    if (content.type === 'card' && !parts.some(Boolean)) parts.push('Card');
+    if (content.operation === 'edit') parts.unshift('Edit');
+    if (content.operation === 'reaction') parts.push('Reaction ' + string(content.emoji));
+  }
+  if (Array.isArray(content.files))
+    for (const file of content.files) {
+      if (typeof file === 'string') parts.push('[file not sent: ' + basename(file) + ']');
+    }
+  return parts.filter(Boolean).join('\n');
 }
 export async function routeAgentPeer(
   session: Session,
@@ -441,7 +509,7 @@ export async function routeAgentPeer(
   const hash = createHash('sha256')
     .update(JSON.stringify([msg.platformId, msg.content]))
     .digest('hex');
-  return getDb().transaction(async () => {
+  const result = await getDb().transaction(async () => {
     const sender = await actor(session.id);
     const old = await previous(session.id, msg.id, hash);
     if (old) return old;
@@ -462,11 +530,29 @@ export async function routeAgentPeer(
       id: randomUUID(),
       sourceId: msg.id,
       hash,
-      text: checkedText(data.text ?? ''),
+      text: peerText(data),
       origin: 'unknown',
       mode: 'bypass',
       notify: false,
       failure: data.failureNotice === true,
     });
   });
+  if (data.type === 'ask_question' && typeof data.questionId === 'string' && data.questionId === msg.id) {
+    try {
+      await writeSessionMessage(session.agent_group_id, session.id, {
+        id: 'peer-question-' + msg.id,
+        kind: 'system',
+        timestamp: new Date().toISOString(),
+        content: JSON.stringify({
+          type: 'question_response',
+          questionId: msg.id,
+          selectedOption: 'Sent as plain text. The peer can reply in the conversation.',
+        }),
+        trigger: false,
+      });
+    } catch (error) {
+      if (!isUniqueViolation(error)) throw error;
+    }
+  }
+  return result;
 }

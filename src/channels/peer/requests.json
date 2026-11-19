@@ -1,0 +1,487 @@
+{
+  "components": {
+    "schemas": {
+      "HelloRequest": {
+        "type": "object",
+        "required": [
+          "resumeEpoch",
+          "takeover",
+          "amesh",
+          "claudeCode",
+          "capabilities"
+        ],
+        "properties": {
+          "resumeEpoch": {
+            "description": "The epoch this process held before; null at process start.",
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Epoch"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "takeover": {
+            "type": "boolean",
+            "description": "True only on the first hello after the daemon process started."
+          },
+          "amesh": {
+            "type": "object",
+            "required": [
+              "version",
+              "os",
+              "arch"
+            ],
+            "properties": {
+              "version": {
+                "type": "string"
+              },
+              "os": {
+                "type": "string"
+              },
+              "arch": {
+                "type": "string"
+              }
+            }
+          },
+          "claudeCode": {
+            "type": "object",
+            "required": [
+              "versions",
+              "peerProtocol",
+              "nativeCheck"
+            ],
+            "properties": {
+              "versions": {
+                "description": "Claude Code versions seen in the registry of registered sessions.",
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "peerProtocol": {
+                "type": "integer",
+                "description": "The registry's peerProtocol the daemon checked (R24)."
+              },
+              "nativeCheck": {
+                "type": "string",
+                "const": "ok",
+                "description": "The daemon never connects with a failed startup check."
+              }
+            }
+          },
+          "capabilities": {
+            "description": "What the daemon does (open set) - receipts, idle, human-turn, later ones.",
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "Epoch": {
+        "description": "A connection epoch (contract.md section 5).",
+        "type": "integer",
+        "minimum": 1
+      },
+      "SessionRegisterRequest": {
+        "type": "object",
+        "required": [
+          "epoch",
+          "sessionId",
+          "name",
+          "nameSource",
+          "project",
+          "status",
+          "entrypoint",
+          "claudeCode",
+          "startedAt"
+        ],
+        "properties": {
+          "epoch": {
+            "$ref": "#/components/schemas/Epoch"
+          },
+          "sessionId": {
+            "type": "string",
+            "description": "Claude Code's session id, an attribute (it changes on /clear)."
+          },
+          "name": {
+            "type": "string",
+            "description": "The registry's name, before address normalisation."
+          },
+          "nameSource": {
+            "type": "string",
+            "description": "user or derived (open set)."
+          },
+          "project": {
+            "type": "string",
+            "description": "The project name (contract.md section 7)."
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "idle",
+              "busy"
+            ],
+            "description": "The registry's status; waiting and others map to busy."
+          },
+          "entrypoint": {
+            "type": "string",
+            "description": "cli or sdk-cli (open set)."
+          },
+          "claudeCode": {
+            "type": "string",
+            "description": "The session's Claude Code version."
+          },
+          "startedAt": {
+            "$ref": "#/components/schemas/Ms"
+          }
+        }
+      },
+      "Ms": {
+        "description": "Milliseconds since the Unix epoch.",
+        "type": "integer",
+        "format": "int64",
+        "minimum": 0
+      },
+      "HumanTurnRequest": {
+        "type": "object",
+        "required": [
+          "epoch",
+          "at",
+          "source"
+        ],
+        "properties": {
+          "epoch": {
+            "$ref": "#/components/schemas/Epoch"
+          },
+          "at": {
+            "$ref": "#/components/schemas/Ms"
+          },
+          "source": {
+            "type": "string",
+            "description": "prompt; later sources are additive."
+          }
+        }
+      },
+      "SessionEndRequest": {
+        "type": "object",
+        "required": [
+          "epoch",
+          "reason"
+        ],
+        "properties": {
+          "epoch": {
+            "$ref": "#/components/schemas/Epoch"
+          },
+          "reason": {
+            "type": "string",
+            "enum": [
+              "exited",
+              "excluded",
+              "not_hosted"
+            ]
+          }
+        }
+      },
+      "HeartbeatRequest": {
+        "type": "object",
+        "required": [
+          "epoch",
+          "cursor",
+          "sessions"
+        ],
+        "properties": {
+          "epoch": {
+            "$ref": "#/components/schemas/Epoch"
+          },
+          "cursor": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "The persisted low-water mark (D39): every log event at or below it is fully handled; events above it may be too. Sets sent up to it."
+          },
+          "sessions": {
+            "description": "Every registered session of this machine, complete.",
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "key",
+                "status"
+              ],
+              "properties": {
+                "key": {
+                  "$ref": "#/components/schemas/SessionKey"
+                },
+                "status": {
+                  "type": "string",
+                  "enum": [
+                    "idle",
+                    "busy"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      },
+      "SessionKey": {
+        "description": "<pid> + \"-\" + first 8 hex of SHA-256(procStart as the registry stores it) (*proposed*, contract.md section 6).",
+        "type": "string",
+        "pattern": "^[1-9][0-9]{0,9}-[0-9a-f]{8}$"
+      },
+      "ReportsRequest": {
+        "type": "object",
+        "required": [
+          "epoch",
+          "reports"
+        ],
+        "properties": {
+          "epoch": {
+            "$ref": "#/components/schemas/Epoch"
+          },
+          "reports": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 100,
+            "items": {
+              "$ref": "#/components/schemas/Report"
+            }
+          }
+        }
+      },
+      "Report": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/StateReport"
+          },
+          {
+            "$ref": "#/components/schemas/IdleReport"
+          }
+        ],
+        "discriminator": {
+          "propertyName": "kind",
+          "mapping": {
+            "state": "#/components/schemas/StateReport",
+            "idle": "#/components/schemas/IdleReport"
+          }
+        }
+      },
+      "StateReport": {
+        "type": "object",
+        "required": [
+          "kind",
+          "id",
+          "session",
+          "state",
+          "reason",
+          "at"
+        ],
+        "properties": {
+          "kind": {
+            "type": "string",
+            "const": "state"
+          },
+          "id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "session": {
+            "$ref": "#/components/schemas/SessionKey",
+            "description": "The receiving session."
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "accepted",
+              "held",
+              "delivered",
+              "denied",
+              "expired",
+              "refused",
+              "dropped",
+              "unknown"
+            ]
+          },
+          "reason": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/DropReason"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "at": {
+            "$ref": "#/components/schemas/Ms"
+          }
+        }
+      },
+      "Uuid": {
+        "description": "A message or frame id, RFC 4122 text form, lower case (it becomes the native msg_id).",
+        "type": "string",
+        "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+      },
+      "DropReason": {
+        "description": "Claude Code's guard (rate-limited, queue-full: retried after pacing, then dropped;\nduplicate, hop-loop, hop-runaway: never retried); oversized (over the native line\nlimit, refused before writing); session_gone (the inbox no longer accepts);\nunknown_session (the daemon does not host that key, L18); queue_expired (past\nqueueTtlMs, D19); ended (the target ended with it queued). Open set.",
+        "type": "string",
+        "enum": [
+          "rate-limited",
+          "queue-full",
+          "duplicate",
+          "hop-loop",
+          "hop-runaway",
+          "oversized",
+          "session_gone",
+          "unknown_session",
+          "queue_expired",
+          "ended"
+        ]
+      },
+      "IdleReport": {
+        "description": "The turn the message started has ended.",
+        "type": "object",
+        "required": [
+          "kind",
+          "id",
+          "session",
+          "at"
+        ],
+        "properties": {
+          "kind": {
+            "type": "string",
+            "const": "idle"
+          },
+          "id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "session": {
+            "$ref": "#/components/schemas/SessionKey"
+          },
+          "at": {
+            "$ref": "#/components/schemas/Ms"
+          }
+        }
+      },
+      "SendRequest": {
+        "type": "object",
+        "required": [
+          "epoch",
+          "id",
+          "from",
+          "to",
+          "text",
+          "hopChain",
+          "fromMode",
+          "origin",
+          "notifyWhenIdle",
+          "failureNotice"
+        ],
+        "properties": {
+          "epoch": {
+            "$ref": "#/components/schemas/Epoch"
+          },
+          "id": {
+            "$ref": "#/components/schemas/Uuid",
+            "description": "Minted by the sender: a new UUID for an MCP send, the reply frame's msg_id for a native reply."
+          },
+          "from": {
+            "type": "object",
+            "required": [
+              "session"
+            ],
+            "properties": {
+              "session": {
+                "$ref": "#/components/schemas/SessionKey"
+              }
+            }
+          },
+          "to": {
+            "description": "A start names an address; a native reply names the endpoint it answers.",
+            "oneOf": [
+              {
+                "type": "object",
+                "required": [
+                  "address"
+                ],
+                "properties": {
+                  "address": {
+                    "$ref": "#/components/schemas/AddressInput"
+                  }
+                }
+              },
+              {
+                "type": "object",
+                "required": [
+                  "endpoint"
+                ],
+                "properties": {
+                  "endpoint": {
+                    "$ref": "#/components/schemas/EndpointId"
+                  }
+                }
+              }
+            ]
+          },
+          "text": {
+            "description": "At least one non-whitespace character, at most maxTextBytes UTF-8 bytes, never starting with \"/\" after leading whitespace (R10, R11).",
+            "type": "string",
+            "minLength": 1
+          },
+          "hopChain": {
+            "$ref": "#/components/schemas/HopChain"
+          },
+          "fromMode": {
+            "$ref": "#/components/schemas/FromMode"
+          },
+          "origin": {
+            "description": "human resets the conversation's hop counter before counting (contract.md section 9).",
+            "type": "string",
+            "enum": [
+              "human",
+              "peer",
+              "unknown"
+            ]
+          },
+          "notifyWhenIdle": {
+            "type": "boolean",
+            "description": "Tell the sender when the target finishes the turn this message starts."
+          },
+          "failureNotice": {
+            "type": "boolean",
+            "description": "Carried both ways so error chains stop after one (r-nanoclaw)."
+          }
+        }
+      },
+      "AddressInput": {
+        "description": "An address as a sender wrote it; the hub resolves it or refuses with bad_address, not_found or ambiguous.",
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 100
+      },
+      "EndpointId": {
+        "description": "Minted by the hub; also the envelope's from-session, so it fits that grammar.",
+        "type": "string",
+        "pattern": "^pe_[A-Za-z0-9_-]{1,77}$"
+      },
+      "HopChain": {
+        "description": "Claude Code's hop-chain tokens, carried unchanged end to end; never minted or read by amesh or the hub.",
+        "type": "array",
+        "maxItems": 32,
+        "items": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{24}$"
+        }
+      },
+      "FromMode": {
+        "description": "The sending session's real permission class (R13).",
+        "type": "string",
+        "enum": [
+          "bypass",
+          "prompting"
+        ]
+      }
+    }
+  }
+}

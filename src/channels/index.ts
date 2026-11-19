@@ -17,3 +17,4 @@ import './slack-a2a.js';
 import './voice-mode.js';
 
 import './app/index.js';
+import './peer/index.js';

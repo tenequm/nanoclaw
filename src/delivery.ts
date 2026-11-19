@@ -445,7 +445,7 @@ async function completeDelivery(
     mailbox.markDelivered(msg.id, platformMsgId ?? null),
   );
   await clearAttemptRow(msg.id);
-  if (msg.kind !== 'system' && msg.channelType !== 'agent') {
+  if (msg.kind !== 'system' && msg.channelType !== 'agent' && msg.channelType !== 'peer') {
     pauseTypingRefreshAfterDelivery(session.id);
     if (msg.kind !== 'task_log') {
       // Cross-session context: echo the delivered reply into the
@@ -638,8 +638,9 @@ async function deliverMessage(
   if (msg.channelType === 'peer') {
     if (!(await hasTable(getDb(), 'peer_machines'))) throw new Error('Peer channel is not installed');
     const { routeAgentPeer } = await import('./channels/peer/routing.js');
-    await routeAgentPeer(session, msg);
-    return;
+    const reply = await routeAgentPeer(session, msg);
+    clearOutbox(session.agent_group_id, session.id, msg.id);
+    return reply.message.id;
   }
 
   // Permission check: the source agent must be allowed to deliver to this
