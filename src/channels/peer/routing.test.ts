@@ -335,6 +335,7 @@ it('reconciles an inbox write after a hub restart and reports definite delivery 
   }
   const revoked = await send();
   await setMeshMembership('agent', false);
+  await setMeshMembership('agent', true);
   await drainInbound();
   const events = await getDb().all<{ payload: string }>(
     "SELECT payload FROM peer_events WHERE kind='delivery' ORDER BY seq",

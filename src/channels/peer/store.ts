@@ -240,7 +240,11 @@ export async function setMeshMembership(agentId: string, member: boolean) {
         agentId,
         label(agent.name),
       );
-    } else await db.run('DELETE FROM mesh_members WHERE agent_group_id=?', agentId);
+    } else {
+      await db.run('DELETE FROM mesh_members WHERE agent_group_id=?', agentId);
+      const { dropAgentQueue } = await import('./lifecycle.js');
+      await dropAgentQueue(agentId);
+    }
     const endpoints = await db.all<{ id: string }>(
       'SELECT e.id FROM peer_endpoints e JOIN sessions s ON s.id=e.actor WHERE s.agent_group_id=?',
       agentId,

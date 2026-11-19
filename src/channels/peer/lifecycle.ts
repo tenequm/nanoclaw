@@ -49,6 +49,19 @@ export async function transition(row: MessageRow, state: DeliveryState, reason: 
   return true;
 }
 
+export async function dropAgentQueue(agentId: string) {
+  const db = getDb();
+  const rows = await db.all<MessageRow>(
+    `SELECT m.* FROM peer_messages m JOIN sessions s ON m.recipient=s.id
+    WHERE s.agent_group_id=? AND m.state='queued'`,
+    agentId,
+  );
+  for (const row of rows) await transition(row, 'dropped', 'not_member', Date.now());
+  await db.run(
+    'DELETE FROM peer_inbound WHERE hub_session IN (SELECT id FROM sessions WHERE agent_group_id=?)',
+    agentId,
+  );
+}
 export async function advanceDelivery(row: MessageRow, state: DeliveryState, reason: string | null, at: number) {
   if (row.state === 'queued') {
     row.sent_at = at;

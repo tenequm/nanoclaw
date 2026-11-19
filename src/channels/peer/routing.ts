@@ -443,44 +443,48 @@ export function drainInbound(): Promise<void> {
 }
 async function deliverInbound() {
   const db = getDb();
-  const jobs = await db.all<{
-    id: string;
-    hub_session: string;
-    remote_id: string;
-    content: string;
-    created_at: number;
-    message_row: string | null;
-    channel: string;
-  }>('SELECT * FROM peer_inbound ORDER BY rowid LIMIT 100');
-  for (const job of jobs) {
-    const session = await getSession(job.hub_session);
-    let failure: string | null = null;
-    if (!session || session.status !== 'active') failure = 'route_failed';
-    else if (!(await db.get('SELECT 1 FROM mesh_members WHERE agent_group_id=?', session.agent_group_id)))
-      failure = 'not_member';
-    else {
-      try {
-        await writeSessionMessage(session.agent_group_id, session.id, {
-          id: 'peer-' + job.id,
-          kind: 'chat',
-          timestamp: new Date(job.created_at).toISOString(),
-          platformId: job.remote_id,
-          channelType: job.channel,
-          content: job.content,
-        });
-      } catch (error) {
-        if (!isUniqueViolation(error)) failure = 'route_failed';
+  const jobs = await db.all<{ id: string }>('SELECT id FROM peer_inbound ORDER BY rowid LIMIT 100');
+  for (const { id } of jobs) {
+    // Membership removal and a mailbox write must agree on which side won the race.
+    const delivered = await db.transaction(async () => {
+      const job = await db.get<{
+        id: string;
+        hub_session: string;
+        remote_id: string;
+        content: string;
+        created_at: number;
+        message_row: string | null;
+        channel: string;
+      }>('SELECT * FROM peer_inbound WHERE id=?', id);
+      if (!job) return;
+      const session = await getSession(job.hub_session);
+      let failure: string | null = null;
+      if (!session || session.status !== 'active') failure = 'route_failed';
+      else if (!(await db.get('SELECT 1 FROM mesh_members WHERE agent_group_id=?', session.agent_group_id)))
+        failure = 'not_member';
+      else {
+        try {
+          await writeSessionMessage(session.agent_group_id, session.id, {
+            id: 'peer-' + job.id,
+            kind: 'chat',
+            timestamp: new Date(job.created_at).toISOString(),
+            platformId: job.remote_id,
+            channelType: job.channel,
+            content: job.content,
+          });
+        } catch (error) {
+          if (!isUniqueViolation(error)) failure = 'route_failed';
+        }
       }
-    }
-    await db.transaction(async () => {
       if (job.message_row) {
         const row = await db.get<MessageRow>('SELECT * FROM peer_messages WHERE row_id=?', job.message_row);
         if (row) await transition(row, failure ? 'dropped' : 'delivered', failure, Date.now());
       }
       await db.run('DELETE FROM peer_inbound WHERE id=?', job.id);
+      return failure ? undefined : session;
     });
-    if (!failure && session)
-      await requestWake(session, 'inbound-message').catch(() => log.warn('Peer inbox wake deferred to host sweep'));
+    if (delivered)
+      await requestWake(delivered, 'inbound-message').catch(() => log.warn('Peer inbox wake deferred to host sweep'));
   }
 }
 function hopLimitError(result: SendResponse) {

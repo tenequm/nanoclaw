@@ -1,6 +1,7 @@
 import { readFile, writeFile } from 'node:fs/promises';
 import { compile } from 'json-schema-to-typescript';
 import { parse } from 'yaml';
+import { format } from 'prettier';
 
 const dir = new URL('../src/channels/peer/', import.meta.url);
 const { components } = parse(await readFile(new URL('openapi.yaml', dir), 'utf8'));
@@ -24,7 +25,10 @@ const types = await compile(
     style: { singleQuote: true, printWidth: 120 },
   },
 );
-await writeFile(new URL('types.ts', dir), types);
+await writeFile(
+  new URL('types.ts', dir),
+  await format(types, { parser: 'typescript', singleQuote: true, printWidth: 120 }),
+);
 
 const requestSchemas = {};
 function includeSchema(name) {
