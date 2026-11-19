@@ -11,7 +11,7 @@ import { runMigrations } from '../../db/migrations/index.js';
 import { canonicalSigningText, bodySHA256 } from '../app/contract.js';
 import { parseCidrs } from '../../modules/device-auth/gate.js';
 import { dispatchPeer } from './index.js';
-import { closeStreams } from './stream.js';
+import { closeStreams, currentStream, openStream } from './stream.js';
 import { enrollMachine, revokeMachine } from './store.js';
 import * as env from '../../env.js';
 import { eventHead, sweepPeers } from './lifecycle.js';
@@ -511,6 +511,9 @@ it('notifies both native parties on the first stopped reply, then waits for a re
   const target = await b.register();
   await a.call('POST', '/peer/messages', a.send({ address: target }));
   const ep = (await getDb().get<{ id: string }>('SELECT id FROM peer_endpoints WHERE machine_id=?', b.id))!.id;
+  // A refused send may record its limit notice, but must only read the existing relays.
+  await getDb().exec(`CREATE TRIGGER reject_endpoint_write BEFORE INSERT ON peer_endpoints
+    BEGIN SELECT RAISE(ABORT,'refusal wrote an endpoint'); END`);
   for (let episode = 0; episode < 2; episode++) {
     await getDb().run('UPDATE peer_conversations SET hops=20');
     const head = await eventHead();
@@ -580,4 +583,92 @@ it('snapshots only the remaining endpoint keys, closes on the last end and reope
   await getDb().exec('DROP TRIGGER interrupt_reopen');
   await b.register(resumed);
   expect(await snapshot()).toMatchObject([{ id: ep, state: 'open', sessions: [resumed] }]);
+});
+
+it('keeps the live stream and sends no headers if the replacement snapshot fails to commit', async () => {
+  const daemon = await machine('test');
+  const stream = await daemon.replay();
+  await stream.through('synchronized');
+  const previous = currentStream(daemon.id);
+  const res = new ServerResponse(new IncomingMessage(new Socket()));
+  const db = getDb();
+  const transaction = db.transaction.bind(db);
+  const fault = vi.spyOn(db, 'transaction').mockImplementationOnce((fn) =>
+    transaction(async () => {
+      await fn();
+      throw new Error('snapshot commit failed');
+    }),
+  );
+  try {
+    await expect(openStream(res, daemon.id, daemon.epoch, 0)).rejects.toThrow('snapshot commit failed');
+    expect(res.headersSent).toBe(false);
+    expect(currentStream(daemon.id)).toBe(previous);
+  } finally {
+    fault.mockRestore();
+    await stream.close();
+  }
+});
+
+it('leaves routing state untouched when membership, target, queue or rate refuses a send', async () => {
+  const a = await machine('sender'),
+    b = await machine('receiver');
+  await a.register();
+  const address = await b.register();
+  const send = async (request: SendRequest) => (await a.call('POST', '/peer/messages', request)).json();
+  const db = getDb();
+  await db.run("UPDATE peer_sessions SET status='offline' WHERE machine_id=?", b.id);
+  const { limits } = await import('./store.js');
+  const limit = limits.offlineQueueMax;
+  try {
+    limits.offlineQueueMax = 0;
+    const snapshot = async () =>
+      db.get(`SELECT (SELECT count(*) FROM peer_endpoints) AS endpoints,
+      (SELECT count(*) FROM peer_parties) AS parties, (SELECT count(*) FROM sessions) AS sessions,
+      (SELECT count(*) FROM peer_events) AS events, (SELECT count(*) FROM peer_messages) AS messages`);
+    const before = await snapshot();
+    for (const [request, error] of [
+      [a.send({ address }, '99-12345678'), 'unknown_session'],
+      [a.send({ address: 'absent' }), 'not_found'],
+      [a.send({ address }), 'queue_full'],
+    ] as const) {
+      expect(await send(request)).toMatchObject({ error });
+      expect(await snapshot()).toEqual(before);
+    }
+    await db.run('UPDATE device_auth_rate_limits SET count=60 WHERE bucket_key=?', 'peer-send:' + a.id);
+    expect(await send(a.send({ address }))).toMatchObject({ error: 'rate_limited' });
+    expect(await snapshot()).toEqual(before);
+  } finally {
+    limits.offlineQueueMax = limit;
+  }
+});
+
+it('shares live directory and event head reads across idle streams and refreshes after changes', async () => {
+  const a = await machine('first'),
+    b = await machine('second');
+  await a.register();
+  const address = await b.register();
+  const responses = [a, b].map(() => new ServerResponse(new IncomingMessage(new Socket())));
+  const write = vi.spyOn(responses[1], 'write');
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+  try {
+    await openStream(responses[0], a.id, a.epoch, 0);
+    await openStream(responses[1], b.id, b.epoch, 0);
+    const get = vi.spyOn(getDb(), 'get');
+    const all = vi.spyOn(getDb(), 'all');
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(get.mock.calls.filter(([sql]) => sql.includes('MAX(seq)'))).toHaveLength(0);
+    expect(all.mock.calls.filter(([sql]) => sql.includes('FROM mesh_members'))).toHaveLength(0);
+    const { heartbeat } = await import('./lifecycle.js');
+    const { sendRemote } = await import('./routing.js');
+    await heartbeat(a.id, { epoch: a.epoch, cursor: 0, sessions: [{ key: a.key, status: 'busy' }] });
+    const sent = await sendRemote(a.id, a.send({ address }));
+    await vi.advanceTimersByTimeAsync(1000);
+    const wire = write.mock.calls.map(([frame]) => frame).join('');
+    expect(wire).toContain(sent.message.id);
+    expect(wire).toContain('"status":"busy"');
+  } finally {
+    closeStreams();
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  }
 });

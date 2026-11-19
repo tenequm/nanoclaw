@@ -13,16 +13,24 @@ async function directory() {
     );
     const ids = new Map(members.map((m) => [m.address, m.agent_group_id]));
     const peers = members.length ? await listPeers() : [];
+    const memberIds = new Set(ids.values());
+    const rows = peers.map(({ address, kind, machine, project, status }) => ({
+      address,
+      kind,
+      machine,
+      project,
+      status,
+      agentGroupId: ids.get(address) ?? null,
+    }));
+    const version = JSON.stringify(rows);
     return {
-      members: new Set(ids.values()),
-      peers: peers.map(({ address, kind, machine, project, status }) => ({
-        address,
-        kind,
-        machine,
-        project,
-        status,
-        agentGroupId: ids.get(address) ?? null,
-      })),
+      versionFor: (agentId: string) => (memberIds.has(agentId) ? version : ''),
+      write(agentId: string, sessionId: string, open: typeof withExistingMailboxSession) {
+        return open(agentId, sessionId, (mailbox) => {
+          mailbox.replaceMeshPeers(memberIds.has(agentId) ? rows : []);
+          return true;
+        });
+      },
     };
   });
 }
@@ -36,10 +44,8 @@ function serialize(action: () => Promise<void>) {
 
 export function writeMeshDirectory(agentGroupId: string, sessionId: string) {
   return serialize(async () => {
-    const { members, peers } = await directory();
-    await withMailboxSession(agentGroupId, sessionId, (mailbox) =>
-      mailbox.replaceMeshPeers(members.has(agentGroupId) ? peers : []),
-    );
+    const snapshot = await directory();
+    await snapshot.write(agentGroupId, sessionId, withMailboxSession);
   });
 }
 
@@ -48,20 +54,15 @@ export async function startMeshProjection(signal: AbortSignal) {
   let scheduled: Promise<void> | undefined;
   function refresh() {
     scheduled ??= serialize(async () => {
-      const { members, peers } = await directory();
-      const version = JSON.stringify(peers);
+      const snapshot = await directory();
       const sessions = await getActiveSessions();
       const active = new Set(sessions.map((s) => s.id));
       for (const id of projected.keys()) if (!active.has(id)) projected.delete(id);
       for (const { id, agent_group_id } of sessions) {
-        const member = members.has(agent_group_id);
-        const next = member ? version : '';
+        const next = snapshot.versionFor(agent_group_id);
         if (projected.get(id) === next) continue;
         try {
-          const written = await withExistingMailboxSession(agent_group_id, id, (mailbox) => {
-            mailbox.replaceMeshPeers(member ? peers : []);
-            return true;
-          });
+          const written = await snapshot.write(agent_group_id, id, withExistingMailboxSession);
           if (written) projected.set(id, next);
         } catch (err) {
           log.warn('Could not project mesh directory into session', { sessionId: id, err });

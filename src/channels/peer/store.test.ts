@@ -14,7 +14,8 @@ it('only projects host-attributed text into agent inbound content', () => {
   };
   expect(JSON.parse(inboundContent(remote, body))).toEqual({
     text: 'hello',
-    sender: 'review@repo:test (Claude Code session)',
+    sender: 'review@repo:test',
+    senderKind: 'session',
     senderId: 'peer:test',
   });
   expect(() => inboundContent(remote, { text: '  /restart' })).toThrow();

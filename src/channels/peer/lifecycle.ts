@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { log } from '../../log.js';
 import { getDb } from '../../db/connection.js';
 import { appendEvent, announceEndpoint, type MessageRow } from './routing.js';
-import { checkEpoch, fail, limits, meshChanged, remoteById, remoteSession } from './store.js';
+import { checkEpoch, fail, limits, meshChanged, remoteById, remoteSession, streamRevision } from './store.js';
 import type { DeliveryState, HeartbeatRequest, ReportsRequest, ReportsResponse, SendResponse } from './types.js';
 
 export async function queueNotice(hub: string, remote: string, text: string, channel = 'peer') {
@@ -148,6 +148,7 @@ export async function heartbeat(machineId: string, body: HeartbeatRequest) {
     return { changed, response: { unknown, ended, serverTime: now } };
   });
   if (result.changed) meshChanged();
+  else streamRevision.directory++;
   return result.response;
 }
 export async function reports(machineId: string, body: ReportsRequest) {

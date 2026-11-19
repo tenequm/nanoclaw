@@ -54,6 +54,13 @@ function insertMessage(
     );
 }
 
+it('renders a peer session kind and uses its address for replies', () => {
+  const address = 'review@repo:mac';
+  insertMessage('remote', 'chat', { sender: address, senderKind: 'session', senderId: 'peer:mac', text: 'hello' });
+  getInboundDb().prepare("UPDATE messages_in SET channel_type='peer', platform_id='ps_test'").run();
+  expect(formatMessages(getPendingMessages())).toContain(`from="${address}" sender="${address} (Claude Code session)"`);
+});
+
 describe('context timezone header', () => {
   it('prepends <context timezone="..."/> to formatted output', () => {
     insertMessage('m1', 'chat', { sender: 'Alice', text: 'hello' });

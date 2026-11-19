@@ -91,6 +91,35 @@ it('delivers a reply only to the agent session that asked, even when another ses
   setDeliveryAdapter({ deliver: external });
   await deliverSessionMessages(session);
   expect(external).not.toHaveBeenCalled();
+  // A runner can also write structured content directly to the outbound mailbox.
+  const raw = new Database(outboundDbPath(agent, session.id));
+  try {
+    raw
+      .prepare(
+        "INSERT INTO messages_out(id,timestamp,kind,platform_id,channel_type,content) VALUES ('raw',datetime('now'),'chat-sdk',?,'peer',?)",
+      )
+      .run(
+        remote.address,
+        JSON.stringify({
+          type: 'ask_question',
+          questionId: 'raw',
+          title: 'Review',
+          question: 'Ready?',
+          options: [{ label: 'Yes', value: 'hidden' }],
+          files: ['/private/report.txt'],
+          attachments: [{ data: 'private' }],
+        }),
+      );
+  } finally {
+    raw.close();
+  }
+  await deliverSessionMessages(session);
+  const event = await getDb().get<{ payload: string }>(
+    "SELECT payload FROM peer_events WHERE kind='message' ORDER BY seq DESC LIMIT 1",
+  );
+  const payload = JSON.parse(event!.payload);
+  expect(payload.text).toBe('Review\nReady?\nYes\n[file not sent: report.txt]');
+  for (const key of ['files', 'attachments', 'options']) expect(payload).not.toHaveProperty(key);
   const endpoint = await getDb().get<{ id: string }>('SELECT id FROM peer_endpoints WHERE actor=?', session.id);
   const { heartbeat } = await import('./lifecycle.js');
   const { seq } = (await getDb().get<{ seq: number }>('SELECT MAX(seq) AS seq FROM peer_events'))!;
@@ -116,17 +145,21 @@ it('delivers a reply only to the agent session that asked, even when another ses
   expect((await sendRemote(remote.id, reply)).message.state).toBe('accepted');
   const inbox = new Database(inboundDbPath(agent, session.id), { readonly: true });
   try {
-    const rows = inbox.prepare('SELECT content,channel_type FROM messages_in').all() as {
+    const rows = inbox.prepare("SELECT content,channel_type FROM messages_in WHERE kind='chat'").all() as {
       content: string;
       channel_type: string;
     }[];
+    expect(inbox.prepare("SELECT kind FROM messages_in WHERE id='peer-question-raw'").get()).toEqual({
+      kind: 'system',
+    });
     expect(rows).toHaveLength(1);
     expect(rows[0].channel_type).toBe('peer');
     expect(JSON.parse(rows[0].content)).toEqual({
       text: 'answer',
-      sender: remote.address + ' (Claude Code session)',
+      sender: remote.address,
+      senderKind: 'session',
       senderId: 'peer:test',
-      replyTo: expect.objectContaining({ text: 'question' }),
+      replyTo: expect.objectContaining({ text: payload.text }),
     });
   } finally {
     inbox.close();
@@ -360,6 +393,27 @@ it('reconciles an inbox write after a hub restart and reports definite delivery 
   await db.run("DELETE FROM schema_version WHERE name='module:peer:agent-inbox-accepted'");
   await runMigrations(db);
   expect(await stored()).toEqual({ state: 'accepted' });
+  const { sqliteRaw } = await import('../../db/drivers/sqlite.js');
+  const originalWrite = manager.writeSessionMessage;
+  const transactions: boolean[] = [];
+  let removing: Promise<void> | undefined;
+  const deliver = vi.spyOn(manager, 'writeSessionMessage').mockImplementation(async (...args) => {
+    transactions.push(sqliteRaw(getDb()).inTransaction);
+    removing = setMeshMembership('agent', false);
+    return originalWrite(...args);
+  });
+  const committed = await send();
+  try {
+    await drainInbound();
+  } finally {
+    deliver.mockRestore();
+  }
+  await removing;
+  expect(transactions).toEqual([false]);
+  expect(await db.get('SELECT state FROM peer_messages WHERE id=?', committed.message.id)).toEqual({
+    state: 'accepted',
+  });
+  await setMeshMembership('agent', true);
   const failed = await send();
   const write = vi.spyOn(manager, 'writeSessionMessage').mockRejectedValueOnce(new Error('mailbox write failed'));
   try {
@@ -376,6 +430,7 @@ it('reconciles an inbox write after a hub restart and reports definite delivery 
   );
   expect(events.map((e) => JSON.parse(e.payload))).toMatchObject([
     { id: pending.message.id, state: 'accepted', reason: null },
+    { id: committed.message.id, state: 'accepted', reason: null },
     { id: failed.message.id, state: 'dropped', reason: 'route_failed' },
     { id: revoked.message.id, state: 'dropped', reason: 'not_member' },
   ]);
@@ -411,6 +466,9 @@ it('counts both mesh agents through normal delivery, tells each side once, and r
   expect(await getDb().get('SELECT count(*) AS n FROM peer_agent_sends WHERE refused=1')).toEqual({ n: 2 });
   expect(await getDb().get('SELECT count(*) AS n FROM peer_inbound WHERE hub_session=?', a.id)).toEqual({ n: 1 });
   expect(await getDb().get('SELECT count(*) AS n FROM peer_inbound WHERE hub_session=?', b.id)).toEqual({ n: 1 });
+  expect(await getDb().get("SELECT json_extract(content,'$.text') AS text FROM peer_inbound LIMIT 1")).toEqual({
+    text: 'Conversation paused after 20 messages. A human turn resets the limit.',
+  });
   await createSession({ ...b, id: 'sess-owner-separate' });
   expect(await resetHops('sess-owner-separate')).toBe(1);
   await send(22);

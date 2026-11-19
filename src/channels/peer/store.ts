@@ -3,6 +3,7 @@ import { EventEmitter } from 'node:events';
 import type { IncomingMessage } from 'node:http';
 import type { MeshPeerRecord } from '../../mailbox/model.js';
 import { envValue } from '../../env.js';
+import { AsyncMutex } from '../../db/drivers/shared.js';
 import { getDb } from '../../db/connection.js';
 import { registerMigration } from '../../db/migrations/index.js';
 import { clientAddress } from '../../modules/device-auth/gate.js';
@@ -130,6 +131,7 @@ export function fail(status: number, error: ErrorCode, message: string, extra: P
   throw new PeerError(status, { error, message, ...extra });
 }
 
+export const streamRevision = { directory: 0, events: 0 };
 const changes = new EventEmitter();
 export function onMeshChange(listener: () => void): () => void {
   changes.on('mesh', listener);
@@ -138,6 +140,7 @@ export function onMeshChange(listener: () => void): () => void {
   };
 }
 export function meshChanged(): void {
+  streamRevision.directory++;
   changes.emit('mesh');
 }
 export function onMachineRevoked(listener: (id: string) => void): () => void {
@@ -267,7 +270,21 @@ function label(value: string) {
       .replace(/[._-]+$/, '') || 'session'
   );
 }
+// Removal must not drop a queued job between its final membership check and mailbox acknowledgement.
+const inboundDelivery = new AsyncMutex();
+export async function withInboundDelivery<T>(action: () => Promise<T>): Promise<T> {
+  const release = await inboundDelivery.acquire();
+  try {
+    return await action();
+  } finally {
+    release();
+  }
+}
 export async function setMeshMembership(agentId: string, member: boolean) {
+  if (member) await updateMembership(agentId, true);
+  else await withInboundDelivery(() => updateMembership(agentId, false));
+}
+async function updateMembership(agentId: string, member: boolean) {
   const db = getDb();
   await db.transaction(async () => {
     if (member) {
@@ -467,7 +484,8 @@ export function inboundContent(
 ) {
   return JSON.stringify({
     text: checkedText(message.text),
-    sender: remote.address + ' (Claude Code session)',
+    sender: remote.address,
+    senderKind: 'session',
     senderId: 'peer:' + remote.machine,
     ...(replyTo ? { replyTo } : {}),
     ...(failureNotice ? { failureNotice: true } : {}),

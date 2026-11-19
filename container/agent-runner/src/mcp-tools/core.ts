@@ -238,6 +238,9 @@ export const sendFile: McpToolDefinition = {
     const routing = resolveRouting(to);
     if ('error' in routing) return err(routing.error);
 
+    const resolvedPath = path.isAbsolute(filePath) ? filePath : path.resolve('/workspace/agent', filePath);
+    if (!fs.existsSync(resolvedPath)) return err(`File not found: ${filePath}`);
+
     if (routing.channel_type === 'peer') {
       const filename = path.basename((args.filename as string) || filePath);
       const seq = await writeMessageOut({
@@ -252,9 +255,6 @@ export const sendFile: McpToolDefinition = {
       });
       return ok(`Sent file description to ${routing.resolvedName} (id: ${seq})`);
     }
-    const resolvedPath = path.isAbsolute(filePath) ? filePath : path.resolve('/workspace/agent', filePath);
-    if (!fs.existsSync(resolvedPath)) return err(`File not found: ${filePath}`);
-
     const id = generateId();
     const filename = (args.filename as string) || path.basename(resolvedPath);
 

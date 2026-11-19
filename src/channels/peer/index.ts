@@ -22,6 +22,7 @@ import {
   PeerError,
   PEER_PROTOCOL,
   registerSession,
+  streamRevision,
   refreshAgentStatus,
   remoteSession,
   verifyPeerRequest,
@@ -95,6 +96,7 @@ async function hello(machineId: string, body: HelloRequest) {
       },
     };
   });
+  streamRevision.directory++;
   old?.close(
     old.epoch === response.epoch
       ? undefined

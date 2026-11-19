@@ -483,7 +483,8 @@ export class SqliteAgentMailbox implements AgentMailbox {
     const writableOutbound = () => (outboundWriter ??= openOutboundDbRw(sessionMailboxPath(key, 'outbound')));
     try {
       if (!this.migrated.has(inboundPath)) {
-        inbound.exec(MESH_PEERS_SCHEMA);
+        if (!inbound.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='mesh_peers'").get())
+          inbound.exec(MESH_PEERS_SCHEMA);
         migrateMessagesInTable(inbound);
         const deliveredColumns = inbound.prepare("PRAGMA table_info('delivered')").all();
         if (deliveredColumns.length > 0) migrateDeliveredTable(inbound);

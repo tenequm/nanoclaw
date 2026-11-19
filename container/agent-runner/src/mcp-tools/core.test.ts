@@ -442,7 +442,12 @@ it('sends a file description to a remote session without staging the attachment'
   getInboundDb()
     .prepare('INSERT INTO mesh_peers VALUES (?, ?, ?, ?, ?, ?)')
     .run('review@repo:mac', 'session', 'mac', 'repo', 'idle', null);
-  const result = await sendFile.handler({ to: 'review@repo', path: '/workspace/agent/diagram.png', text: 'Diagram' });
+  const file = path.join(agentDir, 'diagram.png');
+  const missing = await sendFile.handler({ to: 'review@repo', path: file });
+  expect(missing.isError).toBe(true);
+  expect(getUndeliveredMessages()).toHaveLength(0);
+  fs.writeFileSync(file, 'test');
+  const result = await sendFile.handler({ to: 'review@repo', path: file, text: 'Diagram' });
   expect(result.isError).toBeFalsy();
   expect(JSON.parse(getUndeliveredMessages()[0].content)).toEqual({
     text: 'Diagram\nFile: diagram.png (peer messages are text only)',

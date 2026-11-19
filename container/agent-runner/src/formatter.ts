@@ -283,13 +283,21 @@ function formatSingleChat(msg: MessageInRow): string {
   const attachmentsSuffix = formatAttachments(content.attachments);
   const appContextSuffix = formatAppContext(content.app_context);
 
-  const peerAddress = msg.channel_type === 'peer' && typeof content.sender === 'string'
-    ? /^([a-z0-9][a-z0-9._-]*@[a-z0-9][a-z0-9._-]*:[a-z0-9-]+) \(Claude Code session\)$/.exec(content.sender)?.[1]
-    : undefined;
+  let displaySender = sender;
+  let peerAddress: string | undefined;
+  if (msg.channel_type === 'peer' && typeof content.sender === 'string') {
+    if (content.senderKind === 'session') {
+      peerAddress = content.sender;
+      displaySender = `${content.sender} (Claude Code session)`;
+    } else if (!content.senderKind && content.sender.endsWith(' (Claude Code session)')) {
+      // Mailbox rows written before senderKind already contain the display label.
+      peerAddress = content.sender.split(' ', 1)[0];
+    }
+  }
   const fromAttr = peerAddress ? ` from="${escapeXml(peerAddress)}"` : originAttr(msg);
   const userAttr = senderAttrs(msg, content);
 
-  return `<message${idAttr}${fromAttr} sender="${escapeXml(sender)}"${userAttr} time="${escapeXml(time)}"${replyAttr}>${replyPrefix}${escapeXml(text)}${linksSuffix}${attachmentsSuffix}${appContextSuffix}</message>`;
+  return `<message${idAttr}${fromAttr} sender="${escapeXml(displaySender)}"${userAttr} time="${escapeXml(time)}"${replyAttr}>${replyPrefix}${escapeXml(text)}${linksSuffix}${attachmentsSuffix}${appContextSuffix}</message>`;
 }
 
 /**

@@ -1,6 +1,6 @@
 import type { ServerResponse } from 'node:http';
 import { getDb } from '../../db/connection.js';
-import { checkEpoch, fail, limits, listPeers, onMachineRevoked, type Machine } from './store.js';
+import { checkEpoch, fail, limits, listPeers, onMachineRevoked, streamRevision, type Machine } from './store.js';
 import { eventHead } from './lifecycle.js';
 import type { Peer, PeerEvent } from './types.js';
 
@@ -26,11 +26,28 @@ function frame(event: PeerEvent, snapshot = false) {
   const id = !snapshot && 'seq' in event && event.kind !== 'synchronized' ? 'id: ' + event.seq + '\n' : '';
   return id + 'event: ' + event.kind + '\ndata: ' + JSON.stringify(event) + '\n\n';
 }
+function sharedRead<T>(key: keyof typeof streamRevision, read: () => Promise<T>) {
+  let cache: { db: ReturnType<typeof getDb>; revision: number; value: Promise<T> } | undefined;
+  return () => {
+    const db = getDb(),
+      revision = streamRevision[key];
+    if (cache?.db === db && cache.revision === revision) return cache.value;
+    // Serialize the read with writes that invalidate inside a transaction, including rolled-back writes.
+    const value = db.transaction(read).catch((error) => {
+      if (cache?.value === value) cache = undefined;
+      throw error;
+    });
+    cache = { db, revision, value };
+    return value;
+  };
+}
+const liveHead = sharedRead('events', eventHead);
+const liveDirectory = sharedRead('directory', listPeers);
+
 export async function openStream(res: ServerResponse, machineId: string, epoch: number, after: number) {
   const db = getDb();
   let cursor = after;
-  let replayHead = 0;
-  let initialDirectory: Peer[] = [];
+  let lastDirectory: Peer[] | undefined;
   let directory = new Map<string, Peer>();
   let closed = false,
     timer: NodeJS.Timeout | undefined,
@@ -77,6 +94,8 @@ export async function openStream(res: ServerResponse, machineId: string, epoch: 
     }
   }
   function status(peers: Peer[]) {
+    if (lastDirectory === peers) return;
+    lastDirectory = peers;
     const current = new Map(peers.map((p) => [p.address, p]));
     for (const [address, peer] of directory)
       if (!current.has(address)) write(frame({ kind: 'status', peer, listed: false }));
@@ -87,8 +106,8 @@ export async function openStream(res: ServerResponse, machineId: string, epoch: 
   }
   async function tick() {
     try {
-      await events(await eventHead());
-      status(await listPeers());
+      await events(await liveHead());
+      status(await liveDirectory());
       if (Date.now() - lastPing >= limits.keepaliveMs) {
         await db.run('UPDATE peer_machines SET epoch_seen_at=? WHERE id=? AND epoch=?', Date.now(), machineId, epoch);
         write(': ping\n\n');
@@ -99,21 +118,11 @@ export async function openStream(res: ServerResponse, machineId: string, epoch: 
       close();
     }
   }
-  await db.transaction(async () => {
+  const { replayHead, initialDirectory, endpoints } = await db.transaction(async () => {
     await checkEpoch(machineId, epoch);
-    replayHead = await eventHead();
-    initialDirectory = await listPeers();
+    const replayHead = await eventHead();
     if (after > replayHead) fail(400, 'bad_cursor', 'Cursor exceeds the event log head.', { seq: replayHead });
-    if (res.destroyed) {
-      closed = true;
-      return;
-    }
-    streams.get(machineId)?.close();
-    streams.set(machineId, { epoch, close });
-    res.once('close', () => close());
-    res.once('error', () => close());
-    res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no' });
-    res.flushHeaders();
+    const initialDirectory = await listPeers();
     const endpoints = await db.all<{ seq: number; payload: string }>(
       `
       SELECT seq,payload FROM peer_events WHERE seq IN (SELECT MAX(seq) FROM peer_events
@@ -121,9 +130,17 @@ export async function openStream(res: ServerResponse, machineId: string, epoch: 
       AND json_extract(payload,'$.state')='open' ORDER BY seq`,
       machineId,
     );
-    for (const e of endpoints) write(frame({ ...JSON.parse(e.payload), seq: e.seq }, true));
+    return { replayHead, initialDirectory, endpoints };
   });
+  if (res.destroyed) return;
+  streams.get(machineId)?.close();
+  streams.set(machineId, { epoch, close });
+  res.once('close', () => close());
+  res.once('error', () => close());
   try {
+    res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no' });
+    res.flushHeaders();
+    for (const e of endpoints) write(frame({ ...JSON.parse(e.payload), seq: e.seq }, true));
     await events(replayHead);
     status(initialDirectory);
     write(frame({ kind: 'synchronized', seq: replayHead }));
