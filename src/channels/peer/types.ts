@@ -962,7 +962,9 @@ export interface HookInputPreToolUse {
   agent_id?: string;
   agent_type?: string;
   tool_name: string;
-  tool_input?: {};
+  tool_input?: {
+    [k: string]: unknown;
+  };
   tool_use_id?: string;
 }
 /**
@@ -1117,7 +1119,9 @@ export interface McpCallToolResult {
       text: string;
     }[],
   ];
-  structuredContent: {};
+  structuredContent: {
+    [k: string]: unknown;
+  };
   isError: false;
 }
 /**
