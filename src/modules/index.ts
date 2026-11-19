@@ -29,4 +29,3 @@ import './community-portal/index.js';
 import './slack-room-membership/index.js';
 import './slack-onboarding/index.js';
 import './mailbox-http/index.js';
-import '../channels/peer/directory.js';

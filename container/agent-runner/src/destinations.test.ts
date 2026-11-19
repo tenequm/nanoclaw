@@ -86,9 +86,7 @@ describe('buildSystemPromptAddendum — multi-destination routing guidance', () 
 
     const prompt = buildSystemPromptAddendum('Casa', { kind: 'task', taskId: 'weekly-report' });
 
-    expect(prompt).toContain(
-      'For user-visible escalation output, default to your own channel destination(s): `casa`',
-    );
+    expect(prompt).toContain('For user-visible escalation output, default to your own channel destination(s): `casa`');
     expect(prompt).toContain(
       'Use an agent-type destination like `parent` only when the task explicitly calls for routing through another agent, not as your default escalation path.',
     );
@@ -131,4 +129,14 @@ describe('buildSystemPromptAddendum — reading messages', () => {
     expect(prompt).not.toContain('Reading messages');
     expect(prompt).not.toContain('cross-session-context');
   });
+});
+
+it('resolves a mesh reply tag and its agent sender without adding the directory to the prompt', async () => {
+  const { findByName, findByRouting } = await import('./destinations.js');
+  getInboundDb()
+    .prepare('INSERT INTO mesh_peers VALUES (?, ?, ?, ?, ?, ?)')
+    .run('reviewer', 'agent', null, null, 'busy', 'ag-reviewer');
+  expect(findByName('reviewer')).toEqual(findByRouting('agent', 'ag-reviewer'));
+  expect(findByName('reviewer')).toMatchObject({ type: 'agent', name: 'reviewer', agentGroupId: 'ag-reviewer' });
+  expect(buildSystemPromptAddendum('Test')).not.toContain('reviewer');
 });

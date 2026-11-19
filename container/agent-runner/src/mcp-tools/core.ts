@@ -9,8 +9,7 @@
 import fs from 'fs';
 import path from 'path';
 
-import { getAgentMailbox } from '../mailbox/index.js';
-import { findByName, getAllDestinations } from '../destinations.js';
+import { getMeshPeers, resolveNamedDestination, getAllDestinations } from '../destinations.js';
 import { getMessageIdBySeq, getRoutingBySeq, writeMessageOut } from '../db/messages-out.js';
 import { getCurrentInReplyTo, getCurrentReplyRoute } from '../db/session-state.js';
 import { resolveDestinationThread } from '../db/session-routing.js';
@@ -50,19 +49,8 @@ function destinationList(): string {
 function resolveRouting(
   to: string,
 ): { channel_type: string; platform_id: string; thread_id: string | null; resolvedName: string } | { error: string } {
-  const peers = getAgentMailbox().operations.getMeshPeers();
-  const matches = peers.filter((p) => p.address === to || (p.kind === 'session' && p.address.split(':')[0] === to));
-  if (matches.length > 1)
-    return { error: `Ambiguous peer "${to}". Choose one: ${matches.map((p) => p.address).join(', ')}` };
-  const peer = matches[0];
-  if (peer)
-    return {
-      channel_type: peer.kind === 'agent' ? 'agent' : 'peer',
-      platform_id: peer.agentGroupId ?? peer.address,
-      thread_id: null,
-      resolvedName: peer.address,
-    };
-  const dest = findByName(to);
+  const dest = resolveNamedDestination(to);
+  if (dest && 'error' in dest) return dest;
   if (!dest) return { error: `Unknown destination "${to}". Known: ${destinationList()}` };
   if (dest.type === 'channel') {
     return {
@@ -70,10 +58,10 @@ function resolveRouting(
       platform_id: dest.platformId!,
       thread_id:
         resolveDestinationThread(dest.channelType!, dest.platformId!, getCurrentReplyRoute())?.threadId ?? null,
-      resolvedName: to,
+      resolvedName: dest.name,
     };
   }
-  return { channel_type: 'agent', platform_id: dest.agentGroupId!, thread_id: null, resolvedName: to };
+  return { channel_type: 'agent', platform_id: dest.agentGroupId!, thread_id: null, resolvedName: dest.name };
 }
 
 /** The platform id and routing of a message the agent names by its seq. */
@@ -97,15 +85,13 @@ export const listPeers: McpToolDefinition = {
     inputSchema: { type: 'object', properties: {} },
   },
   async handler() {
-    const peers = getAgentMailbox()
-      .operations.getMeshPeers()
-      .map(({ address, kind, machine, project, status }) => ({
-        address,
-        kind,
-        machine,
-        project,
-        status,
-      }));
+    const peers = getMeshPeers().map(({ address, kind, machine, project, status }) => ({
+      address,
+      kind,
+      machine,
+      project,
+      status,
+    }));
     return ok(JSON.stringify({ peers }));
   },
 };

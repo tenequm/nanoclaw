@@ -43,7 +43,7 @@ export function writeMeshDirectory(agentGroupId: string, sessionId: string) {
   });
 }
 
-onHostStart(async ({ signal }) => {
+export async function startMeshProjection(signal: AbortSignal) {
   const projected = new Map<string, string>();
   let scheduled: Promise<void> | undefined;
   function refresh() {
@@ -72,7 +72,7 @@ onHostStart(async ({ signal }) => {
     });
     return scheduled;
   }
-  // Container busy/idle changes also affect the directory, independently of store events.
+  // Reconcile missed changes and retry mailboxes that were unavailable during an event.
   const update = () => {
     void refresh().catch(() => {});
   };
@@ -89,5 +89,7 @@ onHostStart(async ({ signal }) => {
     { once: true },
   );
   await refresh();
-});
+}
+
+onHostStart(({ signal }) => startMeshProjection(signal));
 onHostShutdown(() => tail);
