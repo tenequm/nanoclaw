@@ -65,8 +65,8 @@ afterAll(() => {
 });
 
 describe('readTranscriptStats', () => {
-  it('accumulates output + turns and dedupes by message.id, context = last turn', () => {
-    const stats = readTranscriptStats(AGENT, null);
+  it('accumulates output + turns and dedupes by message.id, context = last turn', async () => {
+    const stats = await readTranscriptStats(AGENT, null);
     expect(stats).not.toBeNull();
     if (!stats) throw new Error('expected stats');
     // msg_a counted once + msg_b -> 2 turns.
@@ -77,7 +77,34 @@ describe('readTranscriptStats', () => {
     expect(stats.contextTokens).toBe(220);
   });
 
-  it('returns null for a group with no transcript tree', () => {
-    expect(readTranscriptStats('no-such-group', null)).toBeNull();
+  it('reads a compact boundary across blocks, preserves totals and resumes on the next assistant turn', async () => {
+    const group = 'compact-agent';
+    const dir = path.join(TMP, group, '.claude-shared', 'projects', '-workspace-agent');
+    fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, 'compact.jsonl');
+    fs.writeFileSync(file, assistant('first', { input_tokens: 80000, output_tokens: 14 }) + '\n');
+    expect((await readTranscriptStats(group, null))?.contextTokens).toBe(80000);
+    for (const postTokens of [940, undefined, 0]) {
+      const boundary = {
+        type: 'system',
+        subtype: 'compact_boundary',
+        compactMetadata: { preTokens: 80000, postTokens },
+      };
+      fs.appendFileSync(
+        file,
+        JSON.stringify(boundary) + '\n' + JSON.stringify({ type: 'user', padding: 'à'.repeat(66000) }) + '\n',
+      );
+      expect(await readTranscriptStats(group, null)).toEqual({
+        contextTokens: postTokens ?? null,
+        turns: 1,
+        outputTokens: 14,
+      });
+    }
+    fs.appendFileSync(file, assistant('next', { input_tokens: 1120, output_tokens: 2 }) + '\n');
+    expect(await readTranscriptStats(group, null)).toEqual({ contextTokens: 1120, turns: 2, outputTokens: 16 });
+  });
+
+  it('returns null for a group with no transcript tree', async () => {
+    expect(await readTranscriptStats('no-such-group', null)).toBeNull();
   });
 });

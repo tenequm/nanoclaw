@@ -115,18 +115,20 @@ export interface AgentStatus {
   agent: AgentSettings;
   session: {
     contextTokens: number | null;
-    contextWindow: number | null;
+    contextWindow: number;
     turns: number | null;
     outputTokens: number | null;
-    queueDepth: number | null;
+    queueDepth: number;
   };
-  taskCount: number | null;
+  taskCount: number;
   options: { models: { id: string; label: string }[]; efforts: readonly string[] };
 }
 export interface AgentStatusResponse {
   status: AgentStatus;
 }
-export type AgentSettingsRequest = { model: string; effort?: string } | { model?: string; effort: string };
+export type AgentSettingsRequest =
+  | { model: string | null; effort?: string | null }
+  | { model?: string | null; effort: string | null };
 export interface AgentSettingsResponse {
   agent: AgentSettings;
 }

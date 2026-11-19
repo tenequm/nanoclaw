@@ -248,7 +248,9 @@ export function wrapSqliteInbound(db: Database.Database, nextSequence = () => ne
     countLiveTasks: () =>
       (
         db
-          .prepare("SELECT COUNT(*) AS count FROM messages_in WHERE kind = 'task' AND status IN ('pending', 'paused')")
+          .prepare(
+            "SELECT COUNT(*) AS count FROM (SELECT 1 FROM messages_in WHERE kind = 'task' AND status IN ('pending', 'paused') GROUP BY series_id)",
+          )
           .get() as { count: number }
       ).count,
     prunePendingMessages: (channelType, before, keep) => {

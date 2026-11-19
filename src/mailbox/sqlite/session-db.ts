@@ -105,17 +105,12 @@ export function insertMessage(db: Database.Database, message: InboundWrite, sequ
   });
 }
 
+export const DUE_MESSAGE_COUNT_SQL = `SELECT COUNT(*) as count FROM messages_in
+  WHERE status = 'pending' AND trigger = 1
+    AND (process_after IS NULL OR datetime(process_after) <= datetime('now'))`;
+
 export function countDueMessages(db: Database.Database): number {
-  return (
-    db
-      .prepare(
-        `SELECT COUNT(*) as count FROM messages_in
-       WHERE status = 'pending'
-         AND trigger = 1
-         AND (process_after IS NULL OR datetime(process_after) <= datetime('now'))`,
-      )
-      .get() as { count: number }
-  ).count;
+  return (db.prepare(DUE_MESSAGE_COUNT_SQL).get() as { count: number }).count;
 }
 
 export function markMessageFailed(db: Database.Database, messageId: string): void {

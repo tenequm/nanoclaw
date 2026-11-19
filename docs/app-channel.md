@@ -84,17 +84,24 @@ item, the host returns `409 nothing_unread`.
 Hosts advertise `agent-status` and `agent-settings` in hello. Status reports the agent's
 model, install default, effort and available choices, with usage for this conversation.
 A null model id inherits the install default. If both ids are null the provider chooses
-the model. Session figures are null until the host can read a turn for this session.
+the model. A null provider means Claude. Other providers have an empty `options.models`
+list, so the app hides the model rows. The host always reports the configured context
+window (165000 by default) and this conversation's queue depth (zero before a session
+exists). Turns, output tokens and context tokens are null until usage is available.
+After compaction, context tokens use the boundary's post-compaction size. If the SDK
+omits that size, context tokens stay null until the next usage record. Task count is the
+agent's pending or paused task series, updated on task changes and host reconciliation.
 
 Send one or both of `model` and `effort` to update the agent across its chats. Model aliases
-and raw ids follow the same rules as `/model`. A changed setting stops the agent's running
+and raw ids follow the same rules as `/model`. Send null for either field to restore its
+host default. Omitted fields keep their stored values. A changed setting stops the agent's running
 containers once. They start with the new settings on the next message. Repeating the same
 settings leaves active turns running. To compact a Claude session, send `/compact` as an
 ordinary chat message. It appears in the thread as the person's message.
 
 Both routes return `404 not_found` outside the device's reach. A settings write returns
 `403 forbidden` if the command service denies admin access, or `400 invalid_value`
-with the rejected field and its allowed choices.
+with the rejected field and the same choice ids shown in its options list.
 
 ## Routes
 

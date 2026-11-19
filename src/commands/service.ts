@@ -23,7 +23,6 @@
  * Typography rule for this module: ASCII only in user-facing strings and
  * comments. Emoji are allowed as UI glyphs (none used here).
  */
-import fs from 'fs';
 
 import { getRegisteredChannelNames } from '../channels/channel-registry.js';
 import { restartAgentGroupContainers } from '../container-restart.js';
@@ -36,18 +35,12 @@ import {
   getMessagingGroupAgents,
   updateMessagingGroupAgent,
 } from '../db/messaging-groups.js';
-import {
-  findSessionByAgentGroup,
-  findSessionForAgent,
-  findTaskSessions,
-  getSessionsByAgentGroup,
-} from '../db/sessions.js';
+import { findSessionByAgentGroup, findSessionForAgent, getSessionsByAgentGroup } from '../db/sessions.js';
 import { log } from '../log.js';
-import { inboundDbPath } from '../mailbox/sqlite/paths.js';
-import { countDueMessages, openInboundDb } from '../mailbox/sqlite/session-db.js';
 import { hasAdminPrivilege } from '../modules/permissions/db/user-roles.js';
 import type { ContainerConfigRow, EngageMode, Session } from '../types.js';
-import { readTranscriptStats } from './transcript.js';
+import { activeSessionCounts } from '../modules/scheduling/task-count.js';
+import { readSessionStatus } from './transcript.js';
 import {
   describeModel,
   isEffortLevel,
@@ -70,7 +63,6 @@ import {
   type ModelPickerView,
   type RestartView,
   type StatusChatContext,
-  type StatusView,
   type TargetAgent,
   type TargetResolution,
 } from './types.js';
@@ -168,53 +160,6 @@ async function findChatSession(agentGroupId: string, chatCtx: StatusChatContext)
   return (await findSessionForAgent(agentGroupId, chatCtx.messagingGroupId, null)) ?? null;
 }
 
-/** Undelivered (due) inbound messages for a session, or null on any error. */
-function safeQueueDepth(agentGroupId: string, sessionId: string): number | null {
-  try {
-    const dbPath = inboundDbPath(agentGroupId, sessionId);
-    if (!fs.existsSync(dbPath)) return null;
-    const db = openInboundDb(dbPath);
-    try {
-      return countDueMessages(db);
-    } finally {
-      db.close();
-    }
-  } catch (err) {
-    log.debug('Queue depth read failed', { agentGroupId, sessionId, err: String(err) });
-    return null;
-  }
-}
-
-/** Active (pending/paused) scheduled task series for an agent group, or null. */
-async function safeTaskCount(agentGroupId: string): Promise<number | null> {
-  try {
-    let total = 0;
-    for (const s of await findTaskSessions(agentGroupId)) {
-      const dbPath = inboundDbPath(agentGroupId, s.id);
-      if (!fs.existsSync(dbPath)) continue;
-      const db = openInboundDb(dbPath);
-      try {
-        const row = db
-          .prepare(
-            `SELECT COUNT(*) AS c FROM (
-               SELECT 1 FROM messages_in
-                WHERE kind = 'task' AND status IN ('pending', 'paused')
-                GROUP BY series_id
-             )`,
-          )
-          .get() as { c: number };
-        total += row.c;
-      } finally {
-        db.close();
-      }
-    }
-    return total;
-  } catch (err) {
-    log.debug('Task count read failed', { agentGroupId, err: String(err) });
-    return null;
-  }
-}
-
 // --- Reads ---
 
 export async function getAgentConfigStatus(agentGroupId: string) {
@@ -248,34 +193,43 @@ export async function getAgentConfigStatus(agentGroupId: string) {
  * context/output/turn counts. Without it, activation + queue are omitted and
  * the transcript falls back to the group's newest .jsonl.
  */
-export async function getStatus(agentGroupId: string, chatCtx?: StatusChatContext): Promise<CommandResult<StatusView>> {
+export async function getStatus(agentGroupId: string, chatCtx?: StatusChatContext) {
   const config = await getAgentConfigStatus(agentGroupId);
   if (!config.ok) return config;
-  const activeSessions = (await getSessionsByAgentGroup(agentGroupId)).filter((s) => s.status === 'active');
+  const counts = await activeSessionCounts(agentGroupId);
 
   let activation: ActivationView | null = null;
-  let queueDepth: number | null = null;
+
   let session: Session | null = null;
   if (chatCtx) {
-    activation = await activationFor(chatCtx.messagingGroupId, agentGroupId);
-    session = await findChatSession(agentGroupId, chatCtx);
-    if (session) queueDepth = safeQueueDepth(agentGroupId, session.id);
+    if (chatCtx.transcriptScope === 'session') {
+      session = (await findSessionForAgent(agentGroupId, chatCtx.messagingGroupId, chatCtx.threadId)) ?? null;
+    } else {
+      activation = await activationFor(chatCtx.messagingGroupId, agentGroupId);
+      session = await findChatSession(agentGroupId, chatCtx);
+    }
   }
 
-  const stats = readTranscriptStats(agentGroupId, session?.id ?? null, chatCtx?.transcriptScope);
+  const claude = config.view.provider === null || config.view.provider === 'claude';
+  const { stats, queueDepth } = await readSessionStatus(
+    agentGroupId,
+    session?.id ?? null,
+    chatCtx?.transcriptScope,
+    claude,
+  );
 
-  const view: StatusView = {
+  const view = {
     ...config.view,
-    sessionCount: activeSessions.length,
+    sessionCount: counts.sessions,
     activation,
     contextTokens: stats?.contextTokens ?? null,
     contextWindow: config.view.autoCompactWindow ?? DEFAULT_AUTO_COMPACT_WINDOW,
     sessionOutputTokens: stats?.outputTokens ?? null,
     sessionTurns: stats?.turns ?? null,
     queueDepth,
-    taskCount: await safeTaskCount(agentGroupId),
+    taskCount: counts.tasks,
   };
-  return { ok: true, view };
+  return { ok: true as const, view };
 }
 
 /** Model picker data: current model plus catalog options with an active flag. */
@@ -333,9 +287,9 @@ export async function getConfigView(
  */
 export async function setModel(
   agentGroupId: string,
-  modelIdOrAlias: string,
+  modelIdOrAlias: string | null,
   actorUserId: string,
-  effort?: string,
+  effort?: string | null,
 ): Promise<CommandResult<ModelChangeView>> {
   const result = await writeConfigValue(agentGroupId, 'model', modelIdOrAlias, actorUserId, effort);
   if (!result.ok) return result;
@@ -346,7 +300,7 @@ export async function setModel(
       agentName,
       agentGroupId,
       previous: describeModel(previous === null ? null : String(previous)),
-      current: describeModel(String(current)),
+      current: describeModel(current === null ? null : String(current)),
       containersKilled,
     },
   };
@@ -364,90 +318,107 @@ export async function setModel(
 export async function setConfigValue(
   agentGroupId: string,
   field: ConfigField,
-  value: string,
+  value: string | null,
   actorUserId: string,
 ): Promise<CommandResult<ConfigChangeView>> {
   return writeConfigValue(agentGroupId, field, value, actorUserId);
 }
 
+type ConfigColumn = 'model' | 'effort' | 'auto_compact_window' | 'max_messages_per_prompt';
+
+function validateConfigChange(field: ConfigField, value: string | null, effort?: string | null) {
+  const updates: Partial<Pick<ContainerConfigRow, ConfigColumn>> = {};
+  const effortInput = field === 'effort' ? value : effort;
+  if (effortInput !== undefined) {
+    const level = effortInput?.trim().toLowerCase() ?? null;
+    if (level !== null && !isEffortLevel(level))
+      return fail('invalid-value', { field: 'effort', value: effortInput ?? undefined, allowed: EFFORT_LEVELS });
+    updates.effort = level;
+  }
+  let column: ConfigColumn;
+  switch (field) {
+    case 'model': {
+      column = 'model';
+      const resolved = value === null ? { ok: true as const, id: null } : resolveModelInput(value);
+      if (!resolved.ok)
+        return fail('invalid-value', { field, value: value ?? undefined, allowed: MODEL_CATALOG.map((m) => m.alias) });
+      updates.model = resolved.id;
+      break;
+    }
+    case 'effort':
+      column = 'effort';
+      break;
+    case 'auto-compact-window':
+    case 'max-messages-per-prompt': {
+      const parsed = value === null ? null : parsePositiveInt(value);
+      if (parsed === null)
+        return fail('invalid-value', {
+          field,
+          value: value ?? undefined,
+          allowed: field === 'auto-compact-window' ? COMPACT_WINDOW_PRESETS : undefined,
+        });
+      column = field === 'auto-compact-window' ? 'auto_compact_window' : 'max_messages_per_prompt';
+      updates[column] = parsed;
+      break;
+    }
+    default:
+      return fail('unknown-field', { field: String(field) });
+  }
+  return { ok: true as const, updates, column };
+}
+
 async function writeConfigValue(
   agentGroupId: string,
   field: ConfigField,
-  value: string,
+  value: string | null,
   actorUserId: string,
-  effort?: string,
+  effort?: string | null,
 ): Promise<CommandResult<ConfigChangeView>> {
+  const change = validateConfigChange(field, value, effort);
+  if (!change.ok) {
+    if (!(await getAgentGroup(agentGroupId))) return fail('unknown-agent');
+    if (!(await hasAdminPrivilege(actorUserId, agentGroupId))) return fail('unauthorized');
+    return change;
+  }
+  const { column, updates } = change;
   const result = await getDb().transaction(async () => {
     const ag = await getAgentGroup(agentGroupId);
     if (!ag) return fail('unknown-agent');
     if (!(await hasAdminPrivilege(actorUserId, agentGroupId))) return fail('unauthorized');
 
     const before = await getContainerConfig(agentGroupId);
-    const updates: Partial<
-      Pick<ContainerConfigRow, 'model' | 'effort' | 'auto_compact_window' | 'max_messages_per_prompt'>
-    > = {};
-    let previous: string | number | null;
-    let current: string | number;
-    let previousLabel: string | null | undefined;
-    let currentLabel: string | null | undefined;
-
-    const effortInput = field === 'effort' ? value : effort;
-    if (effortInput !== undefined) {
-      const level = effortInput.trim().toLowerCase();
-      if (!isEffortLevel(level))
-        return fail('invalid-value', { field: 'effort', value: effortInput, allowed: EFFORT_LEVELS });
-      updates.effort = level;
-    }
-    switch (field) {
-      case 'model': {
-        const resolved = resolveModelInput(value);
-        if (!resolved.ok) return fail('invalid-value', { field, value, allowed: MODEL_CATALOG.map((m) => m.alias) });
-        current = resolved.id;
-        updates.model = resolved.id;
-        previous = before?.model ?? null;
-        previousLabel = describeModel(previous).label;
-        currentLabel = resolved.label;
-        break;
-      }
-      case 'effort':
-        previous = before?.effort ?? null;
-        current = updates.effort!;
-        break;
-      case 'auto-compact-window':
-      case 'max-messages-per-prompt': {
-        const parsed = parsePositiveInt(value);
-        if (parsed === null)
-          return fail('invalid-value', {
-            field,
-            value,
-            allowed: field === 'auto-compact-window' ? COMPACT_WINDOW_PRESETS : undefined,
-          });
-        const column = field === 'auto-compact-window' ? 'auto_compact_window' : 'max_messages_per_prompt';
-        previous = before?.[column] ?? null;
-        current = parsed;
-        updates[column] = parsed;
-        break;
-      }
-      default:
-        return fail('unknown-field', { field: String(field) });
-    }
-
-    const changed = previous !== current || (effort !== undefined && before?.effort !== updates.effort);
-    if (changed) {
+    const previous = before?.[column] ?? null;
+    const current = updates[column] ?? null;
+    const changes = Object.entries(updates).flatMap(([key, to]) => {
+      const from = before?.[key as ConfigColumn] ?? null;
+      return from === to ? [] : [{ field: key === 'effort' ? 'effort' : field, from, to }];
+    });
+    if (changes.length) {
       await ensureContainerConfig(agentGroupId);
       await updateContainerConfigScalars(agentGroupId, updates);
     }
     return {
       ok: true as const,
-      changed,
-      view: { agentName: ag.name, agentGroupId, field, previous, current, previousLabel, currentLabel },
+      changes,
+      view: {
+        agentName: ag.name,
+        agentGroupId,
+        field,
+        previous,
+        current,
+        ...(field === 'model' && {
+          previousLabel: describeModel(before?.model ?? null).label,
+          currentLabel: describeModel(updates.model ?? null).label,
+        }),
+      },
     };
   });
   if (!result.ok) return result;
-  const containersKilled = result.changed
+  for (const change of result.changes)
+    log.info('Config changed via chat command', { agentGroupId, actorUserId, ...change });
+  const containersKilled = result.changes.length
     ? await killAgentGroupContainersLazy(agentGroupId, `config ${field} changed via chat command`)
     : 0;
-  if (result.changed) log.info('Config changed via chat command', { agentGroupId, actorUserId, field });
   return { ok: true, view: { ...result.view, containersKilled } };
 }
 

@@ -29,6 +29,20 @@ function agentSettings(
   };
 }
 
+function modelOptions(provider: string | null) {
+  return provider === null || provider === 'claude' ? MODEL_CATALOG.map(({ id, label }) => ({ id, label })) : [];
+}
+
+async function invalidModel(ctx: AppRequest) {
+  const config = await getAgentConfigStatus(ctx.params.id);
+  if (!config.ok) return commandError(ctx, config);
+  invalidValue(
+    ctx,
+    'model',
+    modelOptions(config.view.provider).map(({ id }) => id),
+  );
+}
+
 function invalidValue(ctx: AppRequest, field: string, allowed: readonly (number | string)[]) {
   json(ctx.res, 400, { error: 'invalid_value', message: 'Choose a supported setting.', field, allowed });
 }
@@ -53,20 +67,19 @@ export const conversationStatus: AppHandler = async (ctx) => {
   });
   if (!result.ok) return commandError(ctx, result);
   const view = result.view;
-  const turns = view.sessionTurns ?? null;
   const canEdit = await hasAdminPrivilege(ctx.identity!.userId, conversation.agent_group_id);
   json(ctx.res, 200, {
     status: {
       agent: agentSettings(view, canEdit),
       session: {
         contextTokens: view.contextTokens ?? null,
-        contextWindow: turns === null ? null : (view.contextWindow ?? null),
-        turns,
+        contextWindow: view.contextWindow,
+        turns: view.sessionTurns ?? null,
         outputTokens: view.sessionOutputTokens ?? null,
-        queueDepth: turns === null ? null : (view.queueDepth ?? null),
+        queueDepth: view.queueDepth,
       },
-      taskCount: view.taskCount ?? null,
-      options: { models: MODEL_CATALOG.map(({ id, label }) => ({ id, label })), efforts: EFFORT_LEVELS },
+      taskCount: view.taskCount,
+      options: { models: modelOptions(view.provider), efforts: EFFORT_LEVELS },
     },
   } satisfies AgentStatusResponse);
 };
@@ -85,17 +98,13 @@ export const updateAgentSettings: AppHandler = async (ctx) => {
   ) {
     return invalidValue(ctx, 'settings', ['model', 'effort']);
   }
-  if (model !== undefined && typeof model !== 'string')
-    return invalidValue(
-      ctx,
-      'model',
-      MODEL_CATALOG.map((m) => m.alias),
-    );
-  if (effort !== undefined && typeof effort !== 'string') return invalidValue(ctx, 'effort', EFFORT_LEVELS);
+  if (model != null && typeof model !== 'string') return invalidModel(ctx);
+  if (effort != null && typeof effort !== 'string') return invalidValue(ctx, 'effort', EFFORT_LEVELS);
   const result =
     model !== undefined
       ? await setModel(id, model, userId, effort)
-      : await setConfigValue(id, 'effort', effort as string, userId);
+      : await setConfigValue(id, 'effort', effort as string | null, userId);
+  if (!result.ok && result.reason === 'invalid-value' && result.detail?.field === 'model') return invalidModel(ctx);
   if (!result.ok) return commandError(ctx, result);
   const config = await getAgentConfigStatus(id);
   if (!config.ok) return commandError(ctx, config);

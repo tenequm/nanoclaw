@@ -35,6 +35,8 @@ import { inboundDbPath, outboundDbPath } from '../../mailbox/sqlite/paths.js';
 import { dispatch } from '../dispatch.js';
 import { formatTasksTable } from '../format-tasks.js';
 import type { CallerContext } from '../frame.js';
+import { activeSessionCounts, backfillTaskSeriesCounts } from '../../modules/scheduling/task-count.js';
+import { getDb } from '../../db/connection.js';
 import { getAgentMailbox } from '../../mailbox/index.js';
 import './tasks.js';
 import '../commands/index.js'; // registers tasks-help for the help-topic test
@@ -97,6 +99,7 @@ describe('tasks CLI resource', () => {
     if (!resp.ok) return;
     const created = resp.data as { series_id: string; session_id: string; status: string };
     expect(created.status).toBe('pending');
+    expect((await activeSessionCounts('ag-1')).tasks).toBe(1);
     expect(created.session_id).not.toBe('chat-1');
 
     // The task lands in its own isolated per-series session, not the chat session.
@@ -117,6 +120,29 @@ describe('tasks CLI resource', () => {
     expect(content.prompt).toBe('send a briefing');
     expect(content.prompt).not.toContain('Task delivery contract');
     systemDb.close();
+  });
+
+  it('backfills legacy task series and keeps the central count current across a cancellation', async () => {
+    await getDb().run("UPDATE sessions SET thread_id='system:tasks' WHERE id='chat-1'");
+    const db = new Database(inboundDbPath('ag-1', 'chat-1'));
+    try {
+      const insert = db.prepare(
+        "INSERT INTO messages_in (id,kind,timestamp,content,status,series_id) VALUES (?,'task','2026-01-01','{}',?,?)",
+      );
+      insert.run('one', 'pending', 'daily');
+      insert.run('extra-run', 'pending', 'daily');
+      insert.run('two', 'paused', 'weekly');
+      insert.run('old', 'completed', 'finished');
+    } finally {
+      db.close();
+    }
+    await backfillTaskSeriesCounts();
+    expect((await activeSessionCounts('ag-1')).tasks).toBe(2);
+    expect((await dispatch({ id: 'cancel', command: 'tasks-cancel', args: { id: 'daily' } }, agentCtx())).ok).toBe(
+      true,
+    );
+    expect((await activeSessionCounts('ag-1')).tasks).toBe(1);
+    expect((await activeSessionCounts('ag-2')).tasks).toBe(0);
   });
 
   it('tasks-list attaches a server-rendered human table (so the container agent gets it too)', async () => {

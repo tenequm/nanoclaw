@@ -1,3 +1,4 @@
+import { withTaskChange } from '../../modules/scheduling/task-count.js';
 import fs from 'fs';
 
 import { TIMEZONE } from '../../config.js';
@@ -272,7 +273,7 @@ async function mutateTask(
   const id = taskId(args);
   let touched = 0;
   for (const session of await selectedSessions(args, ctx)) {
-    touched += (await withInbound(session, (db) => fn(db, id))) ?? 0;
+    touched += (await withTaskChange(session.agent_group_id, session.id, (db) => fn(db, id))) ?? 0;
   }
   if (touched === 0) throw new Error(`no live task matched: ${id}`);
   return { series_id: id, touched };
@@ -300,7 +301,8 @@ async function deleteTaskCommand(args: Record<string, unknown>, ctx: CallerConte
     }
 
     // Legacy shared task sessions may contain other series and keep their mailbox.
-    const deleted = (await withInbound(session, (mailbox) => mailbox.deleteTask(id))) ?? 0;
+    const deleted =
+      (await withTaskChange(session.agent_group_id, session.id, (mailbox) => mailbox.deleteTask(id))) ?? 0;
     if (deleted === 0) continue;
     touched += deleted;
     await deleteRunLog(session.agent_group_id, id);
@@ -368,7 +370,7 @@ async function cancelTaskCommand(args: Record<string, unknown>, ctx: CallerConte
 
   let touched = 0;
   for (const session of await selectedSessions(args, ctx)) {
-    touched += (await withInbound(session, (mailbox) => mailbox.cancelTask())) ?? 0;
+    touched += (await withTaskChange(session.agent_group_id, session.id, (mailbox) => mailbox.cancelTask())) ?? 0;
   }
   return { cancelled: touched };
 }
@@ -383,7 +385,7 @@ async function cancelTaskCommand(args: Record<string, unknown>, ctx: CallerConte
 async function runTaskCommand(args: Record<string, unknown>, ctx: CallerContext) {
   const id = taskId(args);
   for (const session of await selectedSessions(args, ctx)) {
-    const fired = await withInbound(session, async (db) => {
+    const fired = await withTaskChange(session.agent_group_id, session.id, async (db) => {
       const row = selectTask(db, id);
       if (!row) return undefined;
       const seriesKey = row.seriesId ?? row.id;

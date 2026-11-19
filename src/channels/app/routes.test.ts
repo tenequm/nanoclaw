@@ -95,6 +95,7 @@ it('rejects unknown routes and methods without reading a body', async () => {
 });
 it('registers the adapter and tracks its connection', async () => {
   expect(getRegisteredChannelNames()).toContain('app');
+  await runMigrations(await initDb(':memory:', { role: 'test' }));
   const adapter = createAppAdapter();
   expect(adapter.isConnected()).toBe(false);
   await adapter.setup({ onInbound: vi.fn(), onInboundEvent: vi.fn(), onMetadata: vi.fn(), onAction: vi.fn() });

@@ -1685,10 +1685,10 @@
       },
       "session": {
         "contextTokens": null,
-        "contextWindow": null,
+        "contextWindow": 165000,
         "turns": null,
         "outputTokens": null,
-        "queueDepth": null
+        "queueDepth": 0
       },
       "taskCount": 0,
       "options": {
@@ -1726,6 +1726,7 @@
     "model": "opus",
     "effort": "high"
   },
+  "agentSettingsResetRequest": { "model": null, "effort": null },
   "agentSettingsResponse": {
     "agent": {
       "id": "ag_taylor",
@@ -1760,7 +1761,7 @@
         "error": "invalid_value",
         "message": "Choose a supported setting.",
         "field": "model",
-        "allowed": ["sonnet", "sonnet-5", "opus", "opus-5.5", "fable", "fable-5.2"]
+        "allowed": ["claude-sonnet-5-5", "claude-sonnet-5", "claude-opus-5", "claude-opus-5-5", "claude-fable-5", "claude-fable-5-2"]
       }
     },
     "invalidSettings": {
