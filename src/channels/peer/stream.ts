@@ -10,7 +10,7 @@ export function streamIsOpen(id: string) {
 }
 export function closeStream(id: string, epoch: number, takeover: boolean) {
   const old = streams.get(id);
-  if (old && old.epoch < epoch)
+  if (old && old.epoch <= epoch)
     old.close(
       takeover
         ? { kind: 'superseded', epoch: old.epoch, by: epoch, message: 'A new daemon took over.', at: Date.now() }
@@ -23,14 +23,15 @@ export function closeStreams() {
 onMachineRevoked((id) =>
   streams.get(id)?.close({ kind: 'revoked', machine: id, message: 'Enrollment revoked.', at: Date.now() }),
 );
-function frame(event: PeerEvent) {
-  const id = 'seq' in event && event.kind !== 'synchronized' ? 'id: ' + event.seq + '\n' : '';
+function frame(event: PeerEvent, snapshot = false) {
+  const id = !snapshot && 'seq' in event && event.kind !== 'synchronized' ? 'id: ' + event.seq + '\n' : '';
   return id + 'event: ' + event.kind + '\ndata: ' + JSON.stringify(event) + '\n\n';
 }
 export async function openStream(res: ServerResponse, machineId: string, epoch: number, after: number) {
   const db = getDb();
   let cursor = after;
   let replayHead = 0;
+  let initialDirectory: Peer[] = [];
   let directory = new Map<string, Peer>();
   let closed = false,
     timer: NodeJS.Timeout | undefined,
@@ -39,7 +40,12 @@ export async function openStream(res: ServerResponse, machineId: string, epoch: 
     if (closed) return;
     closed = true;
     clearTimeout(timer);
-    if (streams.get(machineId)?.close === close) streams.delete(machineId);
+    if (streams.get(machineId)?.close === close) {
+      streams.delete(machineId);
+      void db
+        .run('UPDATE peer_machines SET epoch_seen_at=? WHERE id=? AND epoch=?', Date.now(), machineId, epoch)
+        .catch(() => {});
+    }
     res.end(event ? frame(event) : undefined);
   }
   function write(bytes: string) {
@@ -85,6 +91,7 @@ export async function openStream(res: ServerResponse, machineId: string, epoch: 
       await events(await eventHead());
       await status(await listPeers());
       if (Date.now() - lastPing >= limits.keepaliveMs) {
+        await db.run('UPDATE peer_machines SET epoch_seen_at=? WHERE id=? AND epoch=?', Date.now(), machineId, epoch);
         write(': ping\n\n');
         lastPing = Date.now();
       }
@@ -96,6 +103,7 @@ export async function openStream(res: ServerResponse, machineId: string, epoch: 
   await db.transaction(async () => {
     await checkEpoch(machineId, epoch);
     replayHead = await eventHead();
+    initialDirectory = await listPeers();
     if (after > replayHead) fail(400, 'bad_cursor', 'Cursor exceeds the event log head.', { seq: replayHead });
     if (res.destroyed) {
       closed = true;
@@ -107,10 +115,18 @@ export async function openStream(res: ServerResponse, machineId: string, epoch: 
     res.once('error', () => close());
     res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no' });
     res.flushHeaders();
+    const endpoints = await db.all<{ seq: number; payload: string }>(
+      `
+      SELECT seq,payload FROM peer_events WHERE seq IN (SELECT MAX(seq) FROM peer_events
+        WHERE machine_id=? AND kind='endpoint' GROUP BY json_extract(payload,'$.id'))
+      AND json_extract(payload,'$.state')='open' ORDER BY seq`,
+      machineId,
+    );
+    for (const e of endpoints) write(frame({ ...JSON.parse(e.payload), seq: e.seq }, true));
   });
   try {
     await events(replayHead);
-    await status(await listPeers());
+    await status(initialDirectory);
     write(frame({ kind: 'synchronized', seq: replayHead }));
     if (!closed) await tick();
   } catch {

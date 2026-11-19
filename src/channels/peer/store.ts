@@ -58,6 +58,28 @@ registerMigration({
   },
 });
 
+registerMigration({
+  version: 2,
+  name: 'module:peer:epoch-and-conversation-state',
+  async up(db) {
+    await db.exec(`
+      CREATE TABLE peer_log (id TEXT PRIMARY KEY);
+      ALTER TABLE peer_machines ADD COLUMN instance TEXT;
+      ALTER TABLE peer_machines ADD COLUMN epoch_seen_at INTEGER;
+      ALTER TABLE peer_sessions ADD COLUMN anchor TEXT;
+      ALTER TABLE peer_sessions ADD COLUMN successor TEXT;
+      ALTER TABLE peer_conversations ADD COLUMN limited INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE peer_conversations ADD COLUMN reset_chain INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE peer_messages ADD COLUMN origin TEXT;
+      ALTER TABLE peer_messages ADD COLUMN from_mode TEXT;
+      ALTER TABLE peer_inbound ADD COLUMN channel TEXT NOT NULL DEFAULT 'peer';
+      CREATE TABLE peer_agent_sends (source TEXT NOT NULL, outbound TEXT NOT NULL, refused INTEGER NOT NULL,
+        PRIMARY KEY(source,outbound));
+    `);
+    await db.run('INSERT INTO peer_log(id) VALUES (?)', 'lg_' + randomUUID());
+  },
+});
+
 export class PeerError extends Error {
   constructor(
     readonly status: number,
@@ -92,6 +114,8 @@ export interface Machine {
   name: string;
   public_key: string;
   epoch: number;
+  instance: string | null;
+  epoch_seen_at: number | null;
   last_seen_at: number | null;
   revoked_at: number | null;
 }
@@ -200,8 +224,9 @@ function label(value: string) {
     value
       .toLowerCase()
       .replace(/[^a-z0-9._-]+/g, '-')
-      .replace(/^[^a-z0-9]+|-+$/g, '')
-      .slice(0, 40) || 'session'
+      .replace(/^[._-]+/, '')
+      .slice(0, 40)
+      .replace(/[._-]+$/, '') || 'session'
   );
 }
 export async function setMeshMembership(agentId: string, member: boolean) {
@@ -231,6 +256,8 @@ export async function isMeshMember(agentId: string) {
   return Boolean(await getDb().get('SELECT 1 FROM mesh_members WHERE agent_group_id=?', agentId));
 }
 export interface RemoteSession {
+  anchor: string | null;
+  successor: string | null;
   id: string;
   machine_id: string;
   machine: string;
@@ -256,6 +283,7 @@ export async function checkEpoch(id: string, epoch: number) {
   if (!machine || machine.revoked_at !== null) fail(403, 'machine_revoked', 'Machine enrollment was revoked.');
   if (!epoch || machine.epoch !== epoch)
     fail(409, 'superseded', 'This connection no longer owns the machine.', { epoch: machine.epoch });
+  await getDb().run('UPDATE peer_machines SET epoch_seen_at=? WHERE id=? AND epoch=?', Date.now(), id, epoch);
   return machine;
 }
 export async function registerSession(
@@ -266,7 +294,22 @@ export async function registerSession(
   const db = getDb();
   const session = await db.transaction(async () => {
     const machine = await checkEpoch(machineId, request.epoch);
-    const prior = await remoteSession(machineId, key);
+    let prior = await remoteSession(machineId, key);
+    if (prior?.successor) {
+      // Preserve outstanding receipt attribution when a retired process key is reused.
+      await db.run('UPDATE peer_sessions SET key=id WHERE id=?', prior.id);
+      prior = undefined;
+    }
+    const predecessor =
+      !prior &&
+      (await db.get<RemoteSession>(
+        `SELECT * FROM peer_sessions WHERE machine_id=? AND successor IS NULL AND status='ended'
+      AND json_extract(registry_json,'$.sessionId')=?
+      ORDER BY updated_at DESC,rowid DESC LIMIT 1`,
+        machineId,
+        request.sessionId,
+      ));
+
     const base = label(request.name),
       project = label(request.project);
     const id = prior?.id ?? 'ps_' + randomUUID();
@@ -304,6 +347,24 @@ export async function registerSession(
       registeredAt,
       now,
     );
+    if (predecessor) {
+      await db.run('UPDATE peer_sessions SET anchor=? WHERE id=?', predecessor.anchor ?? predecessor.id, id);
+      await db.run('UPDATE peer_sessions SET successor=? WHERE id=?', id, predecessor.id);
+      await db.run('UPDATE peer_endpoints SET actor=? WHERE actor=?', id, predecessor.id);
+      await db.run('UPDATE peer_parties SET session_id=? WHERE session_id=?', id, predecessor.id);
+      await db.run(
+        `UPDATE peer_conversations SET
+        party_a=min(?,CASE WHEN party_a=? THEN party_b ELSE party_a END),
+        party_b=max(?,CASE WHEN party_a=? THEN party_b ELSE party_a END)
+        WHERE party_a=? OR party_b=?`,
+        id,
+        predecessor.id,
+        id,
+        predecessor.id,
+        predecessor.id,
+        predecessor.id,
+      );
+    }
     return { key, address: address(), name, project, machine: machine.name, status, registeredAt };
   });
   meshChanged();

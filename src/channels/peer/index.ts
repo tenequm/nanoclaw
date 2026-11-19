@@ -47,7 +47,7 @@ const settings = {
   backoffInitialMs: 500,
   backoffMaxMs: 10000,
   backoffResetAfterMs: 5000,
-  acceptWindowMs: 5000,
+  acceptWindowMs: 8000,
   requestTimeoutMs: 10000,
   sendWaitMs: 5000,
 };
@@ -67,17 +67,25 @@ async function hello(machineId: string, body: HelloRequest) {
       fail(426, 'upgrade_required', 'Update the daemon to ' + minAmesh + ' or later.', { minAmesh });
     const machine = await getMachine(machineId);
     if (!machine || machine.revoked_at !== null) fail(403, 'machine_revoked', 'Enrollment revoked.');
-    if (
-      (streamIsOpen(machineId) || (machine.last_seen_at ?? 0) > Date.now() - limits.offlineAfterMs) &&
-      body.resumeEpoch !== machine.epoch &&
-      !body.takeover
-    )
+    const now = Date.now();
+    const live = streamIsOpen(machineId) || (machine.epoch_seen_at ?? 0) > now - limits.offlineAfterMs;
+    const reconnect = live && machine.instance === body.instance;
+    if (live && !reconnect && !body.takeover)
       fail(409, 'machine_in_use', 'Machine already has an active daemon.', { epoch: machine.epoch });
-    const epoch = machine.epoch + 1;
-    await db.run('UPDATE peer_machines SET epoch=?,last_seen_at=? WHERE id=?', epoch, Date.now(), machine.id);
-    return { ...helloInfo(), machine: { id: machine.id, name: machine.name }, epoch, settings, limits };
+    const epoch = reconnect ? machine.epoch : machine.epoch + 1;
+    await db.run(
+      'UPDATE peer_machines SET epoch=?,instance=?,epoch_seen_at=?,last_seen_at=? WHERE id=?',
+      epoch,
+      body.instance,
+      now,
+      now,
+      machine.id,
+    );
+    const logId = await db.get<{ id: string }>('SELECT id FROM peer_log');
+    log.info('Peer daemon hello', { machineId, epoch, resumeEpoch: body.resumeEpoch });
+    closeStream(machineId, epoch, live && !reconnect);
+    return { ...helloInfo(), machine: { id: machine.id, name: machine.name }, epoch, log: logId!.id, settings, limits };
   });
-  closeStream(machineId, result.epoch, body.takeover && body.resumeEpoch !== result.epoch - 1);
   return result;
 }
 function networkPolicy(): VoiceModeProxyPolicy {
@@ -139,9 +147,7 @@ export async function dispatchPeer(req: IncomingMessage, res: ServerResponse, po
     if (path === '/peer/reports' && method === 'POST')
       return json(res, 200, await reports(machine.id, decode('ReportsRequest', body)));
     if (path === '/peer/messages' && method === 'POST') {
-      if (body && typeof body === 'object' && 'text' in body && body.text === '')
-        fail(400, 'empty_text', 'Write a non-empty message.');
-      return json(res, 200, await sendRemote(machine.id, decode('SendRequest', body), bodyHash));
+      return json(res, 200, await sendRemote(machine.id, decode('SendRequest', body)));
     }
     const session = /^\/peer\/sessions\/([1-9][0-9]{0,9}-[0-9a-f]{8})(?:\/(end|human))?$/.exec(path ?? '');
     if (session) {

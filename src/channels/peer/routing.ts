@@ -6,7 +6,8 @@ import { getSession, findSessionForAgent, createSession } from '../../db/session
 import { createMessagingGroupIfAbsent, getMessagingGroup } from '../../db/messaging-groups.js';
 import { isUniqueViolation } from '../../db/errors.js';
 import { writeSessionMessage } from '../../session-manager.js';
-import { advanceDelivery, transition, queueNotice } from './lifecycle.js';
+import { transition, queueNotice } from './lifecycle.js';
+import { log } from '../../log.js';
 import { basename } from 'node:path';
 import { requestWake } from '../../request-wake.js';
 import { consumeRateLimit } from '../../modules/device-auth/rate-limit.js';
@@ -60,7 +61,7 @@ async function pairSession(remote: RemoteSession, agentId: string) {
   const groupId =
     'pc_' +
     createHash('sha256')
-      .update(remote.id + '\n' + agentId)
+      .update((remote.anchor ?? remote.id) + '\n' + agentId)
       .digest('base64url');
   await createMessagingGroupIfAbsent({
     id: groupId,
@@ -246,6 +247,7 @@ interface Send {
   mode: SendRequest['fromMode'] | null;
   notify: boolean;
   failure: boolean;
+  reply?: boolean;
 }
 async function previous(scope: string, sourceId: string, hash: string) {
   const row = await getDb().get<MessageRow>(
@@ -256,24 +258,58 @@ async function previous(scope: string, sourceId: string, hash: string) {
   if (!row) return;
   if (row.request_hash !== hash) fail(409, 'id_conflict', 'Message id already used for different content.');
   const result: SendResponse = JSON.parse(row.response);
+  if (result.message.state === 'refused' && scope.startsWith('pm_')) throw hopLimitError(result);
   result.message.state = row.state;
   return result;
+}
+async function conversationFor(source: string, target: string) {
+  const db = getDb();
+  const [a, b] = [source, target].sort();
+  const conversation = await db.get<{ id: string; hops: number; chain: string; limited: number; reset_chain: number }>(
+    `INSERT INTO peer_conversations(id,party_a,party_b) VALUES (?,?,?)
+    ON CONFLICT(party_a,party_b) DO UPDATE SET party_a=excluded.party_a RETURNING id,hops,chain,limited,reset_chain`,
+    randomUUID(),
+    a,
+    b,
+  );
+  return conversation!;
+}
+export async function reserveAgentHop(source: Session, target: Session, outbound: string) {
+  const db = getDb();
+  return db.transaction(async () => {
+    const member = await db.get(
+      'SELECT 1 FROM mesh_members a JOIN mesh_members b ON b.agent_group_id=? WHERE a.agent_group_id=?',
+      target.agent_group_id,
+      source.agent_group_id,
+    );
+    if (!member) return 'unlimited';
+    const prior = await db.get<{ refused: number }>(
+      'SELECT refused FROM peer_agent_sends WHERE source=? AND outbound=?',
+      source.id,
+      outbound,
+    );
+    if (prior) return prior.refused ? 'refused' : 'allowed';
+    const c = await conversationFor(source.id, target.id);
+    const refused = c.hops >= limits.hopLimit;
+    await db.run('INSERT INTO peer_agent_sends(source,outbound,refused) VALUES (?,?,?)', source.id, outbound, +refused);
+    if (refused) {
+      const text = 'Conversation paused after ' + c.hops + ' messages. An owner turn resets the limit.';
+      await queueNotice(source.id, target.agent_group_id, text, 'agent');
+      if (!c.limited) await queueNotice(target.id, source.agent_group_id, text, 'agent');
+      await db.run('UPDATE peer_conversations SET limited=1 WHERE id=?', c.id);
+      return 'refused';
+    }
+    await db.run('UPDATE peer_conversations SET hops=hops+1,reset_chain=0 WHERE id=?', c.id);
+    return 'allowed';
+  });
 }
 async function queue(sender: Actor, target: Actor, scope: string, input: Send): Promise<SendResponse> {
   const db = getDb(),
     now = Date.now();
   checkedText(input.text);
-  const [a, b] = [sender.id, target.id].sort();
-  const conversation = await db.get<{ id: string; hops: number; chain: string }>(
-    `INSERT INTO peer_conversations(id,party_a,party_b) VALUES (?,?,?)
-    ON CONFLICT(party_a,party_b) DO UPDATE SET party_a=excluded.party_a RETURNING id,hops,chain`,
-    randomUUID(),
-    a,
-    b,
-  );
-  const next = (input.origin === 'human' ? 0 : conversation!.hops) + 1;
-  const stopped = next > limits.hopLimit;
-  const count = Math.min(next, limits.hopLimit);
+  const conversation = await conversationFor(sender.id, target.id);
+  const stopped = conversation.hops >= limits.hopLimit;
+  const count = Math.min(conversation.hops + 1, limits.hopLimit);
   if (!stopped && target.status === 'offline') {
     const queued = await db.get<{ n: number }>(
       "SELECT COUNT(*) AS n FROM peer_messages WHERE recipient=? AND state='queued' AND expires_at>?",
@@ -282,7 +318,7 @@ async function queue(sender: Actor, target: Actor, scope: string, input: Send): 
     );
     if (queued!.n >= limits.offlineQueueMax) fail(409, 'queue_full', 'Offline queue is full.');
   }
-  const chain = input.chain ?? JSON.parse(conversation!.chain);
+  const chain = conversation.reset_chain ? [] : (input.chain ?? JSON.parse(conversation.chain));
   // Receipts name only the recipient session and the wire id.
   if (target.remote && (await db.get('SELECT 1 FROM peer_messages WHERE recipient=? AND id=?', target.id, input.id)))
     fail(409, 'id_conflict', 'Message id already used for this recipient.');
@@ -302,14 +338,14 @@ async function queue(sender: Actor, target: Actor, scope: string, input: Send): 
   };
   if (!stopped)
     await db.run(
-      'UPDATE peer_conversations SET hops=?,chain=? WHERE id=?',
+      'UPDATE peer_conversations SET hops=?,chain=?,reset_chain=0 WHERE id=?',
       count,
       JSON.stringify(chain),
-      conversation!.id,
+      conversation.id,
     );
   await db.run(
     `INSERT INTO peer_messages(row_id,id,sender,recipient,sender_scope,source_id,request_hash,conversation_id,text,
-    response,state,failure_notice,notify_idle,created_at,expires_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+    response,state,failure_notice,notify_idle,created_at,expires_at,origin,from_mode) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
     row,
     input.id,
     sender.id,
@@ -317,7 +353,7 @@ async function queue(sender: Actor, target: Actor, scope: string, input: Send): 
     scope,
     input.sourceId,
     input.hash,
-    conversation!.id,
+    conversation.id,
     input.text,
     JSON.stringify(result),
     result.message.state,
@@ -325,13 +361,18 @@ async function queue(sender: Actor, target: Actor, scope: string, input: Send): 
     +input.notify,
     now,
     result.message.expiresAt,
+    input.origin,
+    input.mode,
   );
   if (stopped) {
+    await db.run('UPDATE peer_conversations SET limited=1 WHERE id=?', conversation.id);
     const message = 'Conversation paused after ' + count + ' messages. A human turn resets the limit.';
     for (const [recipient, other, ref] of [
       [target, sender, from],
       [sender, target, to],
     ] as const) {
+      if (recipient === target && conversation.limited) continue;
+      if (recipient === sender && recipient.remote) continue;
       if (recipient.remote)
         await appendEvent(
           recipient.remote.machine_id,
@@ -370,11 +411,14 @@ async function queue(sender: Actor, target: Actor, scope: string, input: Send): 
       row,
     );
   } else {
-    const prior = await db.get<{ id: string; text: string }>(
-      'SELECT id,text FROM peer_messages WHERE conversation_id=? AND sender=? ORDER BY rowid DESC LIMIT 1',
-      conversation!.id,
-      target.id,
-    );
+    const prior = input.reply
+      ? await db.get<{ id: string; text: string }>(
+          "SELECT id,text FROM peer_messages WHERE conversation_id=? AND sender=? AND state IN ('sent','accepted','delivered','held') AND recipient IN (SELECT id FROM peer_sessions WHERE coalesce(anchor,id)=?) ORDER BY rowid DESC LIMIT 1",
+          conversation.id,
+          target.id,
+          sender.remote!.anchor ?? sender.id,
+        )
+      : undefined;
     const content = inboundContent(sender.remote!, input, prior && { ...prior, sender: target.address }, input.failure);
     await db.run(
       'INSERT INTO peer_inbound(id,hub_session,remote_id,content,created_at,message_row) VALUES (?,?,?,?,?,?)',
@@ -406,79 +450,105 @@ async function deliverInbound() {
     content: string;
     created_at: number;
     message_row: string | null;
+    channel: string;
   }>('SELECT * FROM peer_inbound ORDER BY rowid LIMIT 100');
   for (const job of jobs) {
     const session = await getSession(job.hub_session);
-    if (!session || !(await db.get('SELECT 1 FROM mesh_members WHERE agent_group_id=?', session.agent_group_id))) {
-      await db.transaction(async () => {
-        const row =
-          job.message_row && (await db.get<MessageRow>('SELECT * FROM peer_messages WHERE row_id=?', job.message_row));
-        if (row) await transition(row, 'refused', 'not_member', Date.now());
-        await db.run('DELETE FROM peer_inbound WHERE id=?', job.id);
-      });
-      continue;
+    let failure: string | null = null;
+    if (!session || session.status !== 'active') failure = 'route_failed';
+    else if (!(await db.get('SELECT 1 FROM mesh_members WHERE agent_group_id=?', session.agent_group_id)))
+      failure = 'not_member';
+    else {
+      try {
+        await writeSessionMessage(session.agent_group_id, session.id, {
+          id: 'peer-' + job.id,
+          kind: 'chat',
+          timestamp: new Date(job.created_at).toISOString(),
+          platformId: job.remote_id,
+          channelType: job.channel,
+          content: job.content,
+        });
+      } catch (error) {
+        if (!isUniqueViolation(error)) failure = 'route_failed';
+      }
     }
-    try {
-      await writeSessionMessage(session.agent_group_id, session.id, {
-        id: 'peer-' + job.id,
-        kind: 'chat',
-        timestamp: new Date(job.created_at).toISOString(),
-        platformId: job.remote_id,
-        channelType: 'peer',
-        content: job.content,
-      });
-    } catch (error) {
-      if (!isUniqueViolation(error)) throw error;
-    }
-    await requestWake(session, 'inbound-message');
     await db.transaction(async () => {
       if (job.message_row) {
         const row = await db.get<MessageRow>('SELECT * FROM peer_messages WHERE row_id=?', job.message_row);
-        if (row) await advanceDelivery(row, 'accepted', null, Date.now());
+        if (row) await transition(row, failure ? 'dropped' : 'delivered', failure, Date.now());
       }
       await db.run('DELETE FROM peer_inbound WHERE id=?', job.id);
     });
+    if (!failure && session)
+      await requestWake(session, 'inbound-message').catch(() => log.warn('Peer inbox wake deferred to host sweep'));
   }
 }
-export async function sendRemote(machineId: string, request: SendRequest, hash: string) {
-  const result = await getDb().transaction(async () => {
+function hopLimitError(result: SendResponse) {
+  return new PeerError(409, {
+    error: 'hop_limit',
+    message: 'Conversation is paused until a human takes part.',
+    hop: result.message.hop,
+  });
+}
+export async function sendRemote(machineId: string, request: SendRequest) {
+  const to = 'endpoint' in request.to ? ['endpoint', request.to.endpoint] : ['address', request.to.address];
+  const hash = createHash('sha256')
+    .update(JSON.stringify([request.from.session, to, request.text]))
+    .digest('hex');
+  const db = getDb();
+  const result = await db.transaction(async () => {
     await checkEpoch(machineId, request.epoch);
-    const old = await previous(machineId, request.id, hash);
-    if (old) return old;
-    const remote = await remoteSession(machineId, request.from.session);
-    if (!remote || remote.status === 'ended') fail(404, 'unknown_session', 'Register the sending session.');
-    const sender = await actor(remote.id);
-    const target =
-      'endpoint' in request.to
-        ? await endpointTarget(request.to.endpoint, remote)
-        : await addressTarget(request.to.address, sender);
+    let duplicate;
+    try {
+      duplicate = await previous(machineId, request.id, hash);
+    } catch (err) {
+      if (!(err instanceof PeerError)) throw err;
+      duplicate = err;
+    }
+    if (duplicate && !(duplicate instanceof PeerError)) return duplicate;
     const rate = await consumeRateLimit(
       'peer-send:' + machineId,
       limits.machineRate.limit,
       limits.machineRate.windowMs,
     );
-    if (!rate.allowed) fail(429, 'rate_limited', 'Machine send limit reached.', { retryAfter: rate.retryAfter });
-    return queue(sender, target, machineId, {
-      id: request.id,
-      sourceId: request.id,
-      hash,
-      text: request.text,
-      origin: request.origin,
-      chain: request.hopChain,
-      mode: request.fromMode,
-      notify: request.notifyWhenIdle,
-      failure: request.failureNotice,
-    });
+    if (!rate.allowed)
+      return new PeerError(429, {
+        error: 'rate_limited',
+        message: 'Machine send limit reached.',
+        retryAfter: rate.retryAfter,
+      });
+    if (duplicate) return duplicate;
+    try {
+      return await db.transaction(async () => {
+        checkedText(request.text);
+        const remote = await remoteSession(machineId, request.from.session);
+        if (!remote || remote.status === 'ended') fail(404, 'unknown_session', 'Register the sending session.');
+        const sender = await actor(remote.id);
+        const reply = 'endpoint' in request.to;
+        const target =
+          'endpoint' in request.to
+            ? await endpointTarget(request.to.endpoint, remote)
+            : await addressTarget(request.to.address, sender);
+        const sent = await queue(sender, target, machineId, {
+          id: request.id,
+          sourceId: request.id,
+          hash,
+          text: request.text,
+          origin: request.origin,
+          chain: request.hopChain,
+          mode: request.fromMode,
+          notify: false,
+          failure: request.failureNotice,
+          reply,
+        });
+        return sent.message.state === 'refused' ? hopLimitError(sent) : sent;
+      });
+    } catch (error) {
+      if (error instanceof PeerError) return error;
+      throw error;
+    }
   });
-  if (
-    result.message.state === 'refused' &&
-    (await getDb().get(
-      "SELECT 1 FROM peer_events e JOIN peer_messages m ON m.row_id=e.message_row WHERE m.sender_scope=? AND m.source_id=? AND e.kind='limit'",
-      machineId,
-      request.id,
-    ))
-  )
-    fail(409, 'hop_limit', 'Conversation is paused until a human takes part.', { hop: result.message.hop });
+  if (result instanceof PeerError) throw result;
   return result;
 }
 
@@ -521,8 +591,16 @@ export async function routeAgentPeer(
       if (old) return old;
       const address = msg.platformId ?? '';
       let target: Actor;
-      if (address.startsWith('ps_') && !address.includes('@')) target = await actor(address);
-      else if (address.startsWith('pc_') && session.messaging_group_id === address) {
+      if (address.startsWith('ps_') && !address.includes('@')) {
+        const remote = await remoteById(address);
+        const current =
+          remote?.successor &&
+          (await getDb().get<{ id: string }>(
+            "SELECT id FROM peer_sessions WHERE coalesce(anchor,id)=? AND status<>'ended'",
+            remote.anchor ?? remote.id,
+          ));
+        target = await actor(current ? current.id : address);
+      } else if (address.startsWith('pc_') && session.messaging_group_id === address) {
         const row = await getDb().get<{ remote_id: string }>(
           'SELECT CASE WHEN party_a=? THEN party_b ELSE party_a END AS remote_id FROM peer_conversations WHERE party_a=? OR party_b=? ORDER BY rowid LIMIT 1',
           session.id,

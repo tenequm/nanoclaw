@@ -4,6 +4,7 @@
       "HelloRequest": {
         "type": "object",
         "required": [
+          "instance",
           "resumeEpoch",
           "takeover",
           "amesh",
@@ -11,8 +12,12 @@
           "capabilities"
         ],
         "properties": {
+          "instance": {
+            "$ref": "#/components/schemas/Instance",
+            "description": "This daemon process; the hub tells a reconnect from a second daemon by it."
+          },
           "resumeEpoch": {
-            "description": "The epoch this process held before; null at process start.",
+            "description": "The epoch this process already holds; null at process start. Logged by the hub, which decides by `instance`.",
             "oneOf": [
               {
                 "$ref": "#/components/schemas/Epoch"
@@ -80,8 +85,13 @@
           }
         }
       },
+      "Instance": {
+        "description": "16 random bytes, base64url without padding, minted once per daemon process (contract.md section 5).",
+        "type": "string",
+        "pattern": "^[A-Za-z0-9_-]{22}$"
+      },
       "Epoch": {
-        "description": "A connection epoch (contract.md section 5).",
+        "description": "A connection epoch (contract.md section 5); it changes only when the daemon process holding it changes.",
         "type": "integer",
         "minimum": 1
       },
@@ -327,7 +337,7 @@
         "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
       },
       "DropReason": {
-        "description": "Claude Code's guard (rate-limited, queue-full: retried after pacing, then dropped;\nduplicate, hop-loop, hop-runaway: never retried); oversized (over the native line\nlimit, refused before writing); session_gone (the inbox no longer accepts);\nunknown_session (the daemon does not host that key, L18); queue_expired (past\nqueueTtlMs, D19); ended (the target ended with it queued). Open set.",
+        "description": "Claude Code's guard (rate-limited, queue-full: retried after pacing, then dropped;\nduplicate, hop-loop, hop-runaway: never retried); oversized (over the native line\nlimit, refused before writing); session_gone (the inbox no longer accepts);\nunknown_session (the daemon does not host that key, L18); queue_expired (past\nqueueTtlMs, D19); ended (the target ended with it queued); interrupted (the daemon\nrestarted between recording the id and finishing the inbox write, so it may or may not\nhave arrived; A1); route_failed (the hub could not write it into the agent's hub\nsession; A1). Open set.",
         "type": "string"
       },
       "IdleReport": {
@@ -417,17 +427,24 @@
           },
           "text": {
             "description": "At least one non-whitespace character, at most maxTextBytes UTF-8 bytes, never starting with \"/\" after leading whitespace (R10, R11).",
-            "type": "string",
-            "minLength": 1
+            "type": "string"
           },
           "hopChain": {
             "$ref": "#/components/schemas/HopChain"
           },
           "fromMode": {
-            "$ref": "#/components/schemas/FromMode"
+            "description": "The sender's real class (R13): from the envelope for a native reply, else from the session's latest hook input; null asserts none.",
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/FromMode"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "origin": {
-            "description": "human resets the conversation's hop counter before counting (contract.md section 9).",
+            "description": "Recorded in the log only; it never resets the hop counter (contract.md section 9, A1).",
             "type": "string",
             "enum": [
               "human",
@@ -437,7 +454,7 @@
           },
           "notifyWhenIdle": {
             "type": "boolean",
-            "description": "Tell the sender when the target finishes the turn this message starts."
+            "description": "Tell the sender when the target finishes the turn this message starts. Always false in v1: send_message has no notify_when_idle (A1)."
           },
           "failureNotice": {
             "type": "boolean",

@@ -18,6 +18,9 @@
  * `channel_type === 'agent'` check. When the module is absent the check in
  * core throws with a "module not installed" message so retry → mark failed.
  */
+import { createHash } from 'node:crypto';
+import { getDb } from '../../db/connection.js';
+import { isUniqueViolation } from '../../db/errors.js';
 import { AnchoredDir, copyRegularFile } from '../../anchored-dir.js';
 import { fenceForCard, quoteForCard } from '../../card-text.js';
 import { MAX_CARD_QUESTION_LENGTH } from '../../channels/ask-question.js';
@@ -305,7 +308,19 @@ async function performAgentRoute(
   // leaves the message in an inbox nothing reads; route it once more if so.
   for (let attempt = 1; attempt <= 2; attempt++) {
     const targetSession = await resolveTargetSession(msg, session, targetAgentGroupId);
-    const a2aMsgId = `a2a-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    let meshRoute = false;
+    if (session.agent_group_id !== targetAgentGroupId && (await getDb().hasTable('peer_agent_sends'))) {
+      const { reserveAgentHop } = await import('../../channels/peer/routing.js');
+      const decision = await reserveAgentHop(session, targetSession, msg.id);
+      if (decision === 'refused') return;
+      meshRoute = decision === 'allowed';
+    }
+    const a2aMsgId = meshRoute
+      ? 'a2a-' +
+        createHash('sha256')
+          .update(JSON.stringify([session.id, msg.id]))
+          .digest('hex')
+      : `a2a-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
     // If the source message references files (via `send_file`), forward the
     // bytes from the source's outbox into the target's inbox so the target
@@ -325,6 +340,8 @@ async function performAgentRoute(
       threadId: null,
       content: forwardedContent,
       sourceSessionId: session.id,
+    }).catch((error: unknown) => {
+      if (!meshRoute || !isUniqueViolation(error)) throw error;
     });
     log.info('Agent message routed', {
       from: session.agent_group_id,

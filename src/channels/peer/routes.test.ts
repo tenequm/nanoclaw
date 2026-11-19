@@ -46,6 +46,7 @@ afterEach(async () => {
   rmSync(dir, { recursive: true, force: true });
 });
 const hello: HelloRequest = {
+  instance: randomBytes(16).toString('base64url'),
   resumeEpoch: null,
   takeover: false,
   amesh: { version: '0.1.0', os: 'test', arch: 'test' },
@@ -145,7 +146,7 @@ it('routes between two enrolled machines and authorizes a reply only from the ad
   expect((await a.call('POST', '/peer/messages', message)).status).toBe(200);
   const stream = await b.replay();
   const events = await stream.through('synchronized');
-  expect(events.map((e) => e.kind).slice(0, 2)).toEqual(['endpoint', 'message']);
+  expect(events.map((e) => e.kind).slice(0, 3)).toEqual(['endpoint', 'endpoint', 'message']);
   const incoming = events.find((e) => e.kind === 'message')!;
   expect(incoming).toMatchObject({ session: b.key, id: message.id, fromMode: 'prompting', hop: { count: 1 } });
   const reply = b.send({ endpoint: incoming.endpoint.id });
@@ -219,8 +220,9 @@ it('fences epochs, rejects future cursors, expires offline messages and omits th
   const address = await b.register();
   const before = await b.replay();
   await before.through('synchronized');
-  expect(await (await b.call('POST', '/peer/hello', hello)).json()).toMatchObject({ error: 'machine_in_use' });
-  const takeover = await (await b.call('POST', '/peer/hello', { ...hello, takeover: true })).json();
+  const otherInstance = { ...hello, instance: randomBytes(16).toString('base64url') };
+  expect(await (await b.call('POST', '/peer/hello', otherInstance)).json()).toMatchObject({ error: 'machine_in_use' });
+  const takeover = await (await b.call('POST', '/peer/hello', { ...otherInstance, takeover: true })).json();
   expect(takeover).toMatchObject({ epoch: 2 });
   expect((await before.through('superseded')).at(-1)).toMatchObject({ epoch: 1, by: 2 });
   await before.close();
@@ -284,7 +286,7 @@ it('keeps reports scoped to the receiver and preserves the first final state, in
     const report = { kind: 'state', id: message.id, session: b.key, state, reason: null, at: Date.now() };
     const submit = (daemon: typeof a, record: typeof report) =>
       daemon.call('POST', '/peer/reports', { epoch: daemon.epoch, reports: [record] });
-    expect(await (await submit(a, report)).json()).toMatchObject({ results: [{ applied: false, state: 'unknown' }] });
+    expect(await (await submit(a, report)).json()).toMatchObject({ results: [{ applied: false, state: null }] });
     expect(await (await submit(b, { ...report, state: 'future_state' })).json()).toMatchObject({
       results: [{ applied: false, state: 'sent' }],
     });
@@ -297,5 +299,95 @@ it('keeps reports scoped to the receiver and preserves the first final state, in
     epoch: b.epoch,
     reports: [{ kind: 'future', id: randomUUID() }],
   });
-  expect(await result.json()).toMatchObject({ results: [{ applied: false, state: 'unknown' }] });
+  expect(await result.json()).toMatchObject({ results: [{ applied: false, state: null }] });
+});
+
+it('keeps the live epoch and log across a lost hello and hub restart, and retries under the new daemon epoch', async () => {
+  const a = await machine('one'),
+    b = await machine('two');
+  await a.register();
+  const address = await b.register();
+  const first = (await (await a.call('POST', '/peer/hello', hello)).json()) as HelloResponse;
+  expect(first).toMatchObject({ epoch: 1, settings: { acceptWindowMs: 8000 }, log: expect.stringMatching(/^lg_/) });
+  const m = a.send({ address });
+  expect((await a.call('POST', '/peer/messages', m)).status).toBe(200);
+  await closeDb();
+  await runMigrations(await initDb(dbFile));
+  const again = await (await a.call('POST', '/peer/hello', { ...hello, resumeEpoch: null, takeover: true })).json();
+  expect(again).toMatchObject({ epoch: 1, log: first.log });
+  const epoch = 2;
+  expect(
+    await (
+      await a.call('POST', '/peer/hello', { ...hello, instance: randomBytes(16).toString('base64url'), takeover: true })
+    ).json(),
+  ).toMatchObject({ epoch });
+  expect(
+    await (
+      await a.call('POST', '/peer/messages', {
+        ...m,
+        epoch,
+        origin: 'human',
+        fromMode: null,
+        hopChain: ['a'.repeat(24)],
+      })
+    ).json(),
+  ).toMatchObject({ message: { id: m.id, state: 'queued' } });
+  for (const changed of [{ text: 'different' }, { from: { session: '44-aaaaaaaa' } }, { to: { address: 'different' } }])
+    expect(await (await a.call('POST', '/peer/messages', { ...m, epoch, ...changed })).json()).toMatchObject({
+      error: 'id_conflict',
+    });
+  const n = b.send({ address: 'review@test:one' });
+  expect((await b.call('POST', '/peer/messages', n)).status).toBe(200);
+  const reconnect = await b.replay();
+  const burst = await reconnect.through('synchronized');
+  expect(burst.filter((e) => e.kind === 'message').map((e) => e.id)).toEqual([m.id]);
+  await reconnect.close();
+  const ack = { kind: 'state', id: m.id, session: b.key, state: 'held', reason: null, at: Date.now() };
+  await b.call('POST', '/peer/reports', { epoch: b.epoch, reports: [ack] });
+  const taken = (await (
+    await b.call('POST', '/peer/hello', { ...hello, instance: randomBytes(16).toString('base64url'), takeover: true })
+  ).json()) as HelloResponse;
+  const raw = await b.call('GET', '/peer/events?after=0&epoch=' + taken.epoch);
+  const reader = raw.body!.pipeThrough(new TextDecoderStream()).getReader();
+  let wire = '';
+  while (!wire.includes('event: synchronized')) wire += (await reader.read()).value;
+  const frames = wire.split('\n\n');
+  expect(frames[0]).toMatch(/^event: endpoint\n/);
+  expect(frames.some((f) => f.startsWith('id: ') && f.includes('event: message') && f.includes(m.id))).toBe(true);
+  await reader.cancel();
+  await closeDb();
+  await runMigrations(await initDb(join(dir, 'another.db')));
+  expect(await getDb().get('SELECT id FROM peer_log')).not.toEqual({ id: first.log });
+});
+
+it('accepts signatures at both clock boundaries and rejects one second beyond each', async () => {
+  const { verifyPeerRequest } = await import('./store.js');
+  const a = await machine('clock');
+  const now = Date.now();
+  for (const skew of [-121, -120, 120, 121]) {
+    const socket = new Socket();
+    try {
+      const req = new IncomingMessage(socket);
+      req.method = 'GET';
+      req.url = '/peer/peers';
+      req.headers.authorization = a.header('GET', req.url, '', Math.floor(now / 1000) + skew);
+      if (Math.abs(skew) === 120) expect((await verifyPeerRequest(req, now)).machine.id).toBe(a.id);
+      else await expect(verifyPeerRequest(req, now)).rejects.toMatchObject({ body: { error: 'stale_timestamp' } });
+    } finally {
+      socket.destroy();
+    }
+  }
+});
+
+it('charges refused machine sends and refuses to end an unregistered key', async () => {
+  const a = await machine('limited');
+  await a.register();
+  expect(
+    await (await a.call('POST', '/peer/sessions/23-aaaaaaaa/end', { epoch: 1, reason: 'exited' })).json(),
+  ).toMatchObject({ error: 'unknown_session' });
+  for (let attempt = 0; attempt < 60; attempt++)
+    expect((await a.call('POST', '/peer/messages', a.send({ address: 'absent' }))).status).toBe(404);
+  const exhausted = await a.call('POST', '/peer/messages', a.send({ address: 'absent' }));
+  expect(exhausted.status).toBe(429);
+  expect(Number(exhausted.headers.get('Retry-After'))).toBeGreaterThan(0);
 });

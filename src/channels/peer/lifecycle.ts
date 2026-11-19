@@ -5,14 +5,15 @@ import { appendEvent, announceEndpoint, type MessageRow } from './routing.js';
 import { checkEpoch, fail, limits, meshChanged, remoteById, remoteSession } from './store.js';
 import type { DeliveryState, HeartbeatRequest, ReportsRequest, ReportsResponse, SendResponse } from './types.js';
 
-export async function queueNotice(hub: string, remote: string, text: string) {
+export async function queueNotice(hub: string, remote: string, text: string, channel = 'peer') {
   await getDb().run(
-    'INSERT INTO peer_inbound(id,hub_session,remote_id,content,created_at) VALUES (?,?,?,?,?)',
+    'INSERT INTO peer_inbound(id,hub_session,remote_id,content,created_at,channel) VALUES (?,?,?,?,?,?)',
     randomUUID(),
     hub,
     remote,
     JSON.stringify({ text, sender: 'Peer delivery', failureNotice: true }),
     Date.now(),
+    channel,
   );
 }
 export async function transition(row: MessageRow, state: DeliveryState, reason: string | null, at: number) {
@@ -76,7 +77,15 @@ export async function endRemote(machineId: string, key: string) {
 }
 export async function resetHops(actor: string) {
   return (
-    await getDb().run('UPDATE peer_conversations SET hops=0 WHERE hops>0 AND (party_a=? OR party_b=?)', actor, actor)
+    await getDb().run(
+      `UPDATE peer_conversations SET hops=0,chain='[]',limited=0,reset_chain=1 WHERE hops>0 AND
+      (party_a=? OR party_b=? OR (party_a IN (SELECT id FROM sessions) AND party_b IN (SELECT id FROM sessions) AND EXISTS (
+        SELECT 1 FROM sessions s JOIN sessions owner ON owner.agent_group_id=s.agent_group_id
+        WHERE owner.id=? AND s.id IN (party_a,party_b))))`,
+      actor,
+      actor,
+      actor,
+    )
   ).changes;
 }
 export async function eventHead() {
@@ -137,7 +146,7 @@ export async function reports(machineId: string, body: ReportsRequest) {
     for (const report of body.reports) {
       const { kind, id } = report;
       if (kind !== 'idle' && kind !== 'state') {
-        results.push({ id, state: 'unknown', applied: false });
+        results.push({ id, state: null, applied: false });
         continue;
       }
       const remote = await remoteSession(machineId, report.session);
@@ -148,18 +157,6 @@ export async function reports(machineId: string, body: ReportsRequest) {
       if (row && remote) {
         if (report.kind === 'idle') {
           if (row.state === 'queued') await advanceDelivery(row, 'sent', null, report.at);
-          if (row.notify_idle && row.idle_at === null) {
-            const sender = await remoteById(row.sender);
-            if (sender)
-              await appendEvent(
-                sender.machine_id,
-                { kind: 'idle', id: report.id, session: sender.key, peer: remote.address, at: report.at },
-                row.row_id,
-              );
-            else await queueNotice(row.sender, row.recipient, remote.address + ' finished the turn.');
-            await db.run('UPDATE peer_messages SET idle_at=? WHERE row_id=?', report.at, row.row_id);
-            applied = true;
-          }
         } else if (
           report.kind === 'state' &&
           ['accepted', 'held', 'delivered', 'denied', 'expired', 'refused', 'dropped', 'unknown'].includes(report.state)
@@ -174,7 +171,7 @@ export async function reports(machineId: string, body: ReportsRequest) {
           log.info('Unknown peer delivery state', { id });
         }
       }
-      results.push({ id: report.id, state: row?.state ?? 'unknown', applied });
+      results.push({ id: report.id, state: row?.state ?? null, applied });
     }
     return results;
   });

@@ -87,6 +87,9 @@ it('delivers a reply only to the agent session that asked, even when another ses
   await deliverSessionMessages(session);
   expect(external).not.toHaveBeenCalled();
   const endpoint = await getDb().get<{ id: string }>('SELECT id FROM peer_endpoints WHERE actor=?', session.id);
+  const { heartbeat } = await import('./lifecycle.js');
+  const { seq } = (await getDb().get<{ seq: number }>('SELECT MAX(seq) AS seq FROM peer_events'))!;
+  await heartbeat(remote.id, { epoch: 1, cursor: seq, sessions: [{ key: remote.key, status: 'idle' }] });
   const reply = {
     epoch: 1,
     id: randomUUID(),
@@ -102,8 +105,8 @@ it('delivers a reply only to the agent session that asked, even when another ses
     senderRole: 'owner',
     stagedPath: 'private',
   };
-  await sendRemote(remote.id, reply, 'retry-hash');
-  await sendRemote(remote.id, reply, 'retry-hash');
+  await sendRemote(remote.id, reply);
+  await sendRemote(remote.id, reply);
   await drainInbound();
   const inbox = new Database(inboundDbPath(agent, session.id), { readonly: true });
   try {
@@ -148,7 +151,7 @@ it('creates a dedicated chat per remote, drops omitted heartbeat sessions and en
     notifyWhenIdle: false,
     failureNotice: false,
   };
-  const result = await sendRemote(remote.id, start, 'first');
+  const result = await sendRemote(remote.id, start);
   const endpoint = await getDb().get<{ actor: string }>(
     'SELECT actor FROM peer_endpoints WHERE id=?',
     result.message.endpoint.id,
@@ -188,13 +191,19 @@ it('creates a dedicated chat per remote, drops omitted heartbeat sessions and en
     (await getDb().get<{ sent_at: number }>('SELECT sent_at FROM peer_messages WHERE id=?', report.id))!.sent_at,
   ).toBe(report.at);
   await getDb().run('UPDATE peer_conversations SET hops=20');
-  const stopped = { ...start, id: randomUUID() };
-  await expect(sendRemote(remote.id, stopped, 'stopped')).rejects.toMatchObject({ body: { error: 'hop_limit' } });
-  await expect(sendRemote(remote.id, stopped, 'stopped')).rejects.toMatchObject({ body: { error: 'hop_limit' } });
-  expect(await getDb().get("SELECT COUNT(*) AS n FROM peer_events WHERE kind='limit'")).toEqual({ n: 1 });
+  const stopped = { ...start, id: randomUUID(), origin: 'human' as const };
+  await expect(sendRemote(remote.id, stopped)).rejects.toMatchObject({ body: { error: 'hop_limit' } });
+  await expect(sendRemote(remote.id, stopped)).rejects.toMatchObject({ body: { error: 'hop_limit' } });
+  expect(await getDb().get('SELECT COUNT(*) AS n FROM peer_inbound WHERE message_row IS NULL')).toEqual({ n: 1 });
+  await expect(sendRemote(remote.id, { ...stopped, id: randomUUID() })).rejects.toMatchObject({
+    body: { error: 'hop_limit' },
+  });
+  expect(await getDb().get('SELECT COUNT(*) AS n FROM peer_inbound WHERE message_row IS NULL')).toEqual({ n: 1 });
   expect(await resetHops(hub.id)).toBe(1);
-  const next = await sendRemote(remote.id, { ...start, id: randomUUID() }, 'new');
+  const next = await sendRemote(remote.id, { ...start, id: randomUUID() });
   expect(next.message.hop.count).toBe(1);
+  expect(await getDb().get('SELECT chain FROM peer_conversations')).toEqual({ chain: '[]' });
+
   expect(await heartbeat(remote.id, { epoch: 1, cursor: 0, sessions: [] })).toMatchObject({ ended: [remote.key] });
   await expect(
     routeAgentPeer(hub, { id: 'failed', platformId: remote.address, content: '{"text":"hello"}' }),
@@ -211,4 +220,164 @@ it('creates a dedicated chat per remote, drops omitted heartbeat sessions and en
   } finally {
     unread.close();
   }
+});
+
+it('resumes the ended process hub chat and endpoints while concurrent keys keep separate chats', async () => {
+  const remote = await registerTestMachine('resume');
+  const { endRemote } = await import('./lifecycle.js');
+  await createAgentGroup({
+    id: 'agent',
+    name: 'Agent',
+    folder: 'agent',
+    agent_provider: null,
+    created_at: new Date().toISOString(),
+  });
+  await setMeshMembership('agent', true);
+  const request = {
+    epoch: 1,
+    name: '._-Review-_.',
+    project: '._-Test-_.',
+    nameSource: 'user' as const,
+    startedAt: 0,
+    entrypoint: 'cli',
+    status: 'idle' as const,
+    claudeCode: 'test',
+    sessionId: 'resume',
+  };
+  const send = (key: string, to: { address: string } | { endpoint: string }) =>
+    sendRemote(remote.id, {
+      id: randomUUID(),
+      epoch: 1,
+      from: { session: key },
+      to,
+      text: 'question',
+      origin: 'unknown',
+      fromMode: null,
+      hopChain: [],
+      notifyWhenIdle: false,
+      failureNotice: false,
+    });
+  const first = await send(remote.key, { address: 'agent' });
+  const secondKey = '13-aaaaaaaa';
+  const second = await registerSession(remote.id, secondKey, request);
+  expect(second.address).toBe('review-2@test:resume');
+  const concurrent = await send(secondKey, { address: 'agent' });
+  expect(concurrent.message.endpoint.id).not.toBe(first.message.endpoint.id);
+  await endRemote(remote.id, remote.key);
+  const resumedKey = '14-bbbbbbbb';
+  expect((await registerSession(remote.id, resumedKey, request)).address).toBe('review@test:resume');
+  const same = await send(resumedKey, { address: 'agent' });
+  expect(same.message.endpoint.id).toBe(first.message.endpoint.id);
+  expect((await send(resumedKey, { endpoint: first.message.endpoint.id })).message.hop.count).toBe(3);
+  await expect(send(secondKey, { endpoint: first.message.endpoint.id })).rejects.toMatchObject({
+    body: { error: 'not_a_party' },
+  });
+});
+
+it('reconciles an inbox write after a hub restart and reports definite delivery failures', async () => {
+  const { initDb } = await import('../../db/connection.js');
+  const manager = await import('../../session-manager.js');
+  const { mkdirSync } = await import('node:fs');
+  await closeDb();
+  mkdirSync(DATA_DIR, { recursive: true });
+  const file = join(DATA_DIR, 'hub.db');
+  await runMigrations(await initDb(file));
+  const remote = await registerTestMachine('restart');
+  await createAgentGroup({
+    id: 'agent',
+    name: 'agent',
+    folder: 'agent',
+    created_at: new Date().toISOString(),
+    agent_provider: null,
+  });
+  await setMeshMembership('agent', true);
+  const send = () =>
+    sendRemote(remote.id, {
+      epoch: 1,
+      id: randomUUID(),
+      from: { session: remote.key },
+      to: { address: 'agent' },
+      text: 'question',
+      origin: 'human',
+      fromMode: null,
+      hopChain: [],
+      notifyWhenIdle: false,
+      failureNotice: false,
+    });
+  const pending = await send();
+  const job = (await getDb().get<{ id: string; content: string; hub_session: string; remote_id: string }>(
+    'SELECT * FROM peer_inbound',
+  ))!;
+  await manager.writeSessionMessage('agent', job.hub_session, {
+    id: 'peer-' + job.id,
+    kind: 'chat',
+    channelType: 'peer',
+    platformId: job.remote_id,
+    timestamp: new Date().toISOString(),
+    content: job.content,
+  });
+  await closeDb();
+  await runMigrations(await initDb(file));
+  await drainInbound();
+  await drainInbound();
+  const inbox = new Database(inboundDbPath('agent', job.hub_session), { readonly: true });
+  try {
+    expect(inbox.prepare('SELECT count(*) AS n FROM messages_in').get()).toEqual({ n: 1 });
+  } finally {
+    inbox.close();
+  }
+  const failed = await send();
+  const write = vi.spyOn(manager, 'writeSessionMessage').mockRejectedValueOnce(new Error('mailbox write failed'));
+  try {
+    await drainInbound();
+  } finally {
+    write.mockRestore();
+  }
+  const revoked = await send();
+  await setMeshMembership('agent', false);
+  await drainInbound();
+  const events = await getDb().all<{ payload: string }>(
+    "SELECT payload FROM peer_events WHERE kind='delivery' ORDER BY seq",
+  );
+  expect(events.map((e) => JSON.parse(e.payload))).toMatchObject([
+    { id: pending.message.id, state: 'delivered', reason: null },
+    { id: failed.message.id, state: 'dropped', reason: 'route_failed' },
+    { id: revoked.message.id, state: 'dropped', reason: 'not_member' },
+  ]);
+});
+
+it('counts both mesh agents through normal delivery, tells each side once, and resets on owner input to either group', async () => {
+  const { routeAgentMessage } = await import('../../modules/agent-to-agent/agent-route.js');
+  const { resetHops } = await import('./lifecycle.js');
+  const now = new Date().toISOString();
+  async function group(id: string) {
+    await createAgentGroup({ id, name: id, folder: id, agent_provider: null, created_at: now });
+    await setMeshMembership(id, true);
+    const session: Session = {
+      id: 'sess-' + id,
+      agent_group_id: id,
+      messaging_group_id: null,
+      thread_id: null,
+      agent_provider: null,
+      status: 'active',
+      container_status: 'stopped',
+      last_active: now,
+      created_at: now,
+    };
+    await createSession(session);
+    return session;
+  }
+  const a = await group('sender'),
+    b = await group('receiver');
+  const send = (i: number) =>
+    routeAgentMessage({ id: 'm' + i, in_reply_to: null, platform_id: b.agent_group_id, content: '{"text":"test"}' }, a);
+  for (let i = 0; i < 22; i++) await send(i);
+  await send(21);
+  expect(await getDb().get('SELECT count(*) AS n FROM peer_agent_sends WHERE refused=1')).toEqual({ n: 2 });
+  expect(await getDb().get('SELECT count(*) AS n FROM peer_inbound WHERE hub_session=?', a.id)).toEqual({ n: 2 });
+  expect(await getDb().get('SELECT count(*) AS n FROM peer_inbound WHERE hub_session=?', b.id)).toEqual({ n: 1 });
+  await createSession({ ...b, id: 'sess-owner-separate' });
+  expect(await resetHops('sess-owner-separate')).toBe(1);
+  await send(22);
+  expect(await getDb().get('SELECT hops,limited FROM peer_conversations')).toEqual({ hops: 1, limited: 0 });
 });

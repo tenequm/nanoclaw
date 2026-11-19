@@ -43,6 +43,8 @@ for (const name of [
   'SendRequest',
 ])
   includeSchema(name);
+// Let the send handler return the protocol's empty_text error and charge the attempt.
+delete requestSchemas.SendRequest.properties.text.minLength;
 // Protocol 1 readers ignore new status, report kind and reason values.
 delete requestSchemas.StateReport.properties.state.enum;
 delete requestSchemas.DropReason.enum;
