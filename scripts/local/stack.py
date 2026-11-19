@@ -253,6 +253,8 @@ def chain(state):
         'tls': {'certificates': [{'certFile': str(ca / 'server.crt'), 'keyFile': str(ca / 'server.key')}]},
         'http': {'routers': {'voice': {'entryPoints': ['websecure'],
             'rule': f'Host(`{PROXY_HOST}`) && PathPrefix(`/voice`)', 'service': 'host', 'tls': {}},
+            'nanoclaw-peer': {'entryPoints': ['websecure'],
+                'rule': f'Host(`{PROXY_HOST}`) && PathPrefix(`/peer`)', 'service': 'host', 'tls': {}},
             'app': {'entryPoints': ['websecure'],
                 'rule': f'Host(`{PROXY_HOST}`) && PathPrefix(`/app`)', 'service': 'host', 'tls': {}}},
             'services': {'host': {'loadBalancer': {'servers': [{'url': f'http://127.0.0.1:{b}'}]}}}}}))
