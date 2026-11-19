@@ -169,6 +169,9 @@ it('routes between two enrolled machines and authorizes a reply only from the ad
   expect(await getDb().get("SELECT seq FROM peer_events WHERE kind='idle'")).toBeUndefined();
   const duplicate = await b.call('POST', '/peer/messages', reply);
   expect(duplicate.status).toBe(200);
+  const staleRetry = await b.call('POST', '/peer/messages', { ...reply, epoch: b.epoch + 9 });
+  expect(staleRetry.status).toBe(200);
+  expect(await staleRetry.json()).toMatchObject({ message: { id: reply.id } });
   expect(await (await b.call('POST', '/peer/messages', { ...reply, text: 'changed' })).json()).toMatchObject({
     error: 'id_conflict',
   });

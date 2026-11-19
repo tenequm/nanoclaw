@@ -233,8 +233,6 @@ export interface MessageRow {
   created_at: number;
   expires_at: number;
   failure_notice: number;
-  notify_idle: number;
-  idle_at: number | null;
   sent_at: number | null;
 }
 interface Send {
@@ -245,7 +243,6 @@ interface Send {
   origin: SendRequest['origin'];
   chain?: string[];
   mode: SendRequest['fromMode'] | null;
-  notify: boolean;
   failure: boolean;
   reply?: boolean;
 }
@@ -366,7 +363,7 @@ async function queue(sender: Actor, target: Actor, scope: string, input: Send): 
     JSON.stringify(result),
     result.message.state,
     +input.failure,
-    +input.notify,
+    0,
     now,
     result.message.expiresAt,
     input.origin,
@@ -422,7 +419,7 @@ async function queue(sender: Actor, target: Actor, scope: string, input: Send): 
         hopChain: chain,
         fromMode: input.mode,
         hop: result.message.hop,
-        notifyWhenIdle: input.notify,
+        notifyWhenIdle: false,
         failureNotice: input.failure,
         createdAt: now,
         expiresAt: result.message.expiresAt,
@@ -520,9 +517,9 @@ export async function sendRemote(machineId: string, request: SendRequest) {
     .digest('hex');
   const db = getDb();
   const result = await db.transaction(async () => {
-    await checkEpoch(machineId, request.epoch);
     const duplicate = await previous(machineId, request.id, hash);
     if (duplicate) return duplicate;
+    await checkEpoch(machineId, request.epoch);
     const rate = await consumeRateLimit(
       'peer-send:' + machineId,
       limits.machineRate.limit,
@@ -553,7 +550,6 @@ export async function sendRemote(machineId: string, request: SendRequest) {
           origin: request.origin,
           chain: request.hopChain,
           mode: request.fromMode,
-          notify: false,
           failure: request.failureNotice,
           reply,
         });
@@ -602,9 +598,9 @@ export async function routeAgentPeer(
     .digest('hex');
   const result = await getDb()
     .transaction(async () => {
-      const sender = await actor(session.id);
       const old = await previous(session.id, msg.id, hash);
       if (old) return old;
+      const sender = await actor(session.id);
       const address = msg.platformId ?? '';
       let target: Actor;
       if (address.startsWith('ps_') && !address.includes('@')) {
@@ -635,7 +631,6 @@ export async function routeAgentPeer(
         text: peerText(data),
         origin: 'unknown',
         mode: provider === 'claude' ? 'bypass' : null,
-        notify: false,
         failure: data.failureNotice === true,
       });
     })

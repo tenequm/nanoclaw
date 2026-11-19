@@ -218,6 +218,16 @@ it('creates a dedicated chat per remote, drops omitted heartbeat sessions and en
   expect(next.message.hop.count).toBe(1);
   expect(await getDb().get('SELECT chain FROM peer_conversations')).toEqual({ chain: '[]' });
 
+  const members = await getDb().all<{ agent_group_id: string; address: string }>('SELECT * FROM mesh_members');
+  await getDb().run('DELETE FROM mesh_members');
+  const retried = await routeAgentPeer(hub, {
+    id: 'reply',
+    platformId: hub.messaging_group_id,
+    content: JSON.stringify({ text: 'answer' }),
+  });
+  expect(retried.message.id).toBe(outbound.message.id);
+  for (const m of members)
+    await getDb().run('INSERT INTO mesh_members(agent_group_id,address) VALUES (?,?)', m.agent_group_id, m.address);
   expect(await heartbeat(remote.id, { epoch: 1, cursor: 0, sessions: [] })).toMatchObject({ ended: [remote.key] });
   await expect(
     routeAgentPeer(hub, { id: 'failed', platformId: remote.address, content: '{"text":"hello"}' }),
