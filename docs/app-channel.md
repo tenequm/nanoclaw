@@ -31,7 +31,7 @@ Pairing starts with `/pair` in Telegram, restricted to an owner or admin over
 the target agent. Paste its single-use link into the app within 10 minutes. The code is in
 the URL fragment and is submitted only in the pairing body. The phone proves possession
 of its P-256 private key; the host stores its public key and the permitted agent set.
-Only paired agents appear, not every agent the user's role could otherwise access.
+Pairing shows the agents wired to that chat in the person's app.
 
 Every successful pairing sends a direct notice with the device name, UTC time and revocation
 instructions, after the pairing has been answered; a failed or slow notice does not undo or
@@ -61,6 +61,19 @@ restart. Only hello, pairing and ticketed uploads omit request signatures. Uploa
 are limited to one file's exact size and hash, expire after one hour and remain subject to
 device revocation. Never paste links or authorization headers into logs or reports.
 
+## Agents
+
+The signed agent list contains the agents the person administers that have a non-app chat or are
+already shown. Each entry includes the name of its oldest non-app chat (or null). The list sorts
+by agent name, then chat. A CLI-paired device can only list or change agents in its pairing scope.
+Showing or hiding an agent changes the person's list across devices. Open streams receive the
+conversation and an updated badge. A hide sets `hidden: true` on the final conversation event
+and stops delivery to that person's devices. Showing it again restores the same conversation and history.
+
+The `agents` and `unread` features are always available on this host version. Marking a conversation
+unread moves its shared read order to just before the newest agent message or question and returns
+the conversation and device badge. If there is no such item, the host returns `409 nothing_unread`.
+
 ## Routes
 
 All paths below are under `/app`. `:id` denotes an opaque identifier.
@@ -69,6 +82,9 @@ All paths below are under `/app`. `:id` denotes an opaque identifier.
 | ------ | ----------------------------------- | ---------------------------------------------- | ------------- |
 | GET    | `/hello`                            | Versions and configured features               | None          |
 | POST   | `/pair`                             | Consume pairing code and proof                 | Pairing proof |
+| GET    | `/agents`                           | List candidates and their shown state          | Signature     |
+| PUT    | `/agents/:id`                       | Set whether the person shows an agent          | Signature     |
+| POST   | `/conversations/:id/unread`         | Mark the newest agent item unread              | Signature     |
 | GET    | `/conversations`                    | Conversations, statuses and badge              | Signature     |
 | GET    | `/conversations/:id/messages`       | History; `before` or `after`, optional `limit` | Signature     |
 | POST   | `/conversations/:id/messages`       | Store and enqueue a message                    | Signature     |

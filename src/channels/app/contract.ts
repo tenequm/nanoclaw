@@ -75,6 +75,7 @@ export interface Conversation {
   kind: Kind;
   id: string;
   seq: number;
+  hidden?: boolean;
   agent: Agent;
   lastMessage: LastMessage | null;
   unread: number;
@@ -83,6 +84,21 @@ export interface Conversation {
   callRefusal: ErrorBody | null;
   createdAt: number;
 }
+
+export interface AgentCandidate extends Agent {
+  chat: string | null;
+  shown: boolean;
+}
+export interface AgentsResponse {
+  agents: AgentCandidate[];
+}
+export interface SetAgentRequest {
+  shown: boolean;
+}
+export interface SetAgentResponse {
+  agent: AgentCandidate;
+}
+export type UnreadResponse = ReadResponse;
 
 export interface FileAttachment {
   id: string;

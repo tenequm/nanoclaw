@@ -7,8 +7,8 @@ import {
   parseAuthorization,
   verifyRequestSignature,
   type ErrorBody,
+  type AgentCandidate,
 } from '../../channels/app/contract.js';
-import { hasAdminPrivilege } from '../permissions/db/user-roles.js';
 import type { DeviceRow } from './db.js';
 import { consumeRateLimit } from './rate-limit.js';
 import { clientAddress } from './gate.js';
@@ -41,21 +41,37 @@ export async function getLiveDevice(deviceId: string): Promise<DeviceRow | undef
 export async function liveDevices(userId: string): Promise<DeviceRow[]> {
   return getDb().all<DeviceRow>('SELECT * FROM device_auth_devices WHERE user_id = ? AND revoked_at IS NULL', userId);
 }
+// Both visibility changes and deliveries use the same live device, role and CLI pairing scope.
+const deviceScope = `WITH scope AS (
+  SELECT a.id, a.name, CASE WHEN u.user_id IS NULL THEN 0 ELSE 1 END AS shown
+  FROM device_auth_devices d CROSS JOIN agent_groups a
+  LEFT JOIN device_auth_user_agents u ON u.user_id = d.user_id AND u.agent_group_id = a.id
+  WHERE d.id = ? AND d.revoked_at IS NULL
+    AND EXISTS (SELECT 1 FROM user_roles r WHERE r.user_id = d.user_id AND
+      ((r.agent_group_id IS NULL AND r.role IN ('owner','admin')) OR (r.role = 'admin' AND r.agent_group_id = a.id)))
+    AND (NOT EXISTS (SELECT 1 FROM device_auth_device_agents WHERE device_id = d.id) OR
+      EXISTS (SELECT 1 FROM device_auth_device_agents p WHERE p.device_id = d.id AND p.agent_group_id = a.id))
+)`;
 export async function reachableAgentIds(deviceId: string): Promise<string[]> {
-  const device = await getLiveDevice(deviceId);
-  if (!device) return [];
-  const rows = await getDb().all<{ agent_group_id: string }>(
-    `SELECT u.agent_group_id FROM device_auth_user_agents u
-    JOIN agent_groups a ON a.id = u.agent_group_id WHERE u.user_id = ? AND
-    (NOT EXISTS (SELECT 1 FROM device_auth_device_agents WHERE device_id = ?) OR
-     EXISTS (SELECT 1 FROM device_auth_device_agents d WHERE d.device_id = ? AND d.agent_group_id = u.agent_group_id))`,
-    device.user_id,
+  const rows = await getDb().all<{ id: string }>(`${deviceScope} SELECT id FROM scope WHERE shown = 1`, deviceId);
+  return rows.map((row) => row.id);
+}
+export async function devicePermitsAgent(deviceId: string, agentId: string): Promise<boolean> {
+  return !!(await getDb().get(`${deviceScope} SELECT id FROM scope WHERE id = ?`, deviceId, agentId));
+}
+export async function agentCandidates(deviceId: string, agentId?: string): Promise<AgentCandidate[]> {
+  const rows = await getDb().all<Omit<AgentCandidate, 'shown'> & { shown: number }>(
+    `${deviceScope}
+    SELECT s.id, s.name, m.name AS chat, s.shown FROM scope s
+    LEFT JOIN messaging_groups m ON m.id = (
+      SELECT g.id FROM messaging_group_agents w JOIN messaging_groups g ON g.id = w.messaging_group_id
+      WHERE w.agent_group_id = s.id AND g.channel_type <> 'app' ORDER BY g.created_at, g.id LIMIT 1)
+    WHERE (m.id IS NOT NULL OR s.shown = 1) ${agentId === undefined ? '' : 'AND s.id = ?'}
+    ORDER BY s.name, m.name, s.id`,
     deviceId,
-    deviceId,
+    ...(agentId === undefined ? [] : [agentId]),
   );
-  const ids: string[] = [];
-  for (const row of rows) if (await hasAdminPrivilege(device.user_id, row.agent_group_id)) ids.push(row.agent_group_id);
-  return ids;
+  return rows.map((row) => ({ ...row, shown: Boolean(row.shown) }));
 }
 const listeners = new Set<(deviceId: string) => void>();
 export function onDeviceRevoked(listener: (deviceId: string) => void): () => void {

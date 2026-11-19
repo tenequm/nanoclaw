@@ -2,8 +2,16 @@ import { randomUUID } from 'node:crypto';
 import { getDb } from '../../db/connection.js';
 import { createMessagingGroup, createMessagingGroupAgent } from '../../db/messaging-groups.js';
 import { getAgentGroup } from '../../db/agent-groups.js';
-import { authError, readSignedBody } from '../../modules/device-auth/verify.js';
-import { parseAuthorization, type Conversation, type Badge, type Message, type Question } from './contract.js';
+import { agentCandidates, authError, readSignedBody } from '../../modules/device-auth/verify.js';
+import {
+  parseAuthorization,
+  type Conversation,
+  type SetAgentResponse,
+  type AgentsResponse,
+  type Badge,
+  type Message,
+  type Question,
+} from './contract.js';
 import type { ConversationRow, MessageRow, QuestionRow } from './db.js';
 import { appHooks, appTransaction, appendEvent, lastEventSeq, afterAppCommit } from './log.js';
 import { json, type AppHandler, type AppRequest } from './routes.js';
@@ -18,58 +26,62 @@ export async function conversationsFor(userId: string, agentIds: string[]): Prom
     )
   ).filter((c) => agentIds.includes(c.agent_group_id));
 }
+const conversationForAgent = (userId: string, agentGroupId: string) =>
+  getDb().get<ConversationRow>(
+    'SELECT * FROM app_conversations WHERE user_id = ? AND agent_group_id = ?',
+    userId,
+    agentGroupId,
+  );
+
+async function createConversation(userId: string, agentGroupId: string): Promise<ConversationRow> {
+  const db = getDb();
+  const agent = await getAgentGroup(agentGroupId);
+  if (!agent) throw new Error('Agent not found');
+  const id = `conv_${randomUUID()}`,
+    now = Date.now();
+  await createMessagingGroup({
+    id,
+    channel_type: 'app',
+    instance: 'app',
+    platform_id: id,
+    name: `${agent.name} (app)`,
+    is_group: 0,
+    unknown_sender_policy: 'strict',
+    created_at: new Date(now).toISOString(),
+  });
+  await createMessagingGroupAgent({
+    id: randomUUID(),
+    messaging_group_id: id,
+    agent_group_id: agentGroupId,
+    engage_mode: 'pattern',
+    engage_pattern: '.',
+    sender_scope: 'all',
+    ignored_message_policy: 'drop',
+    session_mode: 'shared',
+    priority: 0,
+    threads: 0,
+    created_at: new Date(now).toISOString(),
+  });
+  await db.run(
+    'INSERT INTO app_conversations (id,user_id,agent_group_id,messaging_group_id,seq,created_at) VALUES (?,?,?,?,0,?)',
+    id,
+    userId,
+    agentGroupId,
+    id,
+    now,
+  );
+  return (await getConversation(id))!;
+}
 export async function ensureConversation(userId: string, agentGroupId: string): Promise<ConversationRow> {
-  const find = () =>
-    getDb().get<ConversationRow>(
-      'SELECT * FROM app_conversations WHERE user_id = ? AND agent_group_id = ?',
-      userId,
-      agentGroupId,
-    );
-  const found = await find();
+  const found = await conversationForAgent(userId, agentGroupId);
   if (found) return found;
   const availability = await appHooks.callAvailability(userId, agentGroupId);
   return appTransaction(async () => {
-    const db = getDb();
-    const existing = await find();
+    const existing = await conversationForAgent(userId, agentGroupId);
     if (existing) return existing;
-    const agent = await getAgentGroup(agentGroupId);
-    if (!agent) throw new Error('Agent not found');
-    const id = `conv_${randomUUID()}`,
-      now = Date.now();
-    await createMessagingGroup({
-      id,
-      channel_type: 'app',
-      instance: 'app',
-      platform_id: id,
-      name: `${agent.name} (app)`,
-      is_group: 0,
-      unknown_sender_policy: 'strict',
-      created_at: new Date(now).toISOString(),
-    });
-    await createMessagingGroupAgent({
-      id: randomUUID(),
-      messaging_group_id: id,
-      agent_group_id: agentGroupId,
-      engage_mode: 'pattern',
-      engage_pattern: '.',
-      sender_scope: 'all',
-      ignored_message_policy: 'drop',
-      session_mode: 'shared',
-      priority: 0,
-      threads: 0,
-      created_at: new Date(now).toISOString(),
-    });
-    await db.run(
-      'INSERT INTO app_conversations (id,user_id,agent_group_id,messaging_group_id,seq,created_at) VALUES (?,?,?,?,0,?)',
-      id,
-      userId,
-      agentGroupId,
-      id,
-      now,
-    );
-    const c = (await getConversation(id))!;
-    await conversationEvent(c, availability);
-    return (await getConversation(id))!;
+    const c = await createConversation(userId, agentGroupId);
+    c.seq = (await conversationEvent(c, availability)).seq;
+    return c;
   });
 }
 export function plainPreview(text: string): string {
@@ -121,26 +133,32 @@ export async function conversationEntity(c: ConversationRow, availability?: Call
     createdAt: c.created_at,
   };
 }
-export async function conversationEvent(c: ConversationRow, availability: CallAvailability): Promise<Conversation> {
+export async function conversationEvent(
+  c: ConversationRow,
+  availability: CallAvailability,
+  hidden?: boolean,
+): Promise<Conversation> {
   const entity = await conversationEntity(c, availability);
+  if (hidden !== undefined) entity.hidden = hidden;
   await appendEvent(getDb(), c.user_id, c.agent_group_id, entity);
   await getDb().run('UPDATE app_conversations SET seq = ? WHERE id = ?', entity.seq, c.id);
   return entity;
 }
-const badgeListeners = new Set<(userId: string) => void>();
-export function onBadgeChanged(listener: (userId: string) => void): () => void {
+type BadgeListener = (userId: string, agentId?: string) => void;
+const badgeListeners = new Set<BadgeListener>();
+export function onBadgeChanged(listener: BadgeListener): () => void {
   badgeListeners.add(listener);
   return () => {
     badgeListeners.delete(listener);
   };
 }
-export async function bumpBadge(userId: string): Promise<void> {
+async function bumpBadge(userId: string, agentId?: string): Promise<void> {
   await getDb().run(
     'INSERT INTO app_badge_revisions (user_id,rev) VALUES (?,1) ON CONFLICT (user_id) DO UPDATE SET rev = app_badge_revisions.rev + 1',
     userId,
   );
   afterAppCommit(() => {
-    for (const listener of badgeListeners) listener(userId);
+    for (const listener of badgeListeners) listener(userId, agentId);
   });
 }
 export async function badgeFor(userId: string, agentIds: string[]): Promise<Badge> {
@@ -171,7 +189,7 @@ export async function itemChanged(
     await getDb().run('UPDATE app_conversations SET last_message_json = ? WHERE id = ?', c.last_message_json, c.id);
     await conversationEvent(c, availability);
   }
-  if (created && role === 'agent') await bumpBadge(c.user_id);
+  if (created && role === 'agent') await bumpBadge(c.user_id, c.agent_group_id);
 }
 export function messageEntity(r: MessageRow): Message {
   return {
@@ -243,6 +261,38 @@ export async function requestBody(ctx: AppRequest, maxBytes = 256 * 1024): Promi
     throw authError(400, 'bad_request', 'The request is malformed.');
   return body as Record<string, unknown>;
 }
+export const listAgents: AppHandler = async ({ res, identity }) => {
+  json(res, 200, { agents: await agentCandidates(identity!.deviceId) } satisfies AgentsResponse);
+};
+export const setAgentShown: AppHandler = async (ctx) => {
+  const { shown } = await requestBody(ctx);
+  if (typeof shown !== 'boolean') throw authError(400, 'bad_request', 'The request is malformed.');
+  const { deviceId, userId } = ctx.identity!;
+  const id = ctx.params.id;
+  const availability = await appHooks.callAvailability(userId, id);
+  const agent = await appTransaction(async () => {
+    const [candidate] = await agentCandidates(deviceId, id);
+    if (!candidate) throw authError(404, 'not_found', 'Not found.');
+    const existing = await conversationForAgent(userId, id);
+    if (candidate.shown === shown && (existing || !shown)) return candidate;
+    const db = getDb();
+    if (shown) {
+      await db.run(
+        'INSERT INTO device_auth_user_agents (user_id,agent_group_id,created_at) VALUES (?,?,?) ON CONFLICT DO NOTHING',
+        userId,
+        id,
+        Date.now(),
+      );
+    } else {
+      await db.run('DELETE FROM device_auth_user_agents WHERE user_id = ? AND agent_group_id = ?', userId, id);
+    }
+    const c = existing ?? (await createConversation(userId, id));
+    await conversationEvent(c, availability, !shown);
+    await bumpBadge(userId);
+    return { ...candidate, shown };
+  });
+  json(ctx.res, 200, { agent } satisfies SetAgentResponse);
+};
 export const listConversations: AppHandler = async (ctx) => {
   const { userId, agentIds } = ctx.identity!;
   const seq = await lastEventSeq();
@@ -317,28 +367,43 @@ export const markRead: AppHandler = async (ctx) => {
     json(ctx.res, 400, { error: 'bad_request', message: 'The request is malformed.' });
     return;
   }
+  await updateReadOrder(ctx, c, order);
+};
+export const markUnread: AppHandler = async (ctx) => {
+  const c = await accessibleConversation(ctx);
+  if (!c) return;
+  const auth = parseAuthorization(ctx.req.headers.authorization)!;
+  await readSignedBody(ctx.req, auth.bodyHash, 0);
+  await updateReadOrder(ctx, c, 'unread');
+};
+async function updateReadOrder(ctx: AppRequest, c: ConversationRow, order: number | 'unread'): Promise<void> {
   const availability = await appHooks.callAvailability(c.user_id, c.agent_group_id);
   const conversation = await appTransaction(async () => {
     const db = getDb();
+    const unread = order === 'unread';
     const newest =
       (
-        await db.get<{ n: number }>(
-          'SELECT MAX(item_order) AS n FROM (SELECT item_order FROM app_messages WHERE conversation_id = ? UNION ALL SELECT item_order FROM app_questions WHERE conversation_id = ?)',
+        await db.get<{ n: number | null }>(
+          `SELECT MAX(item_order) AS n FROM (SELECT item_order FROM app_messages WHERE conversation_id = ? ${unread ? "AND role = 'agent'" : ''}
+      UNION ALL SELECT item_order FROM app_questions WHERE conversation_id = ?)`,
           c.id,
           c.id,
         )
       )?.n ?? 0;
+    if (unread && !newest)
+      throw authError(409, 'nothing_unread', 'There is no agent message or question to mark unread.');
+    const target = unread ? newest - 1 : Math.min(order, newest);
     const result = await db.run(
-      'INSERT INTO app_read_state (user_id,conversation_id,read_order) VALUES (?,?,?) ON CONFLICT (user_id,conversation_id) DO UPDATE SET read_order = excluded.read_order WHERE app_read_state.read_order < excluded.read_order',
+      `INSERT INTO app_read_state (user_id,conversation_id,read_order) VALUES (?,?,?) ON CONFLICT (user_id,conversation_id) DO UPDATE SET read_order = excluded.read_order WHERE app_read_state.read_order ${unread ? '<>' : '<'} excluded.read_order`,
       c.user_id,
       c.id,
-      Math.min(order, newest),
+      target,
     );
-    if (result.changes && Math.min(order, newest) > 0) {
-      await bumpBadge(c.user_id);
+    if (result.changes && (unread || target > 0)) {
+      await bumpBadge(c.user_id, c.agent_group_id);
       return conversationEvent((await getConversation(c.id))!, availability);
     }
     return conversationEntity((await getConversation(c.id))!, availability);
   });
   json(ctx.res, 200, { conversation, badge: await badgeFor(c.user_id, ctx.identity!.agentIds) });
-};
+}

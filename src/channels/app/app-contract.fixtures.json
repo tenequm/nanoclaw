@@ -215,7 +215,7 @@
     "protocol": 1,
     "minProtocol": 1,
     "voiceProtocol": 6,
-    "features": ["files", "calls", "push", "voice-picker"],
+    "features": ["agents", "unread", "files", "calls", "push", "voice-picker"],
     "serverTime": 1794943562000
   },
   "pairLink": {
@@ -341,6 +341,10 @@
         "error": "invalid_code",
         "message": "This pairing link is used or expired. Send /pair again."
       }
+    },
+    "nothingUnread": {
+      "status": 409,
+      "body": { "error": "nothing_unread", "message": "There is no agent message or question to mark unread." }
     },
     "notFound": {
       "status": 404,
@@ -1305,6 +1309,79 @@
       "kind": "badge",
       "rev": 9,
       "unreadTotal": 0
+    }
+  },
+  "agentsResponse": {
+    "agents": [
+      {
+        "id": "ag_taylor",
+        "name": "Taylor",
+        "chat": "Support",
+        "shown": true
+      }
+    ]
+  },
+  "setAgentRequest": {
+    "shown": false
+  },
+  "setAgentResponse": {
+    "agent": {
+      "id": "ag_taylor",
+      "name": "Taylor",
+      "chat": "Support",
+      "shown": false
+    }
+  },
+  "hiddenEvent": {
+    "kind": "conversation",
+    "id": 2132,
+    "data": {
+      "kind": "conversation",
+      "id": "conv_taylor01",
+      "seq": 2132,
+      "agent": {
+        "id": "ag_taylor",
+        "name": "Taylor"
+      },
+      "lastMessage": {
+        "id": "msg_0126",
+        "role": "agent",
+        "preview": "Second draft.",
+        "at": 1794943593000
+      },
+      "unread": 1,
+      "readOrder": 125,
+      "canCall": true,
+      "callRefusal": null,
+      "createdAt": 1794857162000,
+      "hidden": true
+    }
+  },
+  "unreadResponse": {
+    "conversation": {
+      "kind": "conversation",
+      "id": "conv_taylor01",
+      "seq": 2131,
+      "agent": {
+        "id": "ag_taylor",
+        "name": "Taylor"
+      },
+      "lastMessage": {
+        "id": "msg_0126",
+        "role": "agent",
+        "preview": "Second draft.",
+        "at": 1794943593000
+      },
+      "unread": 1,
+      "readOrder": 125,
+      "canCall": true,
+      "callRefusal": null,
+      "createdAt": 1794857162000
+    },
+    "badge": {
+      "kind": "badge",
+      "rev": 10,
+      "unreadTotal": 1
     }
   },
   "answerRequest": {

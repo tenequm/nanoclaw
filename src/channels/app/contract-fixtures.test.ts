@@ -299,15 +299,19 @@ describe('signed HTTP fixture producers', () => {
       content: { type: 'ask_question', questionId, title: q.title, question: q.text, options: q.options, expiresAt },
     });
   }
-  async function replay(after: number): Promise<string> {
+  async function withStream<T>(
+    after: number,
+    deviceId: string,
+    run: (readUntil: (pattern: RegExp) => Promise<string>) => Promise<T>,
+  ): Promise<T> {
     const target = `/app/events?after=${after}`;
     const controller = new AbortController();
     const response = await fetch(base + target, {
-      signal: controller.signal,
+      signal: AbortSignal.any([controller.signal, AbortSignal.timeout(5000)]),
       headers: {
         authorization: signRequest({
           privateKey: fixtures.testKey.privateKeyPkcs8Pem,
-          deviceId: device,
+          deviceId,
           method: 'GET',
           target,
         }),
@@ -318,17 +322,200 @@ describe('signed HTTP fixture producers', () => {
     let raw = '';
     try {
       const decoder = new TextDecoder();
-      while (!/event: synchronized\ndata: [^\n]+\n\n/.test(raw)) {
-        const next = await reader.read();
-        if (next.done) break;
-        raw += decoder.decode(next.value, { stream: true });
-      }
-      return raw;
+      return await run(async (pattern) => {
+        let match = pattern.exec(raw);
+        while (!match) {
+          const next = await reader.read();
+          if (next.done) throw new Error('Stream closed before expected event');
+          raw += decoder.decode(next.value, { stream: true });
+          match = pattern.exec(raw);
+        }
+        const end = match.index + match[0].length;
+        const result = raw.slice(0, end);
+        raw = raw.slice(end);
+        return result;
+      });
     } finally {
       controller.abort();
       await reader.cancel().catch(() => {});
     }
   }
+  const synchronized = /event: synchronized\ndata: [^\n]+\n\n/;
+  const replay = (after: number) => withStream(after, device, (read) => read(synchronized));
+  async function wire(id: string, name: string | null, createdAt = '2026-11-17') {
+    const group = randomUUID();
+    const db = getDb();
+    await db.run(
+      "INSERT INTO messaging_groups (id,channel_type,platform_id,instance,name,created_at) VALUES (?,'telegram',?,'telegram',?,?)",
+      group,
+      group,
+      name,
+      createdAt,
+    );
+    await db.run(
+      'INSERT INTO messaging_group_agents (id,messaging_group_id,agent_group_id,created_at) VALUES (?,?,?,?)',
+      randomUUID(),
+      group,
+      id,
+      createdAt,
+    );
+  }
+  it('lists wired or shown agents within the device and role scope, sorted by agent and oldest chat', async () => {
+    const db = getDb();
+    for (const id of ['unwired', 'also-taylor', 'unnamed-chat'])
+      await createAgentGroup({ ...agent, id, folder: id, agent_provider: null, created_at: '2026-11-17' });
+    await wire('also-taylor', 'Beta');
+    await wire('unnamed-chat', null);
+    const list = async () => (await request('GET', '/app/agents')).body.agents;
+    const expected = { ...agent, chat: null, shown: true };
+    expect(await list()).toEqual([expected]);
+    expect(await request('PUT', '/app/agents/also-taylor', { shown: true })).toEqual(fixtures.errors.notFound);
+    await wire(agent.id, 'Later', '2026-11-18');
+    await wire(agent.id, 'Support');
+    expect(await request('GET', '/app/agents')).toEqual({ status: 200, body: fixtures.agentsResponse });
+    await db.run('DELETE FROM device_auth_device_agents WHERE device_id = ?', device);
+    const global = [
+      { ...agent, id: 'unnamed-chat', chat: null, shown: false },
+      { ...agent, id: 'also-taylor', chat: 'Beta', shown: false },
+      { ...agent, chat: 'Support', shown: true },
+    ];
+    expect(await list()).toEqual(global);
+    expect(await request('PUT', '/app/agents/unwired', { shown: true })).toEqual(fixtures.errors.notFound);
+    await db.run("UPDATE user_roles SET role = 'admin' WHERE user_id = ?", user);
+    expect(await list()).toEqual(global);
+    await db.run("UPDATE user_roles SET agent_group_id = 'also-taylor' WHERE user_id = ?", user);
+    expect(await list()).toEqual([global[1]]);
+    expect(await request('PUT', `/app/agents/${agent.id}`, { shown: false })).toEqual(fixtures.errors.notFound);
+    const update = await request('PUT', '/app/agents/also-taylor', { shown: true });
+    expect(update).toEqual({ status: 200, body: { agent: { ...global[1], shown: true } } });
+    expect((await request('GET', '/app/conversations')).body.conversations).toMatchObject([
+      { agent: { id: 'also-taylor' } },
+    ]);
+  });
+  it('updates an open sibling stream and its badge on hide and re-show, and suppresses hidden deliveries', async () => {
+    const db = getDb();
+    const sibling = 'fixture-sibling';
+    await db.run(
+      'INSERT INTO device_auth_devices (id,user_id,name,public_key,app_json,created_at) VALUES (?,?,?,?,?,?)',
+      sibling,
+      user,
+      'Other phone',
+      fixtures.testKey.publicKeySpki,
+      '{}',
+      Date.now(),
+    );
+    await wire(agent.id, 'Support');
+    expect((await request('PUT', '/app/devices/me/push-token', fixtures.pushTokenRequest)).status).toBe(204);
+    const send = vi.fn(async (_token: unknown, entityId: string) => ({ status: 200, clearToken: false, entityId }));
+    const stop = subscribePush(
+      { onEventAppended, badgeFor, plainPreview },
+      {
+        config: () => ({ ...readAppConfig(() => undefined), publicBase: 'https://app.example.com' }),
+        send,
+        concurrency: 1,
+      },
+    );
+    const target = `/app/agents/${agent.id}`;
+    const put = (shown: boolean) => request('PUT', target, { shown });
+    const reply = () =>
+      deliver(conversation, null, { kind: 'chat', sourceId: randomUUID(), content: { text: 'Reply' } });
+    const badge = /event: badge\ndata: [^\n]+\n\n/;
+    try {
+      await reply();
+      await vi.waitFor(() => expect(send).toHaveBeenCalledTimes(1));
+      await withStream(await lastEventSeq(), sibling, async (read) => {
+        expect(await read(synchronized)).toContain('"unreadTotal":1');
+        expect(await request('PUT', target, { shown: 0 })).toEqual(fixtures.errors.badRequest);
+        expect(await request('PUT', target, fixtures.setAgentRequest)).toEqual({
+          status: 200,
+          body: fixtures.setAgentResponse,
+        });
+        const hidden = await read(badge);
+        expect(hidden.match(/event: conversation/g)).toHaveLength(1);
+        expect(hidden).toContain('"hidden":true');
+        expect(hidden).toContain('"unreadTotal":0');
+        const cursor = await lastEventSeq();
+        expect((await put(false)).status).toBe(200);
+        expect(await lastEventSeq()).toBe(cursor);
+        expect(await request('GET', `/app/conversations/${conversation}/messages`)).toEqual(fixtures.errors.notFound);
+        const otherId = 'ag_visible';
+        await createAgentGroup({
+          ...agent,
+          id: otherId,
+          folder: otherId,
+          agent_provider: null,
+          created_at: '2026-11-17',
+        });
+        await db.run('INSERT INTO device_auth_user_agents VALUES (?,?,0)', user, otherId);
+        await db.run('INSERT INTO device_auth_device_agents VALUES (?,?)', device, otherId);
+        const other = await ensureConversation(user, otherId);
+        await reply();
+        const visibleMessage = await deliver(other.id, null, {
+          kind: 'chat',
+          sourceId: randomUUID(),
+          content: { text: 'Visible' },
+        });
+        const suppressed = await read(badge);
+        expect(suppressed).not.toContain(conversation);
+        expect(suppressed).toContain(other.id);
+        expect(suppressed).toContain('"unreadTotal":1');
+        await vi.waitFor(() => expect(send).toHaveBeenCalledTimes(2));
+        expect(send.mock.calls[1][1]).toBe(visibleMessage);
+        expect((await put(true)).status).toBe(200);
+        const restored = await read(badge);
+        expect(restored).toContain(conversation);
+        expect(restored).toContain('"hidden":false');
+        expect(restored).toContain('"unreadTotal":3');
+        const shownCursor = await lastEventSeq();
+        expect((await put(true)).status).toBe(200);
+        expect(await lastEventSeq()).toBe(shownCursor);
+        expect(await items()).toHaveLength(2);
+        const latest = await reply();
+        expect(await read(badge)).toContain(latest);
+        await vi.waitFor(() => expect(send).toHaveBeenCalledTimes(3));
+      });
+    } finally {
+      stop();
+    }
+  });
+  it('replays a hide only within the current role and CLI device scope, even for a now-unwired agent', async () => {
+    const cursor = await lastEventSeq();
+    const db = getDb();
+    expect((await request('PUT', `/app/agents/${agent.id}`, { shown: false })).status).toBe(200);
+    expect((await request('GET', '/app/agents')).body.agents).toEqual([]);
+    expect(await replay(cursor)).toContain('"hidden":true');
+    await db.run('UPDATE device_auth_device_agents SET agent_group_id = ? WHERE device_id = ?', 'another', device);
+    expect(await replay(cursor)).not.toContain(conversation);
+    await db.run('DELETE FROM device_auth_device_agents WHERE device_id = ?', device);
+    await db.run('DELETE FROM user_roles WHERE user_id = ?', user);
+    expect(await replay(cursor)).not.toContain(conversation);
+  });
+  it('marks the newest agent message or question unread, ignoring newer user items', async () => {
+    const target = `/app/conversations/${conversation}`;
+    const unread = () => request('POST', target + '/unread');
+    const send = () => request('POST', target + '/messages', { clientId: randomUUID(), text: 'Check', fileIds: [] });
+    await send();
+    expect(await unread()).toEqual(fixtures.errors.nothingUnread);
+    const message = await deliver(conversation, null, {
+      kind: 'chat',
+      sourceId: randomUUID(),
+      content: { text: 'Reply' },
+    });
+    for (const kind of ['message', 'question']) {
+      const newest = kind === 'message' ? message : await ask(Date.now() + 300000);
+      await send();
+      const order = (await items()).find((item) => item.id === newest)!.order as number;
+      expect((await request('POST', target + '/read', { order: Number.MAX_SAFE_INTEGER })).body.badge.unreadTotal).toBe(
+        0,
+      );
+      const result = await unread();
+      expect(result).toMatchObject({
+        status: 200,
+        body: { conversation: { id: conversation, readOrder: order - 1, unread: 1 }, badge: { unreadTotal: 1 } },
+      });
+      expect(await unread()).toEqual(result);
+    }
+  });
   it('replays seeded fixture frames through signed HTTP dispatch', async () => {
     const frames = fixtures.stream.raw
       .split('\n\n')

@@ -7,7 +7,7 @@ import { handlePair, handleRevoke } from '../../modules/device-auth/pairing.js';
 import { appFeatures } from './config.js';
 import { APP_PROTOCOL, type HelloResponse } from './contract.js';
 import { LIVEKIT_PROTOCOL_VERSION } from '../voice-mode-protocol.js';
-import { listConversations, history, markRead } from './conversations.js';
+import { listConversations, history, markRead, markUnread, listAgents, setAgentShown } from './conversations.js';
 import { sendMessage } from './send.js';
 import { answerQuestion } from './questions.js';
 import { streamEvents } from './stream.js';
@@ -46,6 +46,9 @@ export const hello: AppHandler = async ({ res }) => {
 export const routes: readonly AppRoute[] = [
   { method: 'GET', path: '/app/hello', signed: false, handler: hello },
   { method: 'POST', path: '/app/pair', signed: false, handler: handlePair },
+  { method: 'GET', path: '/app/agents', signed: true, handler: listAgents },
+  { method: 'PUT', path: '/app/agents/:id', signed: true, handler: setAgentShown },
+  { method: 'POST', path: '/app/conversations/:id/unread', signed: true, handler: markUnread },
   { method: 'GET', path: '/app/conversations', signed: true, handler: listConversations },
   { method: 'GET', path: '/app/conversations/:id/messages', signed: true, handler: history },
   { method: 'POST', path: '/app/conversations/:id/messages', signed: true, handler: sendMessage },
