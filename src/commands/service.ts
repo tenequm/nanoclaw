@@ -24,6 +24,8 @@
  * comments. Emoji are allowed as UI glyphs (none used here).
  */
 
+import fs from 'fs';
+
 import { getRegisteredChannelNames } from '../channels/channel-registry.js';
 import { restartAgentGroupContainers } from '../container-restart.js';
 import { isContainerRunning, killContainer } from '../container-runner.js';
@@ -35,11 +37,17 @@ import {
   getMessagingGroupAgents,
   updateMessagingGroupAgent,
 } from '../db/messaging-groups.js';
-import { findSessionByAgentGroup, findSessionForAgent, getSessionsByAgentGroup } from '../db/sessions.js';
+import {
+  findSessionByAgentGroup,
+  findSessionForAgent,
+  findTaskSessions,
+  getSessionsByAgentGroup,
+} from '../db/sessions.js';
 import { log } from '../log.js';
 import { hasAdminPrivilege } from '../modules/permissions/db/user-roles.js';
 import type { ContainerConfigRow, EngageMode, Session } from '../types.js';
-import { activeSessionCounts } from '../modules/scheduling/task-count.js';
+import { inboundDbPath } from '../mailbox/sqlite/paths.js';
+import { openInboundDb } from '../mailbox/sqlite/session-db.js';
 import { readSessionStatus } from './transcript.js';
 import {
   describeModel,
@@ -160,6 +168,36 @@ async function findChatSession(agentGroupId: string, chatCtx: StatusChatContext)
   return (await findSessionForAgent(agentGroupId, chatCtx.messagingGroupId, null)) ?? null;
 }
 
+/** Active (pending/paused) scheduled task series for an agent group, or null. */
+async function safeTaskCount(agentGroupId: string): Promise<number | null> {
+  try {
+    let total = 0;
+    for (const s of await findTaskSessions(agentGroupId)) {
+      const dbPath = inboundDbPath(agentGroupId, s.id);
+      if (!fs.existsSync(dbPath)) continue;
+      const db = openInboundDb(dbPath);
+      try {
+        const row = db
+          .prepare(
+            `SELECT COUNT(*) AS c FROM (
+               SELECT 1 FROM messages_in
+                WHERE kind = 'task' AND status IN ('pending', 'paused')
+                GROUP BY series_id
+             )`,
+          )
+          .get() as { c: number };
+        total += row.c;
+      } finally {
+        db.close();
+      }
+    }
+    return total;
+  } catch (err) {
+    log.debug('Task count read failed', { agentGroupId, err: String(err) });
+    return null;
+  }
+}
+
 // --- Reads ---
 
 export async function getAgentConfigStatus(agentGroupId: string) {
@@ -196,7 +234,7 @@ export async function getAgentConfigStatus(agentGroupId: string) {
 export async function getStatus(agentGroupId: string, chatCtx?: StatusChatContext) {
   const config = await getAgentConfigStatus(agentGroupId);
   if (!config.ok) return config;
-  const counts = await activeSessionCounts(agentGroupId);
+  const activeSessions = (await getSessionsByAgentGroup(agentGroupId)).filter((s) => s.status === 'active');
 
   let activation: ActivationView | null = null;
 
@@ -220,14 +258,14 @@ export async function getStatus(agentGroupId: string, chatCtx?: StatusChatContex
 
   const view = {
     ...config.view,
-    sessionCount: counts.sessions,
+    sessionCount: activeSessions.length,
     activation,
     contextTokens: stats?.contextTokens ?? null,
     contextWindow: config.view.autoCompactWindow ?? DEFAULT_AUTO_COMPACT_WINDOW,
     sessionOutputTokens: stats?.outputTokens ?? null,
     sessionTurns: stats?.turns ?? null,
     queueDepth,
-    taskCount: counts.tasks,
+    taskCount: chatCtx?.transcriptScope === 'session' ? null : await safeTaskCount(agentGroupId),
   };
   return { ok: true as const, view };
 }

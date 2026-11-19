@@ -1690,7 +1690,6 @@
         "outputTokens": null,
         "queueDepth": 0
       },
-      "taskCount": 0,
       "options": {
         "models": [
           {

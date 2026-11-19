@@ -1,5 +1,4 @@
-// The session files can be locked by a writer on the container mount. Wait for
-// SQLite on a worker so a status request cannot stall message delivery.
+// Keep synchronous SQLite reads and transcript parsing off the host event loop.
 import { MessageChannel, type MessagePort, parentPort, Worker, workerData } from 'node:worker_threads';
 import Database from 'better-sqlite3';
 import { access, open, readdir, stat, type FileHandle } from 'node:fs/promises';
@@ -18,12 +17,13 @@ interface Snapshot {
   mtimeMs: number;
   completeLine: boolean;
   stats: TranscriptStats | null;
-  outputs: Map<string, number>;
+  outputs?: Map<string, number>;
 }
 
 const snapshots = new Map<string, Snapshot>();
 const reading = new Map<string, Promise<TranscriptStats | null>>();
 const BLOCK_SIZE = 64 * 1024;
+const MAX_INCREMENTAL_TRANSCRIPT_BYTES = 4 * 1024 * 1024;
 
 async function* newestLines(file: FileHandle, start: number, end: number) {
   let fragments: Buffer[] = [];
@@ -55,7 +55,8 @@ async function parseTranscript(filePath: string): Promise<TranscriptStats | null
     if (cached?.ino === ino && cached.size === size && cached.mtimeMs === mtimeMs) return cached.stats;
     // SDK transcripts append complete JSONL records. A replaced, truncated or
     // unterminated snapshot must be counted again from the beginning.
-    const base = cached?.ino === ino && cached.completeLine && cached.size < size ? cached : undefined;
+    const base =
+      cached?.outputs && cached.ino === ino && cached.completeLine && cached.size < size ? cached : undefined;
     const outputs = base?.outputs ?? new Map<string, number>();
     const latest = new Map<string, number>();
     let turns = base?.stats?.turns ?? 0;
@@ -100,12 +101,14 @@ async function parseTranscript(filePath: string): Promise<TranscriptStats | null
       turns++;
       outputTokens += output;
     }
-    for (const [id, output] of latest) outputs.set(id, output);
+    // Large transcripts retain only their totals. Recount on append so older duplicate IDs stay accurate.
+    const keepOutputs = size <= MAX_INCREMENTAL_TRANSCRIPT_BYTES;
+    if (keepOutputs) for (const [id, output] of latest) outputs.set(id, output);
     const contextTokens = context === undefined ? (base?.stats?.contextTokens ?? null) : context;
     const stats = turns || contextTokens !== null ? { turns, outputTokens, contextTokens } : null;
     snapshots.delete(filePath);
     if (snapshots.size >= 32) snapshots.delete(snapshots.keys().next().value!);
-    snapshots.set(filePath, { ino, size, mtimeMs, completeLine, stats, outputs });
+    snapshots.set(filePath, { ino, size, mtimeMs, completeLine, stats, outputs: keepOutputs ? outputs : undefined });
     return stats;
   } finally {
     await file.close();
@@ -176,7 +179,7 @@ interface MailboxRead {
   claude: boolean;
 }
 export interface MailboxStatus {
-  queueDepth: number;
+  queueDepth: number | null;
   stats: TranscriptStats | null;
 }
 
@@ -187,7 +190,7 @@ async function readExisting<T>(path: string, query: string): Promise<T | undefin
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
     throw err;
   }
-  const db = new Database(path, { readonly: true });
+  const db = new Database(path, { readonly: true, timeout: 0 });
   try {
     return db.prepare(query).get() as T | undefined;
   } finally {
@@ -196,19 +199,22 @@ async function readExisting<T>(path: string, query: string): Promise<T | undefin
 }
 
 async function mailboxStatus(input: MailboxRead): Promise<MailboxStatus> {
-  const queue = input.inbound ? await readExisting<{ count: number }>(input.inbound, input.queueSql) : undefined;
-  let stats: TranscriptStats | null = null;
-  if (input.claude) {
+  const queueDepth = input.inbound
+    ? ((await readExisting<{ count: number }>(input.inbound, input.queueSql).catch(() => undefined))?.count ?? null)
+    : 0;
+  if (!input.claude) return { queueDepth, stats: null };
+  try {
     const continuation = input.outbound
       ? await readExisting<{ value: string }>(
           input.outbound,
           `SELECT value FROM session_state WHERE key IN ('continuation:claude', 'sdk_session_id')
        ORDER BY CASE key WHEN 'continuation:claude' THEN 0 ELSE 1 END LIMIT 1`,
-        ).catch(() => undefined)
+        )
       : undefined;
-    stats = await readSdkTranscriptStats(input.root, continuation?.value ?? null, input.scope);
+    return { queueDepth, stats: await readSdkTranscriptStats(input.root, continuation?.value ?? null, input.scope) };
+  } catch {
+    return { queueDepth, stats: null };
   }
-  return { queueDepth: queue?.count ?? 0, stats };
 }
 
 if (workerData === 'session-status' && parentPort) {

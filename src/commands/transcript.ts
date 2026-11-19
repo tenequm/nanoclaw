@@ -20,7 +20,7 @@ export async function readSessionStatus(
     queueSql: DUE_MESSAGE_COUNT_SQL,
     claude,
     scope,
-  });
+  }).catch(() => ({ queueDepth: null, stats: null }));
 }
 
 export async function readTranscriptStats(

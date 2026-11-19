@@ -3,7 +3,6 @@ import { CronExpressionParser } from 'cron-parser';
 
 import { TIMEZONE } from '../../config.js';
 import type { TaskRecord } from '../../mailbox/index.js';
-import { recordTaskSeriesCount } from './task-count.js';
 import { resolveTaskSession, withMailboxSession } from '../../session-manager.js';
 import { parseZonedToUtc } from '../../timezone.js';
 
@@ -153,7 +152,6 @@ export async function createScheduledTask(
     });
     const stored = db.getTask(id);
     if (!stored) throw new Error(`task row not found after insert: ${id}`);
-    await recordTaskSeriesCount(session.id, db.countLiveTasks());
     return stored;
   });
 

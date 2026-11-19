@@ -31,7 +31,6 @@
  */
 import fs from 'fs';
 
-import { recordTaskSeriesCount } from './modules/scheduling/task-count.js';
 import { getSessionClaim } from './db/coordination.js';
 import { getSession, isTaskThread, updateSession } from './db/sessions.js';
 import { getAgentGroup } from './db/agent-groups.js';
@@ -207,7 +206,6 @@ async function maintainSessionMailbox(
 
   if (isTaskThread(session.thread_id)) {
     const liveTasks = mailbox.countLiveTasks();
-    await recordTaskSeriesCount(session.id, liveTasks);
     if (shouldCloseTaskSession(session.thread_id, isContainerRunning(session.id), liveTasks)) {
       await updateSession(session.id, { status: 'closed' });
       log.info('Closed spent task session', { sessionId: session.id, threadId: session.thread_id });

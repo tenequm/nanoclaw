@@ -87,10 +87,10 @@ A null model id inherits the install default. If both ids are null the provider 
 the model. A null provider means Claude. Other providers have an empty `options.models`
 list, so the app hides the model rows. The host always reports the configured context
 window (165000 by default) and this conversation's queue depth (zero before a session
-exists). Turns, output tokens and context tokens are null until usage is available.
+exists, null if its mailbox cannot be read). Turns, output tokens and context tokens are
+null until usage is available or whenever its transcript cannot be read.
 After compaction, context tokens use the boundary's post-compaction size. If the SDK
-omits that size, context tokens stay null until the next usage record. Task count is the
-agent's pending or paused task series, updated on task changes and host reconciliation.
+omits that size, context tokens stay null until the next usage record.
 
 Send one or both of `model` and `effort` to update the agent across its chats. Model aliases
 and raw ids follow the same rules as `/model`. Send null for either field to restore its

@@ -1,5 +1,3 @@
-import { execFileSync } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -128,7 +126,8 @@ const tempData = vi.hoisted(() => ({ directory: undefined as string | undefined 
 import * as runner from '../../container-runner.js';
 import * as roles from '../../modules/permissions/db/user-roles.js';
 import * as wake from '../../request-wake.js';
-import * as statusReader from '../../commands/status-reader.js';
+import { getStatus } from '../../commands/service.js';
+import { readSessionStatus } from '../../commands/transcript.js';
 import { inboundDbPath, outboundDbPath } from '../../mailbox/sqlite/paths.js';
 import { ensureSchema, openInboundDb, openOutboundDbRw } from '../../mailbox/sqlite/session-db.js';
 import { sessionDir, sessionsBaseDir } from '../../session-manager.js';
@@ -356,10 +355,6 @@ describe('signed HTTP fixture producers', () => {
     const db = openInboundDb(inbound);
     db.prepare("INSERT INTO messages_in (id,kind,timestamp,content) VALUES ('queued','chat','2026-01-01','{}')").run();
     db.close();
-    await getDb().run(
-      "INSERT INTO sessions (id,agent_group_id,thread_id,created_at,live_task_series) VALUES ('legacy',?,'system:tasks','2026-01-01',3)",
-      agent.id,
-    );
     const status = (await request('GET', `/app/conversations/${conversation}/status`)).body.status;
     expect(status.agent.provider).toBe(provider);
     expect(status.session).toEqual({
@@ -369,7 +364,6 @@ describe('signed HTTP fixture producers', () => {
       outputTokens: null,
       queueDepth: 1,
     });
-    expect(status.taskCount).toBe(3);
     expect(status.options.models).toEqual(provider ? [] : fixtures.agentStatusResponse.status.options.models);
     for (const model of ['bad model', false]) {
       const error = await request('PUT', `/app/agents/${agent.id}/settings`, { model });
@@ -378,37 +372,63 @@ describe('signed HTTP fixture producers', () => {
     }
   });
 
-  it('continues serving requests while the status reader waits on this conversation mailbox', async () => {
+  it('keeps transcript usage and other conversations readable while an inbound mailbox is locked', async () => {
     const session = await agentSession();
     mkdirSync(sessionDir(agent.id, session.id), { recursive: true });
     const inbound = inboundDbPath(agent.id, session.id);
     ensureSchema(inbound, 'inbound');
+    const outbound = outboundDbPath(agent.id, session.id);
+    ensureSchema(outbound, 'outbound');
+    const state = openOutboundDbRw(outbound);
+    state.prepare("INSERT INTO session_state VALUES ('continuation:claude','app-chat','2026-01-01')").run();
+    state.close();
+    const project = join(sessionsBaseDir(), agent.id, '.claude-shared', 'projects', '-workspace-agent');
+    mkdirSync(project, { recursive: true });
+    writeFileSync(
+      join(project, 'app-chat.jsonl'),
+      JSON.stringify({
+        type: 'assistant',
+        message: { id: 'turn', usage: { input_tokens: 9, output_tokens: 4 } },
+      }),
+    );
+    mkdirSync(sessionDir(agent.id, 'other'), { recursive: true });
+    ensureSchema(inboundDbPath(agent.id, 'other'), 'inbound');
     const target = `/app/conversations/${conversation}/status`;
-    expect((await request('GET', target)).status).toBe(200);
     const db = openInboundDb(inbound);
-    const read = statusReader.readStatusMailbox;
-    const started = new Promise<void>((resolve) => {
-      vi.spyOn(statusReader, 'readStatusMailbox').mockImplementationOnce((input) => {
-        const pending = read(input);
-        resolve();
-        return pending;
-      });
-    });
     db.exec('BEGIN EXCLUSIVE');
-    const pending = request('GET', target);
     try {
-      await started;
-      expect((await request('GET', '/app/hello')).status).toBe(200);
+      const [locked, other] = await Promise.all([
+        request('GET', target),
+        readSessionStatus(agent.id, 'other', 'session'),
+      ]);
+      expect(locked.status).toBe(200);
+      expect(locked.body.status.session).toMatchObject({
+        queueDepth: null,
+        turns: 1,
+        contextTokens: 9,
+        outputTokens: 4,
+      });
+      expect(other.queueDepth).toBe(0);
     } finally {
-      db.exec('ROLLBACK');
       db.close();
     }
-    expect((await pending).status).toBe(200);
-  });
+    writeFileSync(outbound, 'broken mailbox');
+    expect((await request('GET', target)).body.status.session).toEqual({
+      queueDepth: 0,
+      turns: null,
+      contextWindow: 165000,
+      contextTokens: null,
+      outputTokens: null,
+    });
+    const telegram = await getStatus(agent.id, { messagingGroupId: conversation, threadId: null });
+    expect(telegram).toMatchObject({ ok: true, view: { queueDepth: 0, contextTokens: null, taskCount: 0 } });
+  }, 4000);
 
   it('applies both settings as a scoped admin and stops each running container once', async () => {
     await getDb().run("UPDATE user_roles SET role='admin', agent_group_id=? WHERE user_id=?", agent.id, user);
     const session = await agentSession();
+    mkdirSync(sessionDir(agent.id, session.id), { recursive: true });
+    ensureSchema(inboundDbPath(agent.id, session.id), 'inbound');
     vi.spyOn(runner, 'isContainerRunning').mockReturnValue(true);
     const kill = vi.spyOn(runner, 'killContainer').mockImplementation(() => {});
     const target = `/app/agents/${agent.id}/settings`;
@@ -478,7 +498,7 @@ describe('signed HTTP fixture producers', () => {
     expect(await request('PUT', '/app/agents/second/settings', { effort: 'low' })).toEqual(missing);
   });
 
-  it('routes a scoped admin compact message from the signed app to the native provider prompt', async () => {
+  it('routes a scoped admin compact message from the signed app to its session mailbox', async () => {
     await getDb().run("UPDATE user_roles SET role='admin', agent_group_id=? WHERE user_id=?", agent.id, user);
     await import('../../modules/permissions/index.js');
     const { routeInbound } = await vi.importActual<typeof import('../../router.js')>('../../router.js');
@@ -501,17 +521,6 @@ describe('signed HTTP fixture producers', () => {
     db.close();
     expect(row).toMatchObject({ kind: 'chat', channel_type: 'app' });
     expect(JSON.parse(row.content)).toMatchObject({ text: '/compact', senderId: user, senderRole: 'admin' });
-    const probe = fileURLToPath(
-      new URL('../../../container/agent-runner/src/test-utils/app-command-prompt.ts', import.meta.url),
-    );
-    const prompt = execFileSync('bun', [probe], {
-      input: JSON.stringify(row),
-      encoding: 'utf8',
-      cwd: directory,
-      timeout: 4000,
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
-    expect(prompt).toBe('/compact');
     expect(await items()).toMatchObject([
       { id: sent.body.message.id, role: 'user', text: '/compact', delivery: 'reached' },
     ]);

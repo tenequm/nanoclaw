@@ -118,9 +118,8 @@ export interface AgentStatus {
     contextWindow: number;
     turns: number | null;
     outputTokens: number | null;
-    queueDepth: number;
+    queueDepth: number | null;
   };
-  taskCount: number;
   options: { models: { id: string; label: string }[]; efforts: readonly string[] };
 }
 export interface AgentStatusResponse {

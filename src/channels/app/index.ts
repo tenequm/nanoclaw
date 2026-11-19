@@ -2,7 +2,6 @@ import type { ChannelAdapter, ChannelDefaults } from '../adapter.js';
 import { registerChannelAdapter } from '../channel-registry.js';
 import { registerRootHandler } from '../../webhook-server.js';
 import './db.js';
-import { backfillTaskSeriesCounts } from '../../modules/scheduling/task-count.js';
 import './agent-docs.js';
 import { dispatchApp } from './routes.js';
 import { deliver } from './deliver.js';
@@ -20,7 +19,6 @@ export function createAppAdapter(): ChannelAdapter {
     supportsThreads: false,
     defaults,
     async setup(_config) {
-      await backfillTaskSeriesCounts();
       registerRootHandler('app', (req, res) => dispatchApp({ req, res, params: {} }));
       connected = true;
     },

@@ -104,6 +104,20 @@ describe('readTranscriptStats', () => {
     expect(await readTranscriptStats(group, null)).toEqual({ contextTokens: 1120, turns: 2, outputTokens: 16 });
   });
 
+  it('counts repeated IDs exactly as a large transcript grows', async () => {
+    const group = 'large-agent';
+    const dir = path.join(TMP, group, '.claude-shared', 'projects', '-workspace-agent');
+    fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, 'large.jsonl');
+    fs.writeFileSync(file, assistant('first', { output_tokens: 2 }) + '\n');
+    expect((await readTranscriptStats(group, null))?.turns).toBe(1);
+    const padding = JSON.stringify({ type: 'user', content: 'x'.repeat(8192) }) + '\n';
+    fs.appendFileSync(file, padding.repeat(512) + assistant('second', { output_tokens: 3 }) + '\n');
+    expect(await readTranscriptStats(group, null)).toMatchObject({ turns: 2, outputTokens: 5 });
+    fs.appendFileSync(file, assistant('first', { input_tokens: 10, output_tokens: 4 }) + '\n');
+    expect(await readTranscriptStats(group, null)).toEqual({ turns: 2, outputTokens: 7, contextTokens: 10 });
+  });
+
   it('returns null for a group with no transcript tree', async () => {
     expect(await readTranscriptStats('no-such-group', null)).toBeNull();
   });

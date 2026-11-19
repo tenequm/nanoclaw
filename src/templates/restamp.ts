@@ -15,7 +15,6 @@
  * dry run shown to the operator (or on the approval card path, re-run by the
  * approver) before anything is replaced.
  */
-import { withTaskChange } from '../modules/scheduling/task-count.js';
 import fs from 'fs';
 import path from 'path';
 
@@ -403,7 +402,7 @@ export async function restampAgentFromTemplate(
       note: `series ${match.seriesId} deleted (was ${match.status})`,
     });
     ops.push(async () => {
-      await withTaskChange(group.id, match.sessionId, (mailbox) => mailbox.deleteTask(match.seriesId));
+      await withExistingMailboxSession(group.id, match.sessionId, (mailbox) => mailbox.deleteTask(match.seriesId));
     });
   }
 

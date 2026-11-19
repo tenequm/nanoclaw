@@ -78,7 +78,6 @@ export const conversationStatus: AppHandler = async (ctx) => {
         outputTokens: view.sessionOutputTokens ?? null,
         queueDepth: view.queueDepth,
       },
-      taskCount: view.taskCount,
       options: { models: modelOptions(view.provider), efforts: EFFORT_LEVELS },
     },
   } satisfies AgentStatusResponse);
