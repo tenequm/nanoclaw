@@ -63,16 +63,20 @@ device revocation. Never paste links or authorization headers into logs or repor
 
 ## Agents
 
-The signed agent list contains the agents the person administers that have a non-app chat or are
-already shown. Each entry includes the name of its oldest non-app chat (or null). The list sorts
-by agent name, then chat. A CLI-paired device can only list or change agents in its pairing scope.
+The signed agent list contains the agents the person administers that have a non-app chat, are
+already shown, or have an existing app conversation with that person. Each entry includes the
+oldest named non-app chat, or null if none has a name. The list sorts by agent name, then chat,
+ignoring case. A CLI-paired device can only list or change agents in its pairing scope.
 Showing or hiding an agent changes the person's list across devices. Open streams receive the
 conversation and an updated badge. A hide sets `hidden: true` on the final conversation event
-and stops delivery to that person's devices. Showing it again restores the same conversation and history.
+and stops delivery to that person's devices. Hiding before a conversation exists creates no app
+wiring. Showing a hidden conversation again, including through pairing, restores its history
+and updates the badge on the person's live devices.
 
 The `agents` and `unread` features are always available on this host version. Marking a conversation
-unread moves its shared read order to just before the newest agent message or question and returns
-the conversation and device badge. If there is no such item, the host returns `409 nothing_unread`.
+unread moves its shared read order back only if needed to make the newest agent message or
+question unread. The response includes the conversation and device badge. If there is no such
+item, the host returns `409 nothing_unread`.
 
 ## Routes
 

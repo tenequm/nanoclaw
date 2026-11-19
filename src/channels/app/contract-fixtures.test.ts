@@ -121,7 +121,10 @@ vi.mock('../../session-manager.js', async (original) => ({
 import type { InboundEvent } from '../adapter.js';
 import { parseIsoTimestamp, type ContainerRecord } from '../../mailbox/model.js';
 import { createVoiceModeLine } from '../../db/voice-mode-lines.js';
-import { mintPairingLink } from '../../modules/device-auth/pairing.js';
+import { dispatch } from '../../cli/dispatch.js';
+import '../../cli/resources/devices.js';
+import * as registry from '../channel-registry.js';
+import { handlePairCommand, mintPairingLink } from '../../modules/device-auth/pairing.js';
 import { createVoiceModeAdapter } from '../voice-mode.js';
 import { CALLER_MARK, SPOKEN_MARK } from '../voice-mode-livekit.js';
 import { createServer as createH2Server, type IncomingHttpHeaders } from 'node:http2';
@@ -359,24 +362,26 @@ describe('signed HTTP fixture producers', () => {
       id,
       createdAt,
     );
+    return group;
   }
   it('lists wired or shown agents within the device and role scope, sorted by agent and oldest chat', async () => {
     const db = getDb();
     for (const id of ['unwired', 'also-taylor', 'unnamed-chat'])
       await createAgentGroup({ ...agent, id, folder: id, agent_provider: null, created_at: '2026-11-17' });
-    await wire('also-taylor', 'Beta');
+    await wire('also-taylor', 'beta');
     await wire('unnamed-chat', null);
     const list = async () => (await request('GET', '/app/agents')).body.agents;
     const expected = { ...agent, chat: null, shown: true };
     expect(await list()).toEqual([expected]);
     expect(await request('PUT', '/app/agents/also-taylor', { shown: true })).toEqual(fixtures.errors.notFound);
+    await wire(agent.id, null, '2026-11-16');
     await wire(agent.id, 'Later', '2026-11-18');
     await wire(agent.id, 'Support');
     expect(await request('GET', '/app/agents')).toEqual({ status: 200, body: fixtures.agentsResponse });
     await db.run('DELETE FROM device_auth_device_agents WHERE device_id = ?', device);
     const global = [
       { ...agent, id: 'unnamed-chat', chat: null, shown: false },
-      { ...agent, id: 'also-taylor', chat: 'Beta', shown: false },
+      { ...agent, id: 'also-taylor', chat: 'beta', shown: false },
       { ...agent, chat: 'Support', shown: true },
     ];
     expect(await list()).toEqual(global);
@@ -391,6 +396,32 @@ describe('signed HTTP fixture producers', () => {
     expect((await request('GET', '/app/conversations')).body.conversations).toMatchObject([
       { agent: { id: 'also-taylor' } },
     ]);
+  });
+  it('sorts agent names without regard to case', async () => {
+    const id = 'alpha';
+    await createAgentGroup({ id, name: 'alpha', folder: id, agent_provider: null, created_at: '2026-11-17' });
+    await wire(id, null);
+    await getDb().run('INSERT INTO device_auth_device_agents VALUES (?,?)', device, id);
+    const { body } = await request('GET', '/app/agents');
+    expect(body.agents.map((candidate: { id: string }) => candidate.id)).toEqual([id, agent.id]);
+  });
+  it('hides an agent before its first conversation without creating app wiring or a stream event', async () => {
+    const db = getDb();
+    const id = 'unopened';
+    await createAgentGroup({ ...agent, id, folder: id, agent_provider: null, created_at: '2026-11-17' });
+    await db.run('INSERT INTO device_auth_user_agents VALUES (?,?,0)', user, id);
+    await db.run('INSERT INTO device_auth_device_agents VALUES (?,?)', device, id);
+    const cursor = await lastEventSeq();
+    const badge = await badgeFor(user, [id]);
+    expect(await request('PUT', `/app/agents/${id}`, { shown: false })).toEqual({
+      status: 200,
+      body: { agent: { id, name: agent.name, chat: null, shown: false } },
+    });
+    expect(await db.get('SELECT 1 FROM device_auth_user_agents WHERE agent_group_id = ?', id)).toBeUndefined();
+    expect(await db.get('SELECT 1 FROM app_conversations WHERE agent_group_id = ?', id)).toBeUndefined();
+    expect(await db.get('SELECT 1 FROM messaging_group_agents WHERE agent_group_id = ?', id)).toBeUndefined();
+    expect(await lastEventSeq()).toBe(cursor);
+    expect(await badgeFor(user, [id])).toEqual(badge);
   });
   it('updates an open sibling stream and its badge on hide and re-show, and suppresses hidden deliveries', async () => {
     const db = getDb();
@@ -482,13 +513,96 @@ describe('signed HTTP fixture producers', () => {
     const cursor = await lastEventSeq();
     const db = getDb();
     expect((await request('PUT', `/app/agents/${agent.id}`, { shown: false })).status).toBe(200);
-    expect((await request('GET', '/app/agents')).body.agents).toEqual([]);
+    const hidden = { ...agent, chat: null, shown: false };
+    expect((await request('GET', '/app/agents')).body.agents).toEqual([hidden]);
+    const afterHide = await lastEventSeq();
+    expect(await request('PUT', `/app/agents/${agent.id}`, { shown: false })).toEqual({
+      status: 200,
+      body: { agent: hidden },
+    });
+    expect(await lastEventSeq()).toBe(afterHide);
     expect(await replay(cursor)).toContain('"hidden":true');
+    expect((await request('PUT', `/app/agents/${agent.id}`, { shown: true })).status).toBe(200);
+    expect((await request('GET', '/app/conversations')).body.conversations[0].id).toBe(conversation);
     await db.run('UPDATE device_auth_device_agents SET agent_group_id = ? WHERE device_id = ?', 'another', device);
     expect(await replay(cursor)).not.toContain(conversation);
     await db.run('DELETE FROM device_auth_device_agents WHERE device_id = ?', device);
     await db.run('DELETE FROM user_roles WHERE user_id = ?', user);
     expect(await replay(cursor)).not.toContain(conversation);
+  });
+  it.each(['/pair', 'ncl devices pair'])(
+    '%s restores the conversation and badge on an open device',
+    async (command) => {
+      vi.stubEnv('APP_PUBLIC_BASE', fixtures.pairLink.host);
+      resetAppConfigCache();
+      const chat = await wire(agent.id, 'Support');
+      vi.spyOn(registry, 'getChannelAdapterExact').mockReturnValue({
+        name: 'telegram',
+        channelType: 'telegram',
+        supportsThreads: false,
+        isConnected: () => true,
+        setup: async () => {},
+        teardown: async () => {},
+        deliver: async () => undefined,
+      });
+      const pair = async () => {
+        if (command === '/pair') {
+          expect(
+            await handlePairCommand({
+              channelType: 'telegram',
+              platformId: chat,
+              threadId: null,
+              message: {
+                id: randomUUID(),
+                kind: 'chat',
+                content: JSON.stringify({ text: '/pair', senderId: user }),
+                timestamp: new Date().toISOString(),
+              },
+            }),
+          ).toBe(true);
+        } else {
+          const result = await dispatch(
+            { id: 'pair', command: 'devices-pair', args: { user, agents: agent.id } },
+            { caller: 'host' },
+          );
+          expect(result.ok).toBe(true);
+        }
+      };
+      await deliver(conversation, null, { kind: 'chat', sourceId: randomUUID(), content: { text: 'Reply' } });
+      expect((await request('PUT', `/app/agents/${agent.id}`, { shown: false })).status).toBe(200);
+      await withStream(await lastEventSeq(), device, async (read) => {
+        expect(await read(synchronized)).toContain('"unreadTotal":0');
+        await pair();
+        const restored = await read(/event: badge\ndata: [^\n]+\n\n/);
+        expect(restored).toContain(conversation);
+        expect(restored).toContain('"hidden":false');
+        expect(restored).toContain('"unreadTotal":1');
+        const cursor = await lastEventSeq();
+        const badge = await badgeFor(user, [agent.id]);
+        await pair();
+        expect(await lastEventSeq()).toBe(cursor);
+        expect(await badgeFor(user, [agent.id])).toEqual(badge);
+      });
+    },
+  );
+  it('preserves existing unread items and leaves a never-opened read cursor absent', async () => {
+    const target = `/app/conversations/${conversation}`;
+    for (let i = 0; i < 3; i++) {
+      await deliver(conversation, null, { kind: 'chat', sourceId: randomUUID(), content: { text: 'Reply' } });
+    }
+    const list = async () => (await request('GET', '/app/conversations')).body;
+    const checkUnchanged = async (count: number) => {
+      const {
+        conversations: [before],
+        badge,
+      } = await list();
+      expect(before.unread).toBe(count);
+      expect(await request('POST', target + '/unread')).toEqual({ status: 200, body: { conversation: before, badge } });
+    };
+    await checkUnchanged(3);
+    expect(await getDb().get('SELECT 1 FROM app_read_state WHERE conversation_id = ?', conversation)).toBeUndefined();
+    expect((await request('POST', target + '/read', { order: (await items())[0].order })).status).toBe(200);
+    await checkUnchanged(2);
   });
   it('marks the newest agent message or question unread, ignoring newer user items', async () => {
     const target = `/app/conversations/${conversation}`;
@@ -1050,6 +1164,15 @@ describe('signed HTTP fixture producers', () => {
     });
     expect(read.status).toBe(200);
     same(read.body, fixtures.readResponse);
+    const unread = await request('POST', `/app/conversations/${conversation}/unread`);
+    expect(unread.status).toBe(200);
+    same(unread.body, fixtures.unreadResponse);
+    const cursor = await lastEventSeq();
+    expect((await request('PUT', `/app/agents/${agent.id}`, { shown: false })).status).toBe(200);
+    const frame = (await replay(cursor)).match(/^id: (\d+)\nevent: conversation\ndata: (.+)$/m)!;
+    const data = JSON.parse(frame[2]);
+    expect(Number(frame[1])).toBe(data.seq);
+    same(data, fixtures.hiddenEvent.data);
   });
   it('returns command, expired-question and rate-limit refusals from actual dispatch', async () => {
     const send = (text: string) =>

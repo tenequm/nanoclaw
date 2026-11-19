@@ -43,7 +43,7 @@ export async function liveDevices(userId: string): Promise<DeviceRow[]> {
 }
 // Both visibility changes and deliveries use the same live device, role and CLI pairing scope.
 const deviceScope = `WITH scope AS (
-  SELECT a.id, a.name, CASE WHEN u.user_id IS NULL THEN 0 ELSE 1 END AS shown
+  SELECT d.user_id, a.id, a.name, CASE WHEN u.user_id IS NULL THEN 0 ELSE 1 END AS shown
   FROM device_auth_devices d CROSS JOIN agent_groups a
   LEFT JOIN device_auth_user_agents u ON u.user_id = d.user_id AND u.agent_group_id = a.id
   WHERE d.id = ? AND d.revoked_at IS NULL
@@ -65,9 +65,10 @@ export async function agentCandidates(deviceId: string, agentId?: string): Promi
     SELECT s.id, s.name, m.name AS chat, s.shown FROM scope s
     LEFT JOIN messaging_groups m ON m.id = (
       SELECT g.id FROM messaging_group_agents w JOIN messaging_groups g ON g.id = w.messaging_group_id
-      WHERE w.agent_group_id = s.id AND g.channel_type <> 'app' ORDER BY g.created_at, g.id LIMIT 1)
-    WHERE (m.id IS NOT NULL OR s.shown = 1) ${agentId === undefined ? '' : 'AND s.id = ?'}
-    ORDER BY s.name, m.name, s.id`,
+      WHERE w.agent_group_id = s.id AND g.channel_type <> 'app' ORDER BY g.name IS NULL, g.created_at, g.id LIMIT 1)
+    WHERE (m.id IS NOT NULL OR s.shown = 1 OR EXISTS (
+      SELECT 1 FROM app_conversations c WHERE c.user_id = s.user_id AND c.agent_group_id = s.id)) ${agentId === undefined ? '' : 'AND s.id = ?'}
+    ORDER BY LOWER(s.name), LOWER(m.name), s.id`,
     deviceId,
     ...(agentId === undefined ? [] : [agentId]),
   );

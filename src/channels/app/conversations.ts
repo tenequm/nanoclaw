@@ -14,7 +14,7 @@ import {
 } from './contract.js';
 import type { ConversationRow, MessageRow, QuestionRow } from './db.js';
 import { appHooks, appTransaction, appendEvent, lastEventSeq, afterAppCommit } from './log.js';
-import { json, type AppHandler, type AppRequest } from './routes.js';
+import { json, type AppHandler, type AppRequest } from './http.js';
 
 export const getConversation = (id: string): Promise<ConversationRow | undefined> =>
   getDb().get('SELECT * FROM app_conversations WHERE id = ?', id);
@@ -267,31 +267,43 @@ export async function requestBody(ctx: AppRequest, maxBytes = 256 * 1024): Promi
 export const listAgents: AppHandler = async ({ res, identity }) => {
   json(res, 200, { agents: await agentCandidates(identity!.deviceId) } satisfies AgentsResponse);
 };
+async function publishVisibility(c: ConversationRow, shown: boolean): Promise<void> {
+  const availability = await appHooks.callAvailability(c.user_id, c.agent_group_id);
+  await conversationEvent(c, availability, !shown);
+  await bumpBadge(c.user_id);
+}
+
+// Pairing leaves first-time conversation creation to the device's first list request.
+export async function showAppAgent(userId: string, id: string, source: 'pairing' | 'settings', now = Date.now()) {
+  const inserted = await getDb().run(
+    'INSERT INTO device_auth_user_agents (user_id,agent_group_id,created_at) VALUES (?,?,?) ON CONFLICT DO NOTHING',
+    userId,
+    id,
+    now,
+  );
+  if (!inserted.changes && source === 'pairing') return;
+  const existing = await conversationForAgent(userId, id);
+  if (existing) {
+    if (inserted.changes) await publishVisibility(existing, true);
+  } else if (source === 'settings') {
+    await publishVisibility(await createConversation(userId, id), true);
+  }
+}
 export const setAgentShown: AppHandler = async (ctx) => {
   const { shown } = await requestBody(ctx);
   if (typeof shown !== 'boolean') throw authError(400, 'bad_request', 'The request is malformed.');
   const { deviceId, userId } = ctx.identity!;
   const id = ctx.params.id;
-  const availability = await appHooks.callAvailability(userId, id);
   const agent = await appTransaction(async () => {
     const [candidate] = await agentCandidates(deviceId, id);
     if (!candidate) throw authError(404, 'not_found', 'Not found.');
-    const existing = await conversationForAgent(userId, id);
-    if (candidate.shown === shown && (existing || !shown)) return candidate;
-    const db = getDb();
     if (shown) {
-      await db.run(
-        'INSERT INTO device_auth_user_agents (user_id,agent_group_id,created_at) VALUES (?,?,?) ON CONFLICT DO NOTHING',
-        userId,
-        id,
-        Date.now(),
-      );
-    } else {
-      await db.run('DELETE FROM device_auth_user_agents WHERE user_id = ? AND agent_group_id = ?', userId, id);
+      await showAppAgent(userId, id, 'settings');
+    } else if (candidate.shown) {
+      await getDb().run('DELETE FROM device_auth_user_agents WHERE user_id = ? AND agent_group_id = ?', userId, id);
+      const existing = await conversationForAgent(userId, id);
+      if (existing) await publishVisibility(existing, false);
     }
-    const c = existing ?? (await createConversation(userId, id));
-    await conversationEvent(c, availability, !shown);
-    await bumpBadge(userId);
     return { ...candidate, shown };
   });
   json(ctx.res, 200, { agent } satisfies SetAgentResponse);
@@ -396,12 +408,20 @@ async function updateReadOrder(ctx: AppRequest, c: ConversationRow, order: numbe
     if (unread && !newest)
       throw authError(409, 'nothing_unread', 'There is no agent message or question to mark unread.');
     const target = unread ? newest - 1 : Math.min(order, newest);
-    const result = await db.run(
-      `INSERT INTO app_read_state (user_id,conversation_id,read_order) VALUES (?,?,?) ON CONFLICT (user_id,conversation_id) DO UPDATE SET read_order = excluded.read_order WHERE app_read_state.read_order ${unread ? '<>' : '<'} excluded.read_order`,
-      c.user_id,
-      c.id,
-      target,
-    );
+    const result = unread
+      ? await db.run(
+          'UPDATE app_read_state SET read_order = ? WHERE user_id = ? AND conversation_id = ? AND read_order > ?',
+          target,
+          c.user_id,
+          c.id,
+          target,
+        )
+      : await db.run(
+          'INSERT INTO app_read_state (user_id,conversation_id,read_order) VALUES (?,?,?) ON CONFLICT (user_id,conversation_id) DO UPDATE SET read_order = excluded.read_order WHERE app_read_state.read_order < excluded.read_order',
+          c.user_id,
+          c.id,
+          target,
+        );
     if (result.changes && (unread || target > 0)) {
       await bumpBadge(c.user_id, c.agent_group_id);
       return conversationEvent((await getConversation(c.id))!, availability);
