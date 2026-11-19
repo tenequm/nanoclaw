@@ -1,5 +1,7 @@
 import './db.js';
 import { createHash, randomInt, randomUUID } from 'node:crypto';
+import { showAppAgent } from '../../channels/app/conversations.js';
+import { appTransaction } from '../../channels/app/log.js';
 import type { AppHandler } from '../../channels/app/routes.js';
 import { APP_PROTOCOL, pairProofText, verifyP256, type PairRequest } from '../../channels/app/contract.js';
 import { appConfig } from '../../channels/app/config.js';
@@ -60,14 +62,8 @@ export async function mintPairingLink(
   const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
   const code = Array.from({ length: 32 }, () => alphabet[randomInt(alphabet.length)]).join('');
   const db = getDb();
-  await db.transaction(async () => {
-    for (const id of addedAgentIds)
-      await db.run(
-        'INSERT INTO device_auth_user_agents (user_id, agent_group_id, created_at) VALUES (?, ?, ?) ON CONFLICT DO NOTHING',
-        userId,
-        id,
-        now,
-      );
+  await appTransaction(async () => {
+    for (const id of addedAgentIds) await showAppAgent(userId, id, 'pairing', now);
     await db.run(
       'INSERT INTO device_auth_pairing_codes (code_hash, user_id, agent_ids_json, created_at, expires_at) VALUES (?, ?, ?, ?, ?)',
       createHash('sha256').update(code).digest('hex'),
