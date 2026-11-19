@@ -269,6 +269,8 @@ function formatChatMessages(messages: MessageInRow[]): string {
   return messages.map(formatSingleChat).join('\n');
 }
 
+const SESSION_LABEL = ' (Claude Code session)';
+
 function formatSingleChat(msg: MessageInRow): string {
   if (isSessionEcho(msg)) return formatEchoMessage(msg);
   const content = parseContent(msg.content);
@@ -288,8 +290,8 @@ function formatSingleChat(msg: MessageInRow): string {
   if (msg.channel_type === 'peer' && typeof content.sender === 'string') {
     if (content.senderKind === 'session') {
       peerAddress = content.sender;
-      displaySender = `${content.sender} (Claude Code session)`;
-    } else if (!content.senderKind && content.sender.endsWith(' (Claude Code session)')) {
+      displaySender = content.sender + SESSION_LABEL;
+    } else if (!content.senderKind && content.sender.endsWith(SESSION_LABEL)) {
       // Mailbox rows written before senderKind already contain the display label.
       peerAddress = content.sender.split(' ', 1)[0];
     }

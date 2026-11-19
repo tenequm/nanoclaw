@@ -25,6 +25,7 @@ export interface DestinationEntry {
 
 export type SessionMode = { kind: 'chat' } | { kind: 'task'; taskId: string };
 
+// Mirrors the Address schema pattern in src/channels/peer/openapi.yaml.
 const MESH_ADDRESS = /^[a-z0-9][a-z0-9._-]{0,39}(@[a-z0-9][a-z0-9._-]{0,39}(:[a-z0-9][a-z0-9-]{0,15})?)?$/;
 
 function destinationEntry(destination: Destination): DestinationEntry {
