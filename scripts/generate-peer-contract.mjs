@@ -5,6 +5,21 @@ import { format } from 'prettier';
 
 const dir = new URL('../src/channels/peer/', import.meta.url);
 const { components } = parse(await readFile(new URL('openapi.yaml', dir), 'utf8'));
+const enumConstants = [];
+function openEnums(schema, name) {
+  if (schema['x-amesh-open']) {
+    enumConstants.push(
+      `export const ${name} = ${JSON.stringify(Object.fromEntries(schema.enum.map((value) => [value, value])))} as const;`,
+    );
+    delete schema.enum;
+  }
+  for (const [field, child] of Object.entries(schema.properties ?? {}))
+    openEnums(child, name + field.replace(/(?:^|_)([a-z])/g, (_, letter) => letter.toUpperCase()));
+  if (schema.items) openEnums(schema.items, name + 'Item');
+  for (const variant of [...(schema.oneOf ?? []), ...(schema.anyOf ?? []), ...(schema.allOf ?? [])])
+    openEnums(variant, name);
+}
+for (const [name, schema] of Object.entries(components.schemas)) openEnums(schema, name);
 const definitions = JSON.parse(
   JSON.stringify(components.schemas).replaceAll('#/components/schemas/', '#/definitions/'),
   (_key, schema) =>
@@ -27,7 +42,7 @@ const types = await compile(
 );
 await writeFile(
   new URL('types.ts', dir),
-  await format(types, { parser: 'typescript', singleQuote: true, printWidth: 120 }),
+  await format([types, ...enumConstants].join('\n'), { parser: 'typescript', singleQuote: true, printWidth: 120 }),
 );
 
 const requestSchemas = {};
@@ -51,7 +66,6 @@ for (const name of [
 delete requestSchemas.SendRequest.properties.text.minLength;
 // Protocol 1 readers ignore new status, report kind and reason values.
 delete requestSchemas.StateReport.properties.state.enum;
-delete requestSchemas.DropReason.enum;
 delete requestSchemas.SessionRegisterRequest.properties.status.enum;
 delete requestSchemas.HeartbeatRequest.properties.sessions.items.properties.status.enum;
 requestSchemas.Report.oneOf.push({

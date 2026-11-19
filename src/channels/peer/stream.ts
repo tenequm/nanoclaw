@@ -1,21 +1,20 @@
 import type { ServerResponse } from 'node:http';
 import { getDb } from '../../db/connection.js';
-import { checkEpoch, fail, limits, listPeers, onMachineRevoked } from './store.js';
+import { checkEpoch, fail, limits, listPeers, onMachineRevoked, type Machine } from './store.js';
 import { eventHead } from './lifecycle.js';
 import type { Peer, PeerEvent } from './types.js';
 
 const streams = new Map<string, { epoch: number; close: (event?: PeerEvent) => void }>();
-export function streamIsOpen(id: string) {
-  return streams.has(id);
+export function currentStream(id: string) {
+  return streams.get(id);
 }
-export function closeStream(id: string, epoch: number, takeover: boolean) {
-  const old = streams.get(id);
-  if (old && old.epoch <= epoch)
-    old.close(
-      takeover
-        ? { kind: 'superseded', epoch: old.epoch, by: epoch, message: 'A new daemon took over.', at: Date.now() }
-        : undefined,
-    );
+export function liveEpoch(machine: Machine) {
+  if (
+    currentStream(machine.id)?.epoch === machine.epoch ||
+    (machine.epoch_seen_at !== null && machine.epoch_seen_at > Date.now() - limits.offlineAfterMs)
+  )
+    return machine.epoch;
+  return undefined;
 }
 export function closeStreams() {
   for (const s of streams.values()) s.close();

@@ -38,3 +38,17 @@ for (const [name, example] of Object.entries<Example>(components.examples)) {
     }
   });
 }
+
+it('keeps unknown open enum strings and exposes the named wire values', async () => {
+  const { DeliveryState, DropReason, ErrorCode, NativeReceiptStatus } = await import('./types.js');
+  const reason: import('./types.js').DeliveryEvent['reason'] = 'future-reason';
+  const state: import('./types.js').DeliveryState = 'future-state';
+  const receipt: import('./types.js').NativeReceipt['status'] = 'future-status';
+  expect([reason, state, receipt]).toEqual(['future-reason', 'future-state', 'future-status']);
+  expect([DeliveryState.accepted, DropReason.route_failed, ErrorCode.not_member, NativeReceiptStatus.held]).toEqual([
+    'accepted',
+    'route_failed',
+    'not_member',
+    'held',
+  ]);
+});

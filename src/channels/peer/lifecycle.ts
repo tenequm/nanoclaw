@@ -91,7 +91,7 @@ export async function endRemote(machineId: string, key: string) {
 export async function resetHops(actor: string) {
   return (
     await getDb().run(
-      `UPDATE peer_conversations SET hops=0,chain='[]',limited=0,reset_chain=1 WHERE hops>0 AND
+      `UPDATE peer_conversations SET hops=0,chain='[]',limited=0,pending_native_limit=NULL,reset_chain=1 WHERE hops>0 AND
       (party_a=? OR party_b=? OR (party_a IN (SELECT id FROM sessions) AND party_b IN (SELECT id FROM sessions) AND EXISTS (
         SELECT 1 FROM sessions s JOIN sessions owner ON owner.agent_group_id=s.agent_group_id
         WHERE owner.id=? AND s.id IN (party_a,party_b))))`,

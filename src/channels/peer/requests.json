@@ -91,7 +91,7 @@
         "pattern": "^[A-Za-z0-9_-]{22}$"
       },
       "Epoch": {
-        "description": "A connection epoch (contract.md section 5); it changes only when the daemon process holding it changes.",
+        "description": "A connection epoch (contract.md section 5); it changes only when the daemon process holding it changes. Every write and the stream carry the live one; any other answers 409 superseded (A2).",
         "type": "integer",
         "minimum": 1
       },
@@ -130,7 +130,8 @@
           },
           "status": {
             "type": "string",
-            "description": "The registry's status; waiting and others map to busy."
+            "x-amesh-open": false,
+            "description": "The registry's status at registration; waiting and others map to busy. Later changes travel in the heartbeat (A2)."
           },
           "entrypoint": {
             "type": "string",
@@ -187,7 +188,8 @@
               "exited",
               "excluded",
               "not_hosted"
-            ]
+            ],
+            "x-amesh-open": false
           }
         }
       },
@@ -221,7 +223,8 @@
                   "$ref": "#/components/schemas/SessionKey"
                 },
                 "status": {
-                  "type": "string"
+                  "type": "string",
+                  "x-amesh-open": false
                 }
               }
             }
@@ -311,10 +314,11 @@
           },
           "session": {
             "$ref": "#/components/schemas/SessionKey",
-            "description": "The receiving session."
+            "description": "The receiving session; a report for a message routed elsewhere is not applied (A2)."
           },
           "state": {
-            "type": "string"
+            "type": "string",
+            "x-amesh-open": false
           },
           "reason": {
             "oneOf": [
@@ -338,7 +342,8 @@
       },
       "DropReason": {
         "description": "Claude Code's guard (rate-limited, queue-full: retried after pacing, then dropped;\nduplicate, hop-loop, hop-runaway: never retried); oversized (over the native line\nlimit, refused before writing); session_gone (the inbox no longer accepts);\nunknown_session (the daemon does not host that key, L18); queue_expired (past\nqueueTtlMs, D19); ended (the target ended with it queued); interrupted (the daemon\nrestarted between recording the id and finishing the inbox write, so it may or may not\nhave arrived; A1); route_failed (the hub could not write it into the agent's hub\nsession; A1). Open set.",
-        "type": "string"
+        "type": "string",
+        "x-amesh-open": true
       },
       "IdleReport": {
         "description": "The turn the message started has ended.",
@@ -450,7 +455,8 @@
               "human",
               "peer",
               "unknown"
-            ]
+            ],
+            "x-amesh-open": false
           },
           "notifyWhenIdle": {
             "type": "boolean",
@@ -485,6 +491,7 @@
       "FromMode": {
         "description": "The sending session's real permission class (R13).",
         "type": "string",
+        "x-amesh-open": false,
         "enum": [
           "bypass",
           "prompting"

@@ -16,7 +16,7 @@ import { drainInbound, routeAgentPeer, sendRemote } from './routing.js';
 
 vi.mock('../../config.js', async (original) => ({
   ...(await original<typeof import('../../config.js')>()),
-  DATA_DIR: mkdtempSync(join(tmpdir(), 'peer-route-')),
+  DATA_DIR: mkdtempSync(join(tmpdir(), 'nanoclaw-a2-peer-route-')),
 }));
 vi.mock('../../request-wake.js', () => ({ requestWake: vi.fn().mockResolvedValue(undefined) }));
 beforeEach(async () => {
@@ -32,7 +32,12 @@ async function registerTestMachine(name: string) {
     .publicKey.export({ format: 'der', type: 'spki' })
     .toString('base64url');
   const id = await enrollMachine(name, publicKey);
-  await getDb().run('UPDATE peer_machines SET epoch=1,last_seen_at=? WHERE id=?', Date.now(), id);
+  await getDb().run(
+    'UPDATE peer_machines SET epoch=1,epoch_seen_at=?,last_seen_at=? WHERE id=?',
+    Date.now(),
+    Date.now(),
+    id,
+  );
   const key = '12-1234abcd';
   const info = await registerSession(id, key, {
     epoch: 1,
@@ -108,6 +113,7 @@ it('delivers a reply only to the agent session that asked, even when another ses
   await sendRemote(remote.id, reply);
   await sendRemote(remote.id, reply);
   await drainInbound();
+  expect((await sendRemote(remote.id, reply)).message.state).toBe('accepted');
   const inbox = new Database(inboundDbPath(agent, session.id), { readonly: true });
   try {
     const rows = inbox.prepare('SELECT content,channel_type FROM messages_in').all() as {
@@ -193,12 +199,20 @@ it('creates a dedicated chat per remote, drops omitted heartbeat sessions and en
   await getDb().run('UPDATE peer_conversations SET hops=20');
   const stopped = { ...start, id: randomUUID(), origin: 'human' as const };
   await expect(sendRemote(remote.id, stopped)).rejects.toMatchObject({ body: { error: 'hop_limit' } });
-  await expect(sendRemote(remote.id, stopped)).rejects.toMatchObject({ body: { error: 'hop_limit' } });
+  expect((await sendRemote(remote.id, stopped)).message.state).toBe('refused');
   expect(await getDb().get('SELECT COUNT(*) AS n FROM peer_inbound WHERE message_row IS NULL')).toEqual({ n: 1 });
   await expect(sendRemote(remote.id, { ...stopped, id: randomUUID() })).rejects.toMatchObject({
     body: { error: 'hop_limit' },
   });
   expect(await getDb().get('SELECT COUNT(*) AS n FROM peer_inbound WHERE message_row IS NULL')).toEqual({ n: 1 });
+  expect(await resetHops(hub.id)).toBe(1);
+  await getDb().run('UPDATE peer_conversations SET hops=20');
+  for (const id of ['agent-stop', 'agent-stop-again'])
+    expect(
+      (await routeAgentPeer(hub, { id, platformId: remote.address, content: '{"text":"again"}' })).message.state,
+    ).toBe('refused');
+  expect(await getDb().get('SELECT COUNT(*) AS n FROM peer_inbound WHERE message_row IS NULL')).toEqual({ n: 2 });
+  expect(await getDb().get("SELECT COUNT(*) AS n FROM peer_events WHERE kind='limit'")).toEqual({ n: 1 });
   expect(await resetHops(hub.id)).toBe(1);
   const next = await sendRemote(remote.id, { ...start, id: randomUUID() });
   expect(next.message.hop.count).toBe(1);
@@ -326,6 +340,16 @@ it('reconciles an inbox write after a hub restart and reports definite delivery 
   } finally {
     inbox.close();
   }
+  const db = getDb();
+  const stored = () => db.get('SELECT state FROM peer_messages WHERE id=?', pending.message.id);
+  expect(await stored()).toEqual({ state: 'accepted' });
+  await db.run("UPDATE peer_messages SET state='delivered' WHERE id=?", pending.message.id);
+  await db.run(
+    "UPDATE peer_events SET payload=json_set(payload,'$.state','delivered','$.message','agent delivery: delivered.') WHERE kind='delivery'",
+  );
+  await db.run("DELETE FROM schema_version WHERE name='module:peer:agent-inbox-accepted'");
+  await runMigrations(db);
+  expect(await stored()).toEqual({ state: 'accepted' });
   const failed = await send();
   const write = vi.spyOn(manager, 'writeSessionMessage').mockRejectedValueOnce(new Error('mailbox write failed'));
   try {
@@ -341,7 +365,7 @@ it('reconciles an inbox write after a hub restart and reports definite delivery 
     "SELECT payload FROM peer_events WHERE kind='delivery' ORDER BY seq",
   );
   expect(events.map((e) => JSON.parse(e.payload))).toMatchObject([
-    { id: pending.message.id, state: 'delivered', reason: null },
+    { id: pending.message.id, state: 'accepted', reason: null },
     { id: failed.message.id, state: 'dropped', reason: 'route_failed' },
     { id: revoked.message.id, state: 'dropped', reason: 'not_member' },
   ]);
@@ -375,7 +399,7 @@ it('counts both mesh agents through normal delivery, tells each side once, and r
   for (let i = 0; i < 22; i++) await send(i);
   await send(21);
   expect(await getDb().get('SELECT count(*) AS n FROM peer_agent_sends WHERE refused=1')).toEqual({ n: 2 });
-  expect(await getDb().get('SELECT count(*) AS n FROM peer_inbound WHERE hub_session=?', a.id)).toEqual({ n: 2 });
+  expect(await getDb().get('SELECT count(*) AS n FROM peer_inbound WHERE hub_session=?', a.id)).toEqual({ n: 1 });
   expect(await getDb().get('SELECT count(*) AS n FROM peer_inbound WHERE hub_session=?', b.id)).toEqual({ n: 1 });
   await createSession({ ...b, id: 'sess-owner-separate' });
   expect(await resetHops('sess-owner-separate')).toBe(1);

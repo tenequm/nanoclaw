@@ -27,8 +27,8 @@ import {
   verifyPeerRequest,
 } from './store.js';
 import { drainInbound, routeAgentPeer, sendRemote } from './routing.js';
-import { endRemote, heartbeat, refreshEndpoints, reports, resetHops, sweepPeers } from './lifecycle.js';
-import { closeStream, closeStreams, openStream, streamIsOpen } from './stream.js';
+import { endRemote, heartbeat, reports, resetHops, sweepPeers } from './lifecycle.js';
+import { closeStreams, currentStream, liveEpoch, openStream } from './stream.js';
 import type { HelloRequest, PeerSchemas } from './types.js';
 import './agent-docs.js';
 
@@ -55,21 +55,21 @@ function helloInfo() {
   return {
     protocol: PEER_PROTOCOL,
     minProtocol: PEER_PROTOCOL,
-    features: ['agents', 'sessions', 'hop-limit', 'idle'],
+    features: ['agents', 'sessions', 'hop-limit'],
     serverTime: Date.now(),
   };
 }
 async function hello(machineId: string, body: HelloRequest) {
   const db = getDb();
-  const result = await db.transaction(async () => {
+  const { response, old } = await db.transaction(async () => {
     const minAmesh = envValue('PEER_MIN_AMESH');
     if (minAmesh && body.amesh.version.localeCompare(minAmesh, 'en', { numeric: true }) < 0)
       fail(426, 'upgrade_required', 'Update the daemon to ' + minAmesh + ' or later.', { minAmesh });
     const machine = await getMachine(machineId);
     if (!machine || machine.revoked_at !== null) fail(403, 'machine_revoked', 'Enrollment revoked.');
     const now = Date.now();
-    const live = streamIsOpen(machineId) || (machine.epoch_seen_at ?? 0) > now - limits.offlineAfterMs;
-    const reconnect = live && machine.instance === body.instance;
+    const live = liveEpoch(machine);
+    const reconnect = machine.instance === body.instance;
     if (live && !reconnect && !body.takeover)
       fail(409, 'machine_in_use', 'Machine already has an active daemon.', { epoch: machine.epoch });
     const epoch = reconnect ? machine.epoch : machine.epoch + 1;
@@ -83,10 +83,30 @@ async function hello(machineId: string, body: HelloRequest) {
     );
     const logId = await db.get<{ id: string }>('SELECT id FROM peer_log');
     log.info('Peer daemon hello', { machineId, epoch, resumeEpoch: body.resumeEpoch });
-    closeStream(machineId, epoch, live && !reconnect);
-    return { ...helloInfo(), machine: { id: machine.id, name: machine.name }, epoch, log: logId!.id, settings, limits };
+    return {
+      old: currentStream(machineId),
+      response: {
+        ...helloInfo(),
+        machine: { id: machine.id, name: machine.name },
+        epoch,
+        log: logId!.id,
+        settings,
+        limits,
+      },
+    };
   });
-  return result;
+  old?.close(
+    old.epoch === response.epoch
+      ? undefined
+      : {
+          kind: 'superseded',
+          epoch: old.epoch,
+          by: response.epoch,
+          message: 'A new daemon took over.',
+          at: Date.now(),
+        },
+  );
+  return response;
 }
 function networkPolicy(): VoiceModeProxyPolicy {
   return {
@@ -154,8 +174,6 @@ export async function dispatchPeer(req: IncomingMessage, res: ServerResponse, po
       const [, key, action] = session;
       if (!action && method === 'PUT') {
         const value = await registerSession(machine.id, key, decode('SessionRegisterRequest', body));
-        const remote = await remoteSession(machine.id, key);
-        await refreshEndpoints(remote!.id);
         return json(res, 200, { session: value });
       }
       if (method === 'POST' && action) {

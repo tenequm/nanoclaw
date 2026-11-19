@@ -5,7 +5,7 @@ import { generateKeyPairSync, randomBytes, sign, randomUUID } from 'node:crypto'
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { beforeEach, afterEach, expect, it } from 'vitest';
+import { beforeEach, afterEach, expect, it, vi } from 'vitest';
 import { initDb, closeDb, getDb } from '../../db/connection.js';
 import { runMigrations } from '../../db/migrations/index.js';
 import { canonicalSigningText, bodySHA256 } from '../app/contract.js';
@@ -13,7 +13,8 @@ import { parseCidrs } from '../../modules/device-auth/gate.js';
 import { dispatchPeer } from './index.js';
 import { closeStreams } from './stream.js';
 import { enrollMachine, revokeMachine } from './store.js';
-import { sweepPeers } from './lifecycle.js';
+import * as env from '../../env.js';
+import { eventHead, sweepPeers } from './lifecycle.js';
 import type {
   HelloResponse,
   SessionRegisterResponse,
@@ -30,7 +31,7 @@ const policy = {
 };
 let server: Server, base: string, dir: string, dbFile: string;
 beforeEach(async () => {
-  dir = mkdtempSync(join(tmpdir(), 'peer-routes-'));
+  dir = mkdtempSync(join(tmpdir(), 'nanoclaw-a2-peer-routes-'));
   dbFile = join(dir, 'test.db');
   await runMigrations(await initDb(dbFile));
   server = createServer((req, res) => void dispatchPeer(req, res, policy));
@@ -76,7 +77,7 @@ async function machine(name: string) {
   expect(init.status).toBe(200);
   const epoch = ((await init.json()) as HelloResponse).epoch;
   const key = '42-1234abcd';
-  async function register(session = key) {
+  function putSession(session: string) {
     const body: SessionRegisterRequest = {
       epoch,
       name: 'review',
@@ -88,7 +89,10 @@ async function machine(name: string) {
       claudeCode: 'test',
       startedAt: 0,
     };
-    const result = await call('PUT', '/peer/sessions/' + session, body);
+    return call('PUT', '/peer/sessions/' + session, body);
+  }
+  async function register(session = key) {
+    const result = await putSession(session);
     expect(result.status).toBe(200);
     return ((await result.json()) as SessionRegisterResponse).session.address;
   }
@@ -132,7 +136,7 @@ async function machine(name: string) {
     }
     return { through, close: () => reader.cancel() };
   }
-  return { id, call, header, key, epoch, register, send, replay };
+  return { id, call, header, key, epoch, putSession, register, send, replay };
 }
 
 it('routes between two enrolled machines and authorizes a reply only from the addressed session', async () => {
@@ -157,6 +161,12 @@ it('routes between two enrolled machines and authorizes a reply only from the ad
   const back = await a.replay();
   const response = (await back.through('synchronized')).find((e) => e.kind === 'message');
   expect(response).toMatchObject({ session: a.key, id: reply.id, hop: { count: 2 } });
+  const idle = await b.call('POST', '/peer/reports', {
+    epoch: b.epoch,
+    reports: [{ kind: 'idle', id: message.id, session: b.key, at: Date.now() }],
+  });
+  expect(idle.status).toBe(200);
+  expect(await getDb().get("SELECT seq FROM peer_events WHERE kind='idle'")).toBeUndefined();
   const duplicate = await b.call('POST', '/peer/messages', reply);
   expect(duplicate.status).toBe(200);
   expect(await (await b.call('POST', '/peer/messages', { ...reply, text: 'changed' })).json()).toMatchObject({
@@ -280,13 +290,35 @@ it('keeps reports scoped to the receiver and preserves the first final state, in
     b = await machine('two');
   await a.register();
   const address = await b.register();
+  const otherKey = '52-bbbbcccc';
+  await b.register(otherKey);
   for (const state of ['accepted', 'denied', 'expired', 'delivered', 'refused', 'dropped', 'unknown']) {
     const message = a.send({ address });
     expect((await a.call('POST', '/peer/messages', message)).status).toBe(200);
-    const report = { kind: 'state', id: message.id, session: b.key, state, reason: null, at: Date.now() };
+    const report = {
+      kind: 'state',
+      id: message.id,
+      session: b.key,
+      state,
+      reason: state === 'dropped' ? 'future_drop_reason' : null,
+      at: Date.now(),
+    };
     const submit = (daemon: typeof a, record: typeof report) =>
       daemon.call('POST', '/peer/reports', { epoch: daemon.epoch, reports: [record] });
     expect(await (await submit(a, report)).json()).toMatchObject({ results: [{ applied: false, state: null }] });
+    expect(await (await submit(b, { ...report, session: otherKey })).json()).toMatchObject({
+      results: [{ applied: false, state: null }],
+    });
+    expect(
+      (
+        await a.call('POST', '/peer/heartbeat', {
+          epoch: a.epoch,
+          cursor: await eventHead(),
+          sessions: [{ key: a.key, status: 'idle' }],
+        })
+      ).status,
+    ).toBe(200);
+    expect(await getDb().get('SELECT state FROM peer_messages WHERE id=?', message.id)).toEqual({ state: 'queued' });
     expect(await (await submit(b, { ...report, state: 'future_state' })).json()).toMatchObject({
       results: [{ applied: false, state: 'sent' }],
     });
@@ -390,4 +422,159 @@ it('charges refused machine sends and refuses to end an unregistered key', async
   const exhausted = await a.call('POST', '/peer/messages', a.send({ address: 'absent' }));
   expect(exhausted.status).toBe(429);
   expect(Number(exhausted.headers.get('Retry-After'))).toBeGreaterThan(0);
+});
+
+it('keeps the live owner and stream on a refused hello, and restores a lapsed owner only by hello', async () => {
+  const a = await machine('epochs');
+  const features = ['agents', 'sessions', 'hop-limit'];
+  expect(await (await fetch(base + '/peer/hello')).json()).toMatchObject({ features });
+  expect(await (await a.call('POST', '/peer/hello', hello)).json()).toMatchObject({ features });
+  const stream = await a.replay();
+  await stream.through('synchronized');
+  const owner = () =>
+    getDb().get('SELECT epoch,instance,epoch_seen_at,last_seen_at FROM peer_machines WHERE id=?', a.id);
+  const next = { ...hello, instance: randomBytes(16).toString('base64url'), takeover: true };
+  const before = await owner();
+  const min = vi.spyOn(env, 'envValue').mockImplementation((key) => (key === 'PEER_MIN_AMESH' ? '1.0.0' : undefined));
+  try {
+    const refused = await a.call('POST', '/peer/hello', next);
+    expect(refused.status).toBe(426);
+    expect(await refused.json()).toMatchObject({ error: 'upgrade_required' });
+    expect(await owner()).toEqual(before);
+  } finally {
+    min.mockRestore();
+  }
+  const lapse = () => getDb().run('UPDATE peer_machines SET epoch_seen_at=0 WHERE id=?', a.id);
+  const beat = (epoch: number) => a.call('POST', '/peer/heartbeat', { epoch, cursor: 0, sessions: [] });
+  await lapse();
+  expect((await beat(a.epoch)).status).toBe(200);
+  for (const r of [await beat(9), await a.call('GET', '/peer/events?after=0&epoch=9')]) {
+    expect(r.status).toBe(409);
+    expect(await r.json()).toMatchObject({ error: 'superseded', epoch: a.epoch });
+  }
+  // A successful reconnect closes this specific stream; its earlier refused hello left it live.
+  expect((await a.call('POST', '/peer/hello', hello)).status).toBe(200);
+  await stream.close();
+  await lapse();
+  for (const r of [await beat(a.epoch), await a.call('GET', '/peer/events?after=0&epoch=9')]) {
+    expect(r.status).toBe(409);
+    const error = await r.json();
+    expect(error).toMatchObject({ error: 'superseded' });
+    expect(error).not.toHaveProperty('epoch');
+  }
+  expect(await (await a.call('POST', '/peer/hello', hello)).json()).toMatchObject({ epoch: a.epoch });
+  expect((await beat(a.epoch)).status).toBe(200);
+  await lapse();
+  expect(await (await a.call('POST', '/peer/hello', { ...next, takeover: false })).json()).toMatchObject({
+    epoch: a.epoch + 1,
+  });
+});
+
+it('replays stored sends before membership, target, hop and rate decisions', async () => {
+  const a = await machine('sender'),
+    b = await machine('receiver');
+  await a.register();
+  const message = a.send({ address: await b.register() });
+  const send = (data: SendRequest) => a.call('POST', '/peer/messages', data);
+  const original = (await (await send(message)).json()) as SendResponse;
+  expect(original.message.state).toBe('queued');
+  await getDb().run('UPDATE peer_conversations SET hops=20');
+  await getDb().run('UPDATE device_auth_rate_limits SET count=60 WHERE bucket_key=?', 'peer-send:' + a.id);
+  async function unchangedReplay(state: string) {
+    const head = await eventHead();
+    const count = () =>
+      getDb().get('SELECT count FROM device_auth_rate_limits WHERE bucket_key=?', 'peer-send:' + a.id);
+    expect(await (await send(message)).json()).toEqual({ message: { ...original.message, state } });
+    const conflict = await send({ ...message, text: 'changed' });
+    expect(conflict.status).toBe(409);
+    expect(await conflict.json()).toMatchObject({ error: 'id_conflict' });
+    expect(await count()).toEqual({ count: 60 });
+    expect(await eventHead()).toBe(head);
+    expect(await getDb().get('SELECT hops FROM peer_conversations')).toEqual({ hops: 20 });
+  }
+  await unchangedReplay('queued');
+  for (const daemon of [b, a])
+    expect(
+      (await daemon.call('POST', '/peer/sessions/' + daemon.key + '/end', { epoch: daemon.epoch, reason: 'exited' }))
+        .status,
+    ).toBe(200);
+  await unchangedReplay('dropped');
+});
+
+it('notifies both native parties on the first stopped reply, then waits for a reset', async () => {
+  const a = await machine('one'),
+    b = await machine('two');
+  const source = await a.register();
+  const target = await b.register();
+  await a.call('POST', '/peer/messages', a.send({ address: target }));
+  const ep = (await getDb().get<{ id: string }>('SELECT id FROM peer_endpoints WHERE machine_id=?', b.id))!.id;
+  for (let episode = 0; episode < 2; episode++) {
+    await getDb().run('UPDATE peer_conversations SET hops=20');
+    const head = await eventHead();
+    const start = b.send({ address: source });
+    if (episode === 1) {
+      expect((await b.call('POST', '/peer/messages', start)).status).toBe(409);
+    }
+    const first = b.send({ endpoint: ep });
+    for (const reply of [first, b.send({ endpoint: ep })]) {
+      const r = await b.call('POST', '/peer/messages', reply);
+      expect(r.status).toBe(409);
+      expect(await r.json()).toMatchObject({ error: 'hop_limit' });
+    }
+    const limits = await getDb().all<{ machine_id: string; payload: string }>(
+      "SELECT machine_id,payload FROM peer_events WHERE seq>? AND kind='limit' ORDER BY seq",
+      head,
+    );
+    expect(limits.map((e) => [e.machine_id, JSON.parse(e.payload).stopped])).toEqual([
+      [a.id, { id: episode === 1 ? start.id : first.id, direction: 'in' }],
+      [b.id, { id: first.id, direction: 'out' }],
+    ]);
+    expect(
+      (await a.call('POST', '/peer/sessions/' + a.key + '/human', { epoch: a.epoch, at: Date.now(), source: 'prompt' }))
+        .status,
+    ).toBe(200);
+  }
+});
+
+it('snapshots only the remaining endpoint keys, closes on the last end and reopens on takeover', async () => {
+  const a = await machine('source'),
+    b = await machine('receiver');
+  await a.register();
+  const second = '43-1234abcd';
+  for (const key of [b.key, second])
+    expect((await a.call('POST', '/peer/messages', a.send({ address: await b.register(key) }))).status).toBe(200);
+  const ep = (await getDb().get<{ id: string }>('SELECT id FROM peer_endpoints WHERE machine_id=?', b.id))!.id;
+  async function snapshot() {
+    const stream = await b.replay(await eventHead());
+    try {
+      return (await stream.through('synchronized')).filter((e) => e.kind === 'endpoint');
+    } finally {
+      await stream.close();
+    }
+  }
+  expect(await snapshot()).toMatchObject([{ id: ep, sessions: [b.key, second], state: 'open' }]);
+  async function end(key: string) {
+    expect((await b.call('POST', '/peer/sessions/' + key + '/end', { epoch: b.epoch, reason: 'exited' })).status).toBe(
+      200,
+    );
+  }
+  await end(b.key);
+  expect(await snapshot()).toMatchObject([{ id: ep, sessions: [second], state: 'open' }]);
+  const head = await eventHead();
+  await end(second);
+  const closing = await b.replay(head);
+  expect((await closing.through('synchronized')).filter((e) => e.kind === 'endpoint')).toMatchObject([
+    { id: ep, state: 'closed', sessions: [] },
+  ]);
+  await closing.close();
+  expect(await snapshot()).toEqual([]);
+  const resumed = '44-abcdef12';
+  await getDb().exec(`CREATE TRIGGER interrupt_reopen BEFORE INSERT ON peer_events WHEN NEW.kind='endpoint'
+    BEGIN SELECT RAISE(ABORT,'test interrupted endpoint write'); END`);
+  expect((await b.putSession(resumed)).status).toBe(500);
+  expect(await getDb().get('SELECT id FROM peer_sessions WHERE key=?', resumed)).toBeUndefined();
+  expect(await snapshot()).toEqual([]);
+  await getDb().exec('DROP TRIGGER interrupt_reopen');
+  await b.register(resumed);
+  expect(await snapshot()).toMatchObject([{ id: ep, state: 'open', sessions: [resumed] }]);
 });

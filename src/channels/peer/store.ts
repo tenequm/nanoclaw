@@ -1,6 +1,7 @@
 import { createHash, createPublicKey, randomUUID } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import type { IncomingMessage } from 'node:http';
+import type { MeshPeerRecord } from '../../mailbox/model.js';
 import { envValue } from '../../env.js';
 import { getDb } from '../../db/connection.js';
 import { registerMigration } from '../../db/migrations/index.js';
@@ -77,6 +78,30 @@ registerMigration({
         PRIMARY KEY(source,outbound));
     `);
     await db.run('INSERT INTO peer_log(id) VALUES (?)', 'lg_' + randomUUID());
+  },
+});
+
+registerMigration({
+  version: 3,
+  name: 'module:peer:agent-inbox-accepted',
+  async up(db) {
+    const agentDeliveries = `SELECT row_id FROM peer_messages WHERE state='delivered'
+      AND json_extract(response,'$.message.to.kind')='agent'`;
+    await db.exec(`
+      UPDATE peer_events SET payload=json_set(payload,'$.state','accepted',
+        '$.message',json_extract(payload,'$.to.address') || ' delivery: accepted.')
+      WHERE kind='delivery' AND json_extract(payload,'$.state')='delivered'
+        AND message_row IN (${agentDeliveries});
+      UPDATE peer_messages SET state='accepted' WHERE row_id IN (${agentDeliveries});
+    `);
+  },
+});
+
+registerMigration({
+  version: 4,
+  name: 'module:peer:pending-native-limit',
+  async up(db) {
+    await db.exec('ALTER TABLE peer_conversations ADD COLUMN pending_native_limit TEXT');
   },
 });
 
@@ -285,8 +310,9 @@ export function remoteById(id: string) {
 export async function checkEpoch(id: string, epoch: number) {
   const machine = await getMachine(id);
   if (!machine || machine.revoked_at !== null) fail(403, 'machine_revoked', 'Machine enrollment was revoked.');
-  if (!epoch || machine.epoch !== epoch)
-    fail(409, 'superseded', 'This connection no longer owns the machine.', { epoch: machine.epoch });
+  const { liveEpoch } = await import('./stream.js');
+  const live = liveEpoch(machine);
+  if (live !== epoch) fail(409, 'superseded', 'This connection no longer owns the machine.', { epoch: live });
   await getDb().run('UPDATE peer_machines SET epoch_seen_at=? WHERE id=? AND epoch=?', Date.now(), id, epoch);
   return machine;
 }
@@ -369,6 +395,8 @@ export async function registerSession(
         predecessor.id,
       );
     }
+    const { refreshEndpoints } = await import('./lifecycle.js');
+    await refreshEndpoints(id);
     return { key, address: address(), name, project, machine: machine.name, status, registeredAt };
   });
   meshChanged();
@@ -396,14 +424,15 @@ export async function refreshAgentStatus() {
   activeAgents.set(db, busy);
   if (previous.size !== busy.size || [...busy].some((id) => !previous.has(id))) meshChanged();
 }
-export async function listPeers(): Promise<Peer[]> {
+type ListedPeer = Peer & Pick<MeshPeerRecord, 'kind' | 'status'>;
+export async function listPeers(): Promise<ListedPeer[]> {
   const db = getDb();
   const agents = await db.all<
-    Peer & { agentId: string }
+    ListedPeer & { agentId: string }
   >(`SELECT m.agent_group_id AS agentId,m.address, 'agent' AS kind, a.name, NULL AS machine,NULL AS project,
     'idle' AS status,
     NULL AS lastSeen FROM mesh_members m JOIN agent_groups a ON a.id=m.agent_group_id`);
-  const sessions = await db.all<Peer>(`SELECT s.address,'session' AS kind,s.name,m.name AS machine,s.project,
+  const sessions = await db.all<ListedPeer>(`SELECT s.address,'session' AS kind,s.name,m.name AS machine,s.project,
     s.status,m.last_seen_at AS lastSeen FROM peer_sessions s JOIN peer_machines m ON m.id=s.machine_id
     WHERE s.status<>'ended' AND m.revoked_at IS NULL`);
   return [...agents.map(({ agentId, ...peer }) => ({ ...peer, status: agentStatus(agentId) })), ...sessions].sort(

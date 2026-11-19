@@ -38,10 +38,10 @@ export type AddressInput = string;
  * The sending session's real permission class (R13).
  */
 export type FromMode = 'bypass' | 'prompting';
-export type PeerStatus = 'idle' | 'busy' | 'offline';
-export type Kind = 'agent' | 'session';
+export type PeerStatus = string;
+export type Kind = string;
 /**
- * A connection epoch (contract.md section 5); it changes only when the daemon process holding it changes.
+ * A connection epoch (contract.md section 5); it changes only when the daemon process holding it changes. Every write and the stream carry the live one; any other answers 409 superseded (A2).
  */
 export type Epoch = number;
 /**
@@ -61,56 +61,17 @@ export type HopChain = string[];
 /**
  * Stable error codes; an open set, so an unknown code is handled by its status class (contract.md section 14).
  */
-export type ErrorCode =
-  | 'bad_request'
-  | 'bad_body'
-  | 'empty_text'
-  | 'slash_command'
-  | 'bad_address'
-  | 'bad_cursor'
-  | 'bad_signature'
-  | 'unknown_machine'
-  | 'stale_timestamp'
-  | 'replayed'
-  | 'machine_revoked'
-  | 'not_member'
-  | 'not_a_party'
-  | 'not_found'
-  | 'not_running'
-  | 'unknown_session'
-  | 'unknown_endpoint'
-  | 'ambiguous'
-  | 'id_conflict'
-  | 'hop_limit'
-  | 'queue_full'
-  | 'machine_in_use'
-  | 'superseded'
-  | 'too_large'
-  | 'protocol'
-  | 'upgrade_required'
-  | 'rate_limited'
-  | 'internal'
-  | 'unavailable';
+export type ErrorCode = string;
 /**
  * queued (stored at the hub); sent (the receiving daemon's heartbeat cursor passed it, or any later report for it arrived, D39);
- * accepted (written to the inbox, no negative receipt within acceptWindowMs; final);
- * held (Claude Code holds it for approval); delivered, denied, expired (final, from a
- * hold; for an agent target, written into the agent's hub session); refused (the session
+ * accepted (written to the inbox, no negative receipt within acceptWindowMs; for an agent
+ * target, written into its hub session, A2; final); held (Claude Code holds it for
+ * approval); delivered, denied, expired (final, from a hold); refused (the session
  * refuses peers; final); dropped (with a reason; final); unknown (written into the inbox and
  * still open when the daemon restarted; final, never told, D25). Open set: an unknown state
  * is logged and treated as not final.
  */
-export type DeliveryState =
-  | 'queued'
-  | 'sent'
-  | 'accepted'
-  | 'held'
-  | 'delivered'
-  | 'denied'
-  | 'expired'
-  | 'refused'
-  | 'dropped'
-  | 'unknown';
+export type DeliveryState = string;
 /**
  * Claude Code's guard (rate-limited, queue-full: retried after pacing, then dropped;
  * duplicate, hop-loop, hop-runaway: never retried); oversized (over the native line
@@ -121,19 +82,7 @@ export type DeliveryState =
  * have arrived; A1); route_failed (the hub could not write it into the agent's hub
  * session; A1). Open set.
  */
-export type DropReason =
-  | 'rate-limited'
-  | 'queue-full'
-  | 'duplicate'
-  | 'hop-loop'
-  | 'hop-runaway'
-  | 'oversized'
-  | 'session_gone'
-  | 'unknown_session'
-  | 'queue_expired'
-  | 'ended'
-  | 'interrupted'
-  | 'route_failed';
+export type DropReason = string;
 export type Report = StateReport | IdleReport;
 /**
  * Every event kind, discriminated by `kind`, which equals the SSE `event` field. Open
@@ -406,7 +355,7 @@ export interface Settings {
   sendWaitMs: number;
 }
 /**
- * The hub's limits; informational for the daemon, which checks maxTextBytes before sending.
+ * The hub's limits, informational for the daemon except maxTextBytes, which it checks before sending (32768 when missing or invalid). The outbox TTL and the delivered-id record's retention are built into the daemon at 24 h (N3), never read from queueTtlMs (A2).
  */
 export interface Limits {
   /**
@@ -480,7 +429,7 @@ export interface SessionRegisterRequest {
    */
   project: string;
   /**
-   * The registry's status; waiting and others map to busy.
+   * The registry's status at registration; waiting and others map to busy. Later changes travel in the heartbeat (A2).
    */
   status: 'idle' | 'busy';
   /**
@@ -502,7 +451,7 @@ export interface SessionInfo {
   name: string;
   project: string;
   machine: MachineName;
-  status: 'idle' | 'busy' | 'offline' | 'ended';
+  status: string;
   registeredAt: Ms;
 }
 export interface SessionRegisterResponse {
@@ -582,7 +531,7 @@ export interface Peer {
   /**
    * An agent is busy while any of its containers runs a turn, else idle; never offline while the hub answers (*proposed*).
    */
-  status: 'idle' | 'busy' | 'offline';
+  status: string;
   lastSeen: Ms | null;
 }
 export interface PeersResponse {
@@ -647,17 +596,7 @@ export interface SendResponse {
     /**
      * queued on first acceptance; the current state on a replay.
      */
-    state:
-      | 'queued'
-      | 'sent'
-      | 'accepted'
-      | 'held'
-      | 'delivered'
-      | 'denied'
-      | 'expired'
-      | 'refused'
-      | 'dropped'
-      | 'unknown';
+    state: string;
     to: {
       address: Address;
       kind: Kind;
@@ -721,17 +660,17 @@ export interface ReportsResponse {
   results: {
     id: Uuid;
     /**
-     * The message's state after the report; null for an id the hub does not know.
+     * The message's state after the report; null for an id the hub does not know or a message not routed to this machine and session.
      */
     state: DeliveryState | null;
     /**
-     * False when the message was already final or the id is unknown.
+     * False when the message was already final, the id is unknown, or the message was not routed to the signing machine and this session (then state is null; A2).
      */
     applied: boolean;
   }[];
 }
 /**
- * An endpoint this machine's sessions see messages from; announced as a log event before the first message that uses it, and again without an SSE id at every connect while it is open (the snapshot, contract.md section 10).
+ * An endpoint this machine's sessions see messages from; announced as a log event before the first message that uses it, and again without an SSE id at every connect while it is open and lists a live key (the snapshot, contract.md section 10).
  */
 export interface EndpointEvent {
   kind: 'endpoint';
@@ -747,10 +686,10 @@ export interface EndpointEvent {
    */
   context: string | null;
   /**
-   * This machine's sessions that are party to it.
+   * This machine's non-ended sessions that are party to it; the endpoint closes when the last one ends (A2).
    */
   sessions: SessionKey[];
-  state: 'open' | 'closed';
+  state: string;
   createdAt: Ms;
   closedAt: Ms | null;
 }
@@ -809,9 +748,9 @@ export interface DeliveryEvent {
   };
   state: DeliveryState;
   /**
-   * A DropReason or a refusal code.
+   * A DropReason or a refusal code (unknown_session is in both sets, so anyOf; A2).
    */
-  reason: string | null;
+  reason: DropReason | ErrorCode | null;
   /**
    * Display text for the notice.
    */
@@ -832,7 +771,7 @@ export interface LimitEvent {
    */
   stopped: {
     id: Uuid;
-    direction: 'in' | 'out';
+    direction: string;
   };
   message: string;
   at: Ms;
@@ -913,7 +852,7 @@ export interface NativeUserFrame {
   msg_id: string;
 }
 /**
- * Asks the receiving session to answer with peer_idle_notice when the turn ends; sent from the same relay socket after the message.
+ * Asks the receiving session to answer with peer_idle_notice when the turn ends; sent from the same relay socket after the message. In v1 only lane mode sends it, to the child each time its registry status turns busy, and the answer becomes laneTurnEndFrame (contract.md section 18, A2).
  */
 export interface NativeNotifyWhenIdle {
   type: 'control';
@@ -938,8 +877,8 @@ export interface NativeNotifyWhenIdle {
 export interface NativeReceipt {
   type: 'control';
   action: 'peer_message_status';
-  status: 'held' | 'delivered' | 'denied' | 'expired' | 'dropped';
-  status_detail?: 'refused';
+  status: string;
+  status_detail?: string;
   /**
    * Claude Code's sentence; logged, never parsed.
    */
@@ -949,7 +888,7 @@ export interface NativeReceipt {
    */
   from: string;
   orig_msg_id: Uuid;
-  drop_reason?: 'rate-limited' | 'queue-full' | 'duplicate' | 'hop-loop' | 'hop-runaway';
+  drop_reason?: string;
   /**
    * More ids a coalesced drop covers.
    */
@@ -1004,7 +943,7 @@ export interface HookInputPreToolUse {
   tool_use_id?: string;
 }
 /**
- * The R15 deny, printed by amesh hook for a subagent's amesh tool call.
+ * The R15 deny, printed by amesh hook for a subagent's amesh tool call, or, in the M1 trial, for its native SendMessage to an amesh relay.
  */
 export interface HookOutputPreToolUse {
   hookSpecificOutput: {
@@ -1015,9 +954,9 @@ export interface HookOutputPreToolUse {
 }
 export interface LocalError {
   /**
-   * not_in_session: the walk found no live registry entry; excluded: a mesh pipe under AMESH_EXCLUDE; bad_request.
+   * not_in_session: the walk found no live registry entry; excluded: a mesh pipe under AMESH_EXCLUDE or from a config dir other than the first in AMESH_CLAUDE_CONFIG_DIRS; bad_request.
    */
-  error: 'not_in_session' | 'excluded' | 'bad_request';
+  error: string;
   message: string;
 }
 export interface DaemonStatus {
@@ -1034,7 +973,7 @@ export interface DaemonStatus {
     name: MachineName;
   } | null;
   hub: {
-    state: 'connected' | 'connecting' | 'halted';
+    state: string;
     since: Ms;
     epoch: Epoch | null;
     cursor: number;
@@ -1194,11 +1133,15 @@ export interface NoticeIdVector {
   namespace: Uuid;
   machineId: MachineId;
   /**
+   * The hub event log's id, minted with the log; a new log (another hub, a restored database) has a new id (contract.md section 10).
+   */
+  log: string;
+  /**
    * The event seq in decimal, or the message id for an outbox notice.
    */
   source: string;
   /**
-   * The event kind (delivery, limit, idle), or outbox.
+   * The event kind (delivery, limit, idle), or outbox (an outbox notice or a refused native reply).
    */
   kind: string;
   msgId: Uuid;
@@ -1254,3 +1197,87 @@ export interface EnvelopeVector {
   attributed: boolean;
   note?: string;
 }
+
+export const PeerStatus = { idle: 'idle', busy: 'busy', offline: 'offline' } as const;
+export const Kind = { agent: 'agent', session: 'session' } as const;
+export const ErrorCode = {
+  bad_request: 'bad_request',
+  bad_body: 'bad_body',
+  empty_text: 'empty_text',
+  slash_command: 'slash_command',
+  bad_address: 'bad_address',
+  bad_cursor: 'bad_cursor',
+  bad_signature: 'bad_signature',
+  unknown_machine: 'unknown_machine',
+  stale_timestamp: 'stale_timestamp',
+  replayed: 'replayed',
+  machine_revoked: 'machine_revoked',
+  not_member: 'not_member',
+  not_a_party: 'not_a_party',
+  not_found: 'not_found',
+  not_running: 'not_running',
+  unknown_session: 'unknown_session',
+  unknown_endpoint: 'unknown_endpoint',
+  ambiguous: 'ambiguous',
+  id_conflict: 'id_conflict',
+  hop_limit: 'hop_limit',
+  queue_full: 'queue_full',
+  machine_in_use: 'machine_in_use',
+  superseded: 'superseded',
+  too_large: 'too_large',
+  protocol: 'protocol',
+  upgrade_required: 'upgrade_required',
+  rate_limited: 'rate_limited',
+  internal: 'internal',
+  unavailable: 'unavailable',
+} as const;
+export const SessionInfoStatus = { idle: 'idle', busy: 'busy', offline: 'offline', ended: 'ended' } as const;
+export const DeliveryState = {
+  queued: 'queued',
+  sent: 'sent',
+  accepted: 'accepted',
+  held: 'held',
+  delivered: 'delivered',
+  denied: 'denied',
+  expired: 'expired',
+  refused: 'refused',
+  dropped: 'dropped',
+  unknown: 'unknown',
+} as const;
+export const DropReason = {
+  'rate-limited': 'rate-limited',
+  'queue-full': 'queue-full',
+  duplicate: 'duplicate',
+  'hop-loop': 'hop-loop',
+  'hop-runaway': 'hop-runaway',
+  oversized: 'oversized',
+  session_gone: 'session_gone',
+  unknown_session: 'unknown_session',
+  queue_expired: 'queue_expired',
+  ended: 'ended',
+  interrupted: 'interrupted',
+  route_failed: 'route_failed',
+} as const;
+export const EndpointEventState = { open: 'open', closed: 'closed' } as const;
+export const LimitEventStoppedDirection = { in: 'in', out: 'out' } as const;
+export const NativeReceiptStatus = {
+  held: 'held',
+  delivered: 'delivered',
+  denied: 'denied',
+  expired: 'expired',
+  dropped: 'dropped',
+} as const;
+export const NativeReceiptStatusDetail = { refused: 'refused' } as const;
+export const NativeReceiptDropReason = {
+  'rate-limited': 'rate-limited',
+  'queue-full': 'queue-full',
+  duplicate: 'duplicate',
+  'hop-loop': 'hop-loop',
+  'hop-runaway': 'hop-runaway',
+} as const;
+export const LocalErrorError = {
+  not_in_session: 'not_in_session',
+  excluded: 'excluded',
+  bad_request: 'bad_request',
+} as const;
+export const DaemonStatusHubState = { connected: 'connected', connecting: 'connecting', halted: 'halted' } as const;

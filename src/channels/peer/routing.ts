@@ -258,16 +258,22 @@ async function previous(scope: string, sourceId: string, hash: string) {
   if (!row) return;
   if (row.request_hash !== hash) fail(409, 'id_conflict', 'Message id already used for different content.');
   const result: SendResponse = JSON.parse(row.response);
-  if (result.message.state === 'refused' && scope.startsWith('pm_')) throw hopLimitError(result);
   result.message.state = row.state;
   return result;
 }
 async function conversationFor(source: string, target: string) {
   const db = getDb();
   const [a, b] = [source, target].sort();
-  const conversation = await db.get<{ id: string; hops: number; chain: string; limited: number; reset_chain: number }>(
+  const conversation = await db.get<{
+    id: string;
+    hops: number;
+    chain: string;
+    limited: number;
+    pending_native_limit: string | null;
+    reset_chain: number;
+  }>(
     `INSERT INTO peer_conversations(id,party_a,party_b) VALUES (?,?,?)
-    ON CONFLICT(party_a,party_b) DO UPDATE SET party_a=excluded.party_a RETURNING id,hops,chain,limited,reset_chain`,
+    ON CONFLICT(party_a,party_b) DO UPDATE SET party_a=excluded.party_a RETURNING id,hops,chain,limited,pending_native_limit,reset_chain`,
     randomUUID(),
     a,
     b,
@@ -294,9 +300,11 @@ export async function reserveAgentHop(source: Session, target: Session, outbound
     await db.run('INSERT INTO peer_agent_sends(source,outbound,refused) VALUES (?,?,?)', source.id, outbound, +refused);
     if (refused) {
       const text = 'Conversation paused after ' + c.hops + ' messages. An owner turn resets the limit.';
-      await queueNotice(source.id, target.agent_group_id, text, 'agent');
-      if (!c.limited) await queueNotice(target.id, source.agent_group_id, text, 'agent');
-      await db.run('UPDATE peer_conversations SET limited=1 WHERE id=?', c.id);
+      if (!c.limited) {
+        await queueNotice(source.id, target.agent_group_id, text, 'agent');
+        await queueNotice(target.id, source.agent_group_id, text, 'agent');
+        await db.run('UPDATE peer_conversations SET limited=1 WHERE id=?', c.id);
+      } else log.info('Peer hop limit', { conversation: c.id, outbound });
       return 'refused';
     }
     await db.run('UPDATE peer_conversations SET hops=hops+1,reset_chain=0 WHERE id=?', c.id);
@@ -365,14 +373,25 @@ async function queue(sender: Actor, target: Actor, scope: string, input: Send): 
     input.mode,
   );
   if (stopped) {
-    await db.run('UPDATE peer_conversations SET limited=1 WHERE id=?', conversation.id);
+    const nativeSender = sender.remote?.anchor ?? sender.id;
+    const owesReplyNotice = input.reply && conversation.pending_native_limit === nativeSender;
+    if (conversation.limited && !owesReplyNotice) {
+      log.info('Peer hop limit', { conversation: conversation.id, id: input.id });
+      return result;
+    }
+    // An address send receives the HTTP refusal directly. Its first later native reply has no tool result.
+    await db.run(
+      'UPDATE peer_conversations SET limited=1,pending_native_limit=? WHERE id=?',
+      sender.remote && !input.reply ? nativeSender : null,
+      conversation.id,
+    );
     const message = 'Conversation paused after ' + count + ' messages. A human turn resets the limit.';
     for (const [recipient, other, ref] of [
       [target, sender, from],
       [sender, target, to],
     ] as const) {
       if (recipient === target && conversation.limited) continue;
-      if (recipient === sender && recipient.remote) continue;
+      if (recipient === sender && recipient.remote && !input.reply) continue;
       if (recipient.remote)
         await appendEvent(
           recipient.remote.machine_id,
@@ -478,7 +497,7 @@ async function deliverInbound() {
       }
       if (job.message_row) {
         const row = await db.get<MessageRow>('SELECT * FROM peer_messages WHERE row_id=?', job.message_row);
-        if (row) await transition(row, failure ? 'dropped' : 'delivered', failure, Date.now());
+        if (row) await transition(row, failure ? 'dropped' : 'accepted', failure, Date.now());
       }
       await db.run('DELETE FROM peer_inbound WHERE id=?', job.id);
       return failure ? undefined : session;
@@ -502,14 +521,8 @@ export async function sendRemote(machineId: string, request: SendRequest) {
   const db = getDb();
   const result = await db.transaction(async () => {
     await checkEpoch(machineId, request.epoch);
-    let duplicate;
-    try {
-      duplicate = await previous(machineId, request.id, hash);
-    } catch (err) {
-      if (!(err instanceof PeerError)) throw err;
-      duplicate = err;
-    }
-    if (duplicate && !(duplicate instanceof PeerError)) return duplicate;
+    const duplicate = await previous(machineId, request.id, hash);
+    if (duplicate) return duplicate;
     const rate = await consumeRateLimit(
       'peer-send:' + machineId,
       limits.machineRate.limit,
@@ -521,7 +534,6 @@ export async function sendRemote(machineId: string, request: SendRequest) {
         message: 'Machine send limit reached.',
         retryAfter: rate.retryAfter,
       });
-    if (duplicate) return duplicate;
     try {
       return await db.transaction(async () => {
         checkedText(request.text);
