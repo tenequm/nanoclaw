@@ -1,6 +1,7 @@
 import type {
   DeliveryRecord,
   DestinationRecord,
+  MeshPeerRecord,
   InboundRecord,
   OutboundRecord,
   OutboundWrite,
@@ -67,6 +68,7 @@ export interface MailboxOperations {
   setState(key: string, value: string): void;
   deleteState(key: string): void;
   getSessionRouting(): SessionRouting;
+  getMeshPeers(): MeshPeerRecord[];
   getDestinations(): Destination[];
   findDestinationByName(name: string): Destination | undefined;
   findDestinationByRouting(channelType: string, platformId: string): Destination | undefined;

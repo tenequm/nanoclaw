@@ -410,3 +410,88 @@ describe('add_reaction - Telegram glyphs', () => {
     expect(lastContent().emoji).toBe('🚀');
   });
 });
+
+describe('mesh addresses', () => {
+  it('refuses missing mesh addresses locally and lists the current peers', async () => {
+    const peers = getInboundDb().prepare('INSERT INTO mesh_peers VALUES (?, ?, ?, ?, ?, ?)');
+    peers.run('tester', 'agent', null, null, 'idle', 'ag-test');
+    peers.run('review@repo:mac', 'session', 'mac', 'repo', 'offline', null);
+    seedChannelDestination('gone@repo:mac', 'cli', 'alias');
+    for (const to of ['gone@repo:mac', 'gone@repo', 'gone']) {
+      const result = await sendMessage.handler({ to, text: 'test' });
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toBe(`Error: No mesh peer "${to}" is running. Peers: review@repo:mac, tester`);
+    }
+    const missing = await sendMessage.handler({ to: '@repo', text: 'test' });
+    expect(missing.content[0].text).toBe('Error: Unknown destination "@repo". Known: gone@repo:mac, peer, review@repo:mac, tester');
+    expect(getUndeliveredMessages()).toHaveLength(0);
+    expect((await sendMessage.handler({ to: 'peer', text: 'test' })).isError).toBeFalsy();
+  });
+
+  it('recognizes session addresses even with an empty mesh directory', async () => {
+    for (const to of ['gone@repo', 'gone@repo:mac']) {
+      const result = await sendMessage.handler({ to, text: 'test' });
+      expect(result.content[0].text).toBe(`Error: No mesh peer "${to}" is running. Peers: (none)`);
+    }
+    const missing = await sendMessage.handler({ to: 'gone', text: 'test' });
+    expect(missing.content[0].text).toBe('Error: Unknown destination "gone". Known: peer');
+    expect(getUndeliveredMessages()).toHaveLength(0);
+  });
+
+  it('lists public directory fields and routes agent, short and qualified addresses', async () => {
+    const { listPeers } = await import('./core.js');
+    const insert = getInboundDb().prepare('INSERT INTO mesh_peers VALUES (?, ?, ?, ?, ?, ?)');
+    insert.run('tester', 'agent', null, null, 'idle', 'ag-test');
+    insert.run('review@repo:mac', 'session', 'mac', 'repo', 'offline', null);
+    const list = await listPeers.handler({});
+    expect(JSON.parse(String(list.content[0].text)).peers).toEqual([
+      { address: 'review@repo:mac', kind: 'session', machine: 'mac', project: 'repo', status: 'offline' },
+      { address: 'tester', kind: 'agent', machine: null, project: null, status: 'idle' },
+    ]);
+    for (const to of ['tester', 'review@repo'])
+      expect((await sendMessage.handler({ to, text: 'test' })).isError).toBeFalsy();
+    insert.run('review@repo:bl', 'session', 'bl', 'repo', 'busy', null);
+    const ambiguous = await sendMessage.handler({ to: 'review@repo', text: 'test' });
+    expect(ambiguous.isError).toBe(true);
+    expect(ambiguous.content[0].text).toContain('review@repo:mac');
+    expect(ambiguous.content[0].text).toContain('review@repo:bl');
+    await sendMessage.handler({ to: 'review@repo:bl', text: 'test' });
+    expect(getUndeliveredMessages().map((m) => [m.channel_type, m.platform_id])).toEqual([
+      ['agent', 'ag-test'],
+      ['peer', 'review@repo:mac'],
+      ['peer', 'review@repo:bl'],
+    ]);
+  });
+});
+
+it('sends a file description to a remote session without staging the attachment', async () => {
+  getInboundDb()
+    .prepare('INSERT INTO mesh_peers VALUES (?, ?, ?, ?, ?, ?)')
+    .run('review@repo:mac', 'session', 'mac', 'repo', 'idle', null);
+  const file = path.join(agentDir, 'diagram.png');
+  const missing = await sendFile.handler({ to: 'review@repo', path: file });
+  expect(missing.isError).toBe(true);
+  expect(getUndeliveredMessages()).toHaveLength(0);
+  fs.writeFileSync(file, 'test');
+  const result = await sendFile.handler({ to: 'review@repo', path: file, text: 'Diagram' });
+  expect(result.isError).toBeFalsy();
+  expect(JSON.parse(getUndeliveredMessages()[0].content)).toEqual({
+    text: 'Diagram\nFile: diagram.png (peer messages are text only)',
+  });
+});
+
+it('asks a peer by text without waiting or posting in the bound human chat', async () => {
+  const { askUserQuestion } = await import('./interactive.js');
+  seedBoundThread('telegram', 'room', null);
+  publishReplyRoute({ inReplyTo: 'test-in', channelType: 'peer', platformId: 'ps_test' });
+  const result = await askUserQuestion.handler({ title: 'Review', question: 'Ready?', options: ['Yes', 'No'] });
+  expect(result.isError).toBeFalsy();
+  expect(getUndeliveredMessages()).toMatchObject([
+    {
+      kind: 'chat',
+      channel_type: 'peer',
+      platform_id: 'ps_test',
+      content: JSON.stringify({ text: 'Review\nReady?\nYes\nNo' }),
+    },
+  ]);
+});

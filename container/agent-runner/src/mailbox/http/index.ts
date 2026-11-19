@@ -30,6 +30,8 @@ import { heartbeatPath } from '../../heartbeat.js';
  */
 import {
   parseDestinationRecord,
+  parseMeshPeerRecord,
+  type MeshPeerRecord,
   parseInboundRecord,
   parseOutboundRecord,
   parseOutboundWrite,
@@ -114,6 +116,7 @@ interface WireSnapshot {
   delivered: Array<{ messageOutId: string; platformMessageId: string | null; status?: string }>;
   latestRoutes: Array<{ channelType: string; platformId: string; threadId: string | null; inReplyTo: string }>;
   replySeqs: Array<{ channelType: string; platformId: string; platformMessageId: string; sequence: number | null }>;
+  meshPeers?: unknown[];
   destinations: unknown[];
   routing: unknown;
   state: unknown[];
@@ -153,6 +156,7 @@ class Replica {
   deliveryStatus = new Map<string, 'delivered' | 'failed'>();
   latestRoutes = new Map<string, { threadId: string | null; inReplyTo: string }>();
   replySeqs = new Map<string, number | null>();
+  meshPeers: MeshPeerRecord[] = [];
   destinations: Destination[] = [];
   routing: SessionRouting = { channelType: null, platformId: null, threadId: null };
   state = new Map<string, StateValue>();
@@ -190,6 +194,7 @@ class Replica {
         entry.sequence,
       ]),
     );
+    this.meshPeers = (snapshot.meshPeers ?? []).map(parseMeshPeerRecord);
     this.destinations = snapshot.destinations.map(parseDestinationRecord);
     this.routing = parseSessionRoutingRecord(snapshot.routing);
     this.state = new Map(
@@ -611,6 +616,7 @@ export class HttpAgentMailbox implements AgentMailbox {
       setState: (key, value) => this.writeSync('setState', [key, value]),
       deleteState: (key) => this.writeSync('deleteState', [key]),
       getSessionRouting: () => read(() => replica.routing),
+      getMeshPeers: () => read(() => replica.meshPeers),
       getDestinations: () => read(() => replica.destinations),
       findDestinationByName: (name) => read(() => replica.destinations.find((entry) => entry.name === name)),
       findDestinationByRouting: (channelType, platformId) =>

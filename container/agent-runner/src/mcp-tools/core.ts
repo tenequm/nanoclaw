@@ -9,7 +9,7 @@
 import fs from 'fs';
 import path from 'path';
 
-import { findByName, getAllDestinations } from '../destinations.js';
+import { getMeshPeers, resolveNamedDestination, getAllDestinations } from '../destinations.js';
 import { getMessageIdBySeq, getRoutingBySeq, writeMessageOut } from '../db/messages-out.js';
 import { getCurrentInReplyTo, getCurrentReplyRoute } from '../db/session-state.js';
 import { resolveDestinationThread } from '../db/session-routing.js';
@@ -33,9 +33,8 @@ function err(text: string) {
 }
 
 function destinationList(): string {
-  const all = getAllDestinations();
-  if (all.length === 0) return '(none)';
-  return all.map((d) => d.name).join(', ');
+  const names = [...getAllDestinations().map((d) => d.name), ...getMeshPeers().map((p) => p.address)];
+  return [...new Set(names)].join(', ') || '(none)';
 }
 
 /**
@@ -49,7 +48,8 @@ function destinationList(): string {
 function resolveRouting(
   to: string,
 ): { channel_type: string; platform_id: string; thread_id: string | null; resolvedName: string } | { error: string } {
-  const dest = findByName(to);
+  const dest = resolveNamedDestination(to);
+  if (dest && 'error' in dest) return dest;
   if (!dest) return { error: `Unknown destination "${to}". Known: ${destinationList()}` };
   if (dest.type === 'channel') {
     return {
@@ -57,10 +57,10 @@ function resolveRouting(
       platform_id: dest.platformId!,
       thread_id:
         resolveDestinationThread(dest.channelType!, dest.platformId!, getCurrentReplyRoute())?.threadId ?? null,
-      resolvedName: to,
+      resolvedName: dest.name,
     };
   }
-  return { channel_type: 'agent', platform_id: dest.agentGroupId!, thread_id: null, resolvedName: to };
+  return { channel_type: 'agent', platform_id: dest.agentGroupId!, thread_id: null, resolvedName: dest.name };
 }
 
 /** The platform id and routing of a message the agent names by its seq. */
@@ -76,6 +76,24 @@ function resolveSeqTarget(
     return { error: `Cannot determine destination for message #${seq}` };
   return { messageId, routing: { ...routing, channel_type: routing.channel_type, platform_id: routing.platform_id } };
 }
+
+export const listPeers: McpToolDefinition = {
+  tool: {
+    name: 'list_peers',
+    description: 'List mesh peers you can message, with their address, kind, machine, project and status.',
+    inputSchema: { type: 'object', properties: {} },
+  },
+  async handler() {
+    const peers = getMeshPeers().map(({ address, kind, machine, project, status }) => ({
+      address,
+      kind,
+      machine,
+      project,
+      status,
+    }));
+    return ok(JSON.stringify({ peers }));
+  },
+};
 
 const MAX_QUOTE_LENGTH = 1024;
 
@@ -124,7 +142,8 @@ export const sendMessage: McpToolDefinition = {
       properties: {
         to: {
           type: 'string',
-          description: 'Destination name (e.g., "family", "worker-1").',
+          description:
+            'Destination name or mesh address from list_peers (agent, session@project or session@project:machine).',
         },
         text: { type: 'string', description: 'Message content' },
         reply_to: {
@@ -221,6 +240,20 @@ export const sendFile: McpToolDefinition = {
     const resolvedPath = path.isAbsolute(filePath) ? filePath : path.resolve('/workspace/agent', filePath);
     if (!fs.existsSync(resolvedPath)) return err(`File not found: ${filePath}`);
 
+    if (routing.channel_type === 'peer') {
+      const filename = path.basename((args.filename as string) || filePath);
+      const seq = await writeMessageOut({
+        id: generateId(),
+        in_reply_to: getCurrentInReplyTo(),
+        kind: 'chat',
+        platform_id: routing.platform_id,
+        channel_type: 'peer',
+        content: JSON.stringify({
+          text: [args.text, `File: ${filename} (peer messages are text only)`].filter(Boolean).join('\n'),
+        }),
+      });
+      return ok(`Sent file description to ${routing.resolvedName} (id: ${seq})`);
+    }
     const id = generateId();
     const filename = (args.filename as string) || path.basename(resolvedPath);
 
@@ -339,4 +372,4 @@ export const addReaction: McpToolDefinition = {
   },
 };
 
-registerTools([sendMessage, sendFile, editMessage, addReaction]);
+registerTools([listPeers, sendMessage, sendFile, editMessage, addReaction]);

@@ -269,6 +269,8 @@ function formatChatMessages(messages: MessageInRow[]): string {
   return messages.map(formatSingleChat).join('\n');
 }
 
+const SESSION_LABEL = ' (Claude Code session)';
+
 function formatSingleChat(msg: MessageInRow): string {
   if (isSessionEcho(msg)) return formatEchoMessage(msg);
   const content = parseContent(msg.content);
@@ -283,10 +285,21 @@ function formatSingleChat(msg: MessageInRow): string {
   const attachmentsSuffix = formatAttachments(content.attachments);
   const appContextSuffix = formatAppContext(content.app_context);
 
-  const fromAttr = originAttr(msg);
+  let displaySender = sender;
+  let peerAddress: string | undefined;
+  if (msg.channel_type === 'peer' && typeof content.sender === 'string') {
+    if (content.senderKind === 'session') {
+      peerAddress = content.sender;
+      displaySender = content.sender + SESSION_LABEL;
+    } else if (!content.senderKind && content.sender.endsWith(SESSION_LABEL)) {
+      // Mailbox rows written before senderKind already contain the display label.
+      peerAddress = content.sender.split(' ', 1)[0];
+    }
+  }
+  const fromAttr = peerAddress ? ` from="${escapeXml(peerAddress)}"` : originAttr(msg);
   const userAttr = senderAttrs(msg, content);
 
-  return `<message${idAttr}${fromAttr} sender="${escapeXml(sender)}"${userAttr} time="${escapeXml(time)}"${replyAttr}>${replyPrefix}${escapeXml(text)}${linksSuffix}${attachmentsSuffix}${appContextSuffix}</message>`;
+  return `<message${idAttr}${fromAttr} sender="${escapeXml(displaySender)}"${userAttr} time="${escapeXml(time)}"${replyAttr}>${replyPrefix}${escapeXml(text)}${linksSuffix}${attachmentsSuffix}${appContextSuffix}</message>`;
 }
 
 /**

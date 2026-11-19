@@ -254,9 +254,16 @@ describe('HTTP mailbox reads (served from the replica)', () => {
   test('works without run(): the background sync keeps the replica fresh', async () => {
     const mailbox = await started();
     expect(mailbox.operations.getPendingMessages(10, false)).toEqual([]);
-    snapshotState = { pending: [inbound('late', 2)] };
-    await settle();
+    const peer = {
+      address: 'review@test:mac', kind: 'session', machine: 'mac', project: 'test', status: 'busy', agentGroupId: null,
+    };
+    snapshotState = { pending: [inbound('late', 2)], meshPeers: [peer] };
+    const deadline = performance.now() + 2_000;
+    while (!mailbox.operations.getPendingMessages(10, false).length && performance.now() < deadline) {
+      await Bun.sleep(10);
+    }
     expect(mailbox.operations.getPendingMessages(10, false).map((m) => m.id)).toEqual(['late']);
+    expect(mailbox.operations.getMeshPeers()).toEqual([peer]);
   });
 });
 

@@ -10,6 +10,7 @@
  * The host re-validates on the delivery side against the central DB,
  * so even if this table is stale the host's enforcement is authoritative.
  */
+import { loadConfig } from './config.js';
 import { getAgentMailbox } from './mailbox/index.js';
 import type { Destination } from './mailbox/types.js';
 
@@ -23,6 +24,9 @@ export interface DestinationEntry {
 }
 
 export type SessionMode = { kind: 'chat' } | { kind: 'task'; taskId: string };
+
+// Mirrors the Address schema pattern in src/channels/peer/openapi.yaml.
+const MESH_ADDRESS = /^[a-z0-9][a-z0-9._-]{0,39}(@[a-z0-9][a-z0-9._-]{0,39}(:[a-z0-9][a-z0-9-]{0,15})?)?$/;
 
 function destinationEntry(destination: Destination): DestinationEntry {
   return {
@@ -39,9 +43,41 @@ export function getAllDestinations(): DestinationEntry[] {
   return getAgentMailbox().operations.getDestinations().map(destinationEntry);
 }
 
+export function getMeshPeers() {
+  return getAgentMailbox().operations.getMeshPeers();
+}
+
+export function resolveNamedDestination(name: string): DestinationEntry | { error: string } | undefined {
+  const peers = getMeshPeers();
+  const matches = peers.filter(
+    (p) => p.address === name || (p.kind === 'session' && p.address.split(':')[0] === name),
+  );
+  if (matches.length > 1)
+    return { error: `Ambiguous peer "${name}". Choose one: ${matches.map((p) => p.address).join(', ')}` };
+  const peer = matches[0];
+  if (peer?.agentGroupId && peer.agentGroupId === loadConfig().agentGroupId) {
+    return { error: 'Choose a different mesh member.' };
+  }
+  if (peer) {
+    const base = { name: peer.address, displayName: peer.address };
+    return peer.agentGroupId
+      ? { ...base, type: 'agent', agentGroupId: peer.agentGroupId }
+      : { ...base, type: 'channel', channelType: 'peer', platformId: peer.address };
+  }
+  const meshAddress = MESH_ADDRESS.test(name);
+  const sessionAddress = meshAddress && name.includes('@');
+  if (!sessionAddress) {
+    const destination = getAgentMailbox().operations.findDestinationByName(name);
+    if (destination) return destinationEntry(destination);
+  }
+  if (sessionAddress || (meshAddress && peers.length > 0))
+    return { error: `No mesh peer "${name}" is running. Peers: ${peers.map((p) => p.address).join(', ') || '(none)'}` };
+  return undefined;
+}
+
 export function findByName(name: string): DestinationEntry | undefined {
-  const destination = getAgentMailbox().operations.findDestinationByName(name);
-  return destination && destinationEntry(destination);
+  const dest = resolveNamedDestination(name);
+  return dest && !('error' in dest) ? dest : undefined;
 }
 
 export function findByRouting(
@@ -49,6 +85,10 @@ export function findByRouting(
   platformId: string | null | undefined,
 ): DestinationEntry | undefined {
   if (!channelType || !platformId) return undefined;
+  if (channelType === 'agent') {
+    const peer = getMeshPeers().find((p) => p.agentGroupId === platformId);
+    if (peer) return { name: peer.address, displayName: peer.address, type: 'agent', agentGroupId: platformId };
+  }
   const destination = getAgentMailbox().operations.findDestinationByRouting(channelType, platformId);
   return destination && destinationEntry(destination);
 }

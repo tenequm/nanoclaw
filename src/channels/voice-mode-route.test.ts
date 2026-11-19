@@ -31,6 +31,7 @@ import {
   createAgentGroup,
   createMessagingGroup,
   createMessagingGroupAgent,
+  getDb,
   getMessagingGroup,
   initTestDb,
   runMigrations,
@@ -118,9 +119,14 @@ describe('routeVoiceModeTurn', () => {
   });
 
   describe('once the host has started', () => {
+    let controller: AbortController;
+    afterEach(() => controller.abort());
     beforeEach(async () => {
       // What the host runs once inbound is released (src/index.ts startHostModules).
-      for (const start of getHostStartCallbacks()) await start({} as never);
+      controller = new AbortController();
+      for (const start of getHostStartCallbacks()) {
+        await start({ db: getDb(), deliveryAdapter: { deliver: vi.fn() }, signal: controller.signal });
+      }
     });
     it("stores the turn as a waking message in the line agent's session only, and wakes it", async () => {
       expect(await routeVoiceModeTurn(turn(), await fromCaller())).toBe(true);

@@ -520,7 +520,7 @@ describe('error result with no <message> envelope', () => {
   });
 });
 
-describe('a2a failure notices (never answer a notice with a notice)', () => {
+describe('failure notices (never answer a notice with a notice)', () => {
   function insertRow(
     id: string,
     content: object | string,
@@ -585,6 +585,20 @@ describe('a2a failure notices (never answer a notice with a notice)', () => {
     }
     expect(getUndeliveredMessages()).toHaveLength(0);
     expect(lines.filter((line) => line.includes('notice not sent'))).toHaveLength(1);
+  });
+
+  it('marks a failed peer reply and stops the chain when a peer notice wakes the agent', async () => {
+    const sender = { sender: 'review@repo:mac (Claude Code session)', senderId: 'peer:mac' };
+    insertRow('request', { ...sender, text: 'Test request', failureNotice: false }, 'peer', 'ps_test');
+    await failTurn();
+    const replies = getUndeliveredMessages();
+    expect(replies).toHaveLength(1);
+    expect(replies[0]).toMatchObject({ channel_type: 'peer', platform_id: 'ps_test', in_reply_to: 'request' });
+    expect(JSON.parse(replies[0].content)).toEqual({ text: 'Incorrect API key', failureNotice: true });
+
+    insertRow('notice', { ...sender, text: 'Test failure', failureNotice: true }, 'peer', 'ps_test');
+    await failTurn();
+    expect(getUndeliveredMessages()).toEqual(replies);
   });
 
   it('a self-addressed restart message that fails stops after one notice', async () => {

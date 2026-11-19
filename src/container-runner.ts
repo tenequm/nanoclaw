@@ -455,6 +455,10 @@ async function spawnContainer(session: Session, wakeReason?: WakeReason): Promis
     const { writeDestinations } = await import('./modules/agent-to-agent/write-destinations.js');
     await writeDestinations(agentGroup.id, session.id);
   }
+  if (await hasTable(getDb(), 'mesh_members')) {
+    const { writeMeshDirectory } = await import('./channels/peer/directory.js');
+    await writeMeshDirectory(agentGroup.id, session.id);
+  }
   await writeSessionRouting(agentGroup.id, session.id);
   const mailboxKey = { agentGroupId: agentGroup.id, sessionId: session.id };
   const mailbox = getAgentMailbox();

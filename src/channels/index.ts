@@ -14,6 +14,8 @@ import './slack-a2a-guard.js';
 
 import './slack-a2a.js';
 
+import './peer/directory.js';
 import './voice-mode.js';
 
 import './app/index.js';
+import './peer/index.js';

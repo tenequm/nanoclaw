@@ -182,6 +182,22 @@ describe('HTTP mailbox transport, host and runner together', () => {
     expect(operations.getLatestInboundRoute('test', 'room')).toEqual({ threadId: null, inReplyTo: 'in-1' });
   });
 
+  it('refreshes the peer directory and clears it after membership removal', async () => {
+    const runner = await spawnRunner();
+    const peer = {
+      address: 'review@repo:test',
+      kind: 'session' as const,
+      machine: 'test',
+      project: 'repo',
+      status: 'busy' as const,
+      agentGroupId: null,
+    };
+    await host.session(KEY, (mailbox) => mailbox.replaceMeshPeers([peer]));
+    await runner.run(() => expect(runner.operations.getMeshPeers()).toEqual([peer]));
+    await host.session(KEY, (mailbox) => mailbox.replaceMeshPeers([]));
+    await runner.run(() => expect(runner.operations.getMeshPeers()).toEqual([]));
+  });
+
   it('reports a failed card delivery to the runner', async () => {
     const runner = await spawnRunner();
     await runner.operations.writeMessageOut({ id: 'failed-card', kind: 'chat', content: '{}' });

@@ -1,6 +1,7 @@
 import fs from 'fs';
 import type Database from 'better-sqlite3';
 
+import { MESH_PEERS_SCHEMA } from './schema.js';
 import { log } from '../../log.js';
 import { sessionMailboxDir, sessionMailboxPath } from './paths.js';
 export { inboundDbPath, outboundDbPath, sessionMailboxDir, sessionMailboxPath } from './paths.js';
@@ -182,6 +183,15 @@ export function wrapSqliteInbound(db: Database.Database, nextSequence = () => ne
         thread_id: record.threadId,
       });
     },
+    replaceMeshPeers: (entries) => {
+      db.transaction(() => {
+        db.prepare('DELETE FROM mesh_peers').run();
+        const insert = db.prepare(
+          'INSERT INTO mesh_peers (address, kind, machine, project, status, agentGroupId) VALUES (@address, @kind, @machine, @project, @status, @agentGroupId)',
+        );
+        for (const entry of entries) insert.run(entry);
+      })();
+    },
     replaceDestinations: (entries) =>
       replaceDestinations(
         db,
@@ -197,7 +207,13 @@ export function wrapSqliteInbound(db: Database.Database, nextSequence = () => ne
           };
         }),
       ),
-    insertMessage: async (message) => insertMessage(db, message, nextSequence()),
+    insertMessage: async (message, failedOutboundId) => {
+      if (failedOutboundId === undefined) return insertMessage(db, message, nextSequence());
+      db.transaction(() => {
+        insertMessage(db, message, nextSequence());
+        markDeliveryFailed(db, failedOutboundId);
+      })();
+    },
     countDueMessages: () => countDueMessages(db),
     markMessageFailed: (messageId) => markMessageFailed(db, messageId),
     retryWithBackoff: (messageId, backoffSec) => retryWithBackoff(db, messageId, backoffSec),
@@ -473,6 +489,8 @@ export class SqliteAgentMailbox implements AgentMailbox {
     const writableOutbound = () => (outboundWriter ??= openOutboundDbRw(sessionMailboxPath(key, 'outbound')));
     try {
       if (!this.migrated.has(inboundPath)) {
+        if (!inbound.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='mesh_peers'").get())
+          inbound.exec(MESH_PEERS_SCHEMA);
         migrateMessagesInTable(inbound);
         const deliveredColumns = inbound.prepare("PRAGMA table_info('delivered')").all();
         if (deliveredColumns.length > 0) migrateDeliveredTable(inbound);
