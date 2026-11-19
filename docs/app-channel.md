@@ -79,6 +79,23 @@ unread moves its shared read order back only if needed to make the newest agent 
 question unread. The response includes the conversation and device badge. If there is no such
 item, the host returns `409 nothing_unread`.
 
+## Agent status and settings
+
+Hosts advertise `agent-status` and `agent-settings` in hello. Status reports the agent's
+model, install default, effort and available choices, with usage for this conversation.
+A null model id inherits the install default. If both ids are null the provider chooses
+the model. Session figures are null until the host can read a turn for this session.
+
+Send one or both of `model` and `effort` to update the agent across its chats. Model aliases
+and raw ids follow the same rules as `/model`. A changed setting stops the agent's running
+containers once. They start with the new settings on the next message. Repeating the same
+settings leaves active turns running. To compact a Claude session, send `/compact` as an
+ordinary chat message. It appears in the thread as the person's message.
+
+Both routes return `404 not_found` outside the device's reach. A settings write returns
+`403 forbidden` if the command service denies admin access, or `400 invalid_value`
+with the rejected field and its allowed choices.
+
 ## Routes
 
 All paths below are under `/app`. `:id` denotes an opaque identifier.
@@ -87,6 +104,8 @@ All paths below are under `/app`. `:id` denotes an opaque identifier.
 | ------ | ----------------------------------- | ---------------------------------------------- | ------------- |
 | GET    | `/hello`                            | Versions and configured features               | None          |
 | POST   | `/pair`                             | Consume pairing code and proof                 | Pairing proof |
+| GET    | `/conversations/:id/status`         | Read agent settings and this chat's usage      | Signature     |
+| PUT    | `/agents/:id/settings`              | Change this agent's model or effort            | Signature     |
 | GET    | `/agents`                           | List candidates and their shown state          | Signature     |
 | PUT    | `/agents/:id`                       | Set whether the person shows an agent          | Signature     |
 | POST   | `/conversations/:id/unread`         | Mark the newest agent item unread              | Signature     |

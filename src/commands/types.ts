@@ -188,6 +188,7 @@ export interface ActivationView {
  * (and which session) a card should reflect. Omitted for chat-less reads.
  */
 export interface StatusChatContext {
+  transcriptScope?: 'session' | 'group';
   messagingGroupId: string;
   threadId: string | null;
 }

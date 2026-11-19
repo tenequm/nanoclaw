@@ -28,6 +28,7 @@ import fs from 'fs';
 import { getRegisteredChannelNames } from '../channels/channel-registry.js';
 import { restartAgentGroupContainers } from '../container-restart.js';
 import { isContainerRunning, killContainer } from '../container-runner.js';
+import { getDb } from '../db/connection.js';
 import { getAgentGroup } from '../db/agent-groups.js';
 import { ensureContainerConfig, getContainerConfig, updateContainerConfigScalars } from '../db/container-configs.js';
 import {
@@ -216,6 +217,27 @@ async function safeTaskCount(agentGroupId: string): Promise<number | null> {
 
 // --- Reads ---
 
+export async function getAgentConfigStatus(agentGroupId: string) {
+  const ag = await getAgentGroup(agentGroupId);
+  if (!ag) return fail('unknown-agent');
+  const cfg = await getContainerConfig(agentGroupId);
+  return {
+    ok: true as const,
+    view: {
+      agentName: ag.name,
+      agentGroupId,
+      model: cfg?.model ?? null,
+      modelLabel: cfg?.model ? modelLabelFor(cfg.model) : null,
+      effort: cfg?.effort ?? null,
+      autoCompactWindow: cfg?.auto_compact_window ?? null,
+      maxMessagesPerPrompt: cfg?.max_messages_per_prompt ?? null,
+      provider: cfg?.provider ?? null,
+      cliScope: cfg?.cli_scope ?? DEFAULT_CLI_SCOPE,
+      configUpdatedAt: cfg?.updated_at ?? null,
+    },
+  };
+}
+
 /**
  * Read-only status for an agent group. Member-runnable; no auth check here.
  * Missing container_configs rows are treated as all-defaults rather than an
@@ -227,12 +249,9 @@ async function safeTaskCount(agentGroupId: string): Promise<number | null> {
  * the transcript falls back to the group's newest .jsonl.
  */
 export async function getStatus(agentGroupId: string, chatCtx?: StatusChatContext): Promise<CommandResult<StatusView>> {
-  const ag = await getAgentGroup(agentGroupId);
-  if (!ag) return fail('unknown-agent');
-
-  const cfg = await getContainerConfig(agentGroupId);
+  const config = await getAgentConfigStatus(agentGroupId);
+  if (!config.ok) return config;
   const activeSessions = (await getSessionsByAgentGroup(agentGroupId)).filter((s) => s.status === 'active');
-  const autoCompactWindow = cfg?.auto_compact_window ?? null;
 
   let activation: ActivationView | null = null;
   let queueDepth: number | null = null;
@@ -243,23 +262,14 @@ export async function getStatus(agentGroupId: string, chatCtx?: StatusChatContex
     if (session) queueDepth = safeQueueDepth(agentGroupId, session.id);
   }
 
-  const stats = readTranscriptStats(agentGroupId, session?.id ?? null);
+  const stats = readTranscriptStats(agentGroupId, session?.id ?? null, chatCtx?.transcriptScope);
 
   const view: StatusView = {
-    agentName: ag.name,
-    agentGroupId,
-    model: cfg?.model ?? null,
-    modelLabel: cfg?.model ? modelLabelFor(cfg.model) : null,
-    effort: cfg?.effort ?? null,
-    autoCompactWindow,
-    maxMessagesPerPrompt: cfg?.max_messages_per_prompt ?? null,
-    provider: cfg?.provider ?? null,
-    cliScope: cfg?.cli_scope ?? DEFAULT_CLI_SCOPE,
+    ...config.view,
     sessionCount: activeSessions.length,
-    configUpdatedAt: cfg?.updated_at ?? null,
     activation,
     contextTokens: stats?.contextTokens ?? null,
-    contextWindow: autoCompactWindow ?? DEFAULT_AUTO_COMPACT_WINDOW,
+    contextWindow: config.view.autoCompactWindow ?? DEFAULT_AUTO_COMPACT_WINDOW,
     sessionOutputTokens: stats?.outputTokens ?? null,
     sessionTurns: stats?.turns ?? null,
     queueDepth,
@@ -319,60 +329,24 @@ export async function getConfigView(
 
 /**
  * Switch the agent's model. Admin-only. Accepts a catalog alias or a raw
- * model id (format-validated). Instant-kill + lazy-respawn.
+ * model id (format-validated). An accompanying effort change applies in the same write.
  */
 export async function setModel(
   agentGroupId: string,
   modelIdOrAlias: string,
   actorUserId: string,
+  effort?: string,
 ): Promise<CommandResult<ModelChangeView>> {
-  const ag = await getAgentGroup(agentGroupId);
-  if (!ag) return fail('unknown-agent');
-  if (!(await hasAdminPrivilege(actorUserId, agentGroupId))) return fail('unauthorized');
-
-  const resolved = resolveModelInput(modelIdOrAlias);
-  if (!resolved.ok) {
-    return fail('invalid-value', {
-      field: 'model',
-      value: modelIdOrAlias,
-      allowed: MODEL_CATALOG.map((m) => m.alias),
-    });
-  }
-
-  const before = await getContainerConfig(agentGroupId);
-  const previous = describeModel(before?.model ?? null);
-
-  await ensureContainerConfig(agentGroupId);
-  await updateContainerConfigScalars(agentGroupId, { model: resolved.id });
-  log.info('Model changed via chat command', {
-    agentGroupId,
-    actorUserId,
-    from: previous.id,
-    to: resolved.id,
-  });
-
-  // Only kill when the stored value actually moved. Re-selecting the model a
-  // group is already on (easy to do from the /model menu, which shows the
-  // current model as a tappable row) used to kill the container anyway,
-  // destroying an in-flight turn for no config change at all. Note this
-  // compares the STORED value: null (inherit the default) to an explicit id is
-  // a real change even when the effective model is identical, because the
-  // container reads the stored value.
-  const changed = (before?.model ?? null) !== resolved.id;
-  const containersKilled = changed
-    ? await killAgentGroupContainersLazy(agentGroupId, 'model changed via chat command')
-    : 0;
-  if (!changed) {
-    log.debug('Model unchanged, skipping container kill', { agentGroupId, model: resolved.id });
-  }
-
+  const result = await writeConfigValue(agentGroupId, 'model', modelIdOrAlias, actorUserId, effort);
+  if (!result.ok) return result;
+  const { agentName, previous, current, containersKilled } = result.view;
   return {
     ok: true,
     view: {
-      agentName: ag.name,
+      agentName,
       agentGroupId,
-      previous,
-      current: { id: resolved.id, label: resolved.label },
+      previous: describeModel(previous === null ? null : String(previous)),
+      current: describeModel(String(current)),
       containersKilled,
     },
   };
@@ -393,85 +367,88 @@ export async function setConfigValue(
   value: string,
   actorUserId: string,
 ): Promise<CommandResult<ConfigChangeView>> {
-  const ag = await getAgentGroup(agentGroupId);
-  if (!ag) return fail('unknown-agent');
-  if (!(await hasAdminPrivilege(actorUserId, agentGroupId))) return fail('unauthorized');
+  return writeConfigValue(agentGroupId, field, value, actorUserId);
+}
 
-  const before = await getContainerConfig(agentGroupId);
+async function writeConfigValue(
+  agentGroupId: string,
+  field: ConfigField,
+  value: string,
+  actorUserId: string,
+  effort?: string,
+): Promise<CommandResult<ConfigChangeView>> {
+  const result = await getDb().transaction(async () => {
+    const ag = await getAgentGroup(agentGroupId);
+    if (!ag) return fail('unknown-agent');
+    if (!(await hasAdminPrivilege(actorUserId, agentGroupId))) return fail('unauthorized');
 
-  const updates: Partial<
-    Pick<ContainerConfigRow, 'model' | 'effort' | 'auto_compact_window' | 'max_messages_per_prompt'>
-  > = {};
-  let previous: string | number | null;
-  let current: string | number;
-  let previousLabel: string | null | undefined;
-  let currentLabel: string | null | undefined;
+    const before = await getContainerConfig(agentGroupId);
+    const updates: Partial<
+      Pick<ContainerConfigRow, 'model' | 'effort' | 'auto_compact_window' | 'max_messages_per_prompt'>
+    > = {};
+    let previous: string | number | null;
+    let current: string | number;
+    let previousLabel: string | null | undefined;
+    let currentLabel: string | null | undefined;
 
-  switch (field) {
-    case 'model': {
-      const resolved = resolveModelInput(value);
-      if (!resolved.ok) {
-        return fail('invalid-value', { field, value, allowed: MODEL_CATALOG.map((m) => m.alias) });
-      }
-      updates.model = resolved.id;
-      previous = before?.model ?? null;
-      current = resolved.id;
-      previousLabel = before?.model ? modelLabelFor(before.model) : null;
-      currentLabel = resolved.label;
-      break;
-    }
-    case 'effort': {
-      const level = value.trim().toLowerCase();
-      if (!isEffortLevel(level)) {
-        return fail('invalid-value', { field, value, allowed: EFFORT_LEVELS });
-      }
+    const effortInput = field === 'effort' ? value : effort;
+    if (effortInput !== undefined) {
+      const level = effortInput.trim().toLowerCase();
+      if (!isEffortLevel(level))
+        return fail('invalid-value', { field: 'effort', value: effortInput, allowed: EFFORT_LEVELS });
       updates.effort = level;
-      previous = before?.effort ?? null;
-      current = level;
-      break;
     }
-    case 'auto-compact-window': {
-      const parsed = parsePositiveInt(value);
-      if (parsed === null) {
-        return fail('invalid-value', { field, value, allowed: COMPACT_WINDOW_PRESETS });
+    switch (field) {
+      case 'model': {
+        const resolved = resolveModelInput(value);
+        if (!resolved.ok) return fail('invalid-value', { field, value, allowed: MODEL_CATALOG.map((m) => m.alias) });
+        current = resolved.id;
+        updates.model = resolved.id;
+        previous = before?.model ?? null;
+        previousLabel = describeModel(previous).label;
+        currentLabel = resolved.label;
+        break;
       }
-      updates.auto_compact_window = parsed;
-      previous = before?.auto_compact_window ?? null;
-      current = parsed;
-      break;
-    }
-    case 'max-messages-per-prompt': {
-      const parsed = parsePositiveInt(value);
-      if (parsed === null) {
-        return fail('invalid-value', { field, value });
+      case 'effort':
+        previous = before?.effort ?? null;
+        current = updates.effort!;
+        break;
+      case 'auto-compact-window':
+      case 'max-messages-per-prompt': {
+        const parsed = parsePositiveInt(value);
+        if (parsed === null)
+          return fail('invalid-value', {
+            field,
+            value,
+            allowed: field === 'auto-compact-window' ? COMPACT_WINDOW_PRESETS : undefined,
+          });
+        const column = field === 'auto-compact-window' ? 'auto_compact_window' : 'max_messages_per_prompt';
+        previous = before?.[column] ?? null;
+        current = parsed;
+        updates[column] = parsed;
+        break;
       }
-      updates.max_messages_per_prompt = parsed;
-      previous = before?.max_messages_per_prompt ?? null;
-      current = parsed;
-      break;
+      default:
+        return fail('unknown-field', { field: String(field) });
     }
-    default:
-      return fail('unknown-field', { field: String(field) });
-  }
 
-  await ensureContainerConfig(agentGroupId);
-  await updateContainerConfigScalars(agentGroupId, updates);
-  log.info('Config changed via chat command', { agentGroupId, actorUserId, field, from: previous, to: current });
-
-  // Same no-op guard as setModel: re-picking the value already stored must not
-  // kill a running container and lose its turn.
-  const changed = previous !== current;
-  const containersKilled = changed
+    const changed = previous !== current || (effort !== undefined && before?.effort !== updates.effort);
+    if (changed) {
+      await ensureContainerConfig(agentGroupId);
+      await updateContainerConfigScalars(agentGroupId, updates);
+    }
+    return {
+      ok: true as const,
+      changed,
+      view: { agentName: ag.name, agentGroupId, field, previous, current, previousLabel, currentLabel },
+    };
+  });
+  if (!result.ok) return result;
+  const containersKilled = result.changed
     ? await killAgentGroupContainersLazy(agentGroupId, `config ${field} changed via chat command`)
     : 0;
-  if (!changed) {
-    log.debug('Config unchanged, skipping container kill', { agentGroupId, field, value: current });
-  }
-
-  return {
-    ok: true,
-    view: { agentName: ag.name, agentGroupId, field, previous, current, previousLabel, currentLabel, containersKilled },
-  };
+  if (result.changed) log.info('Config changed via chat command', { agentGroupId, actorUserId, field });
+  return { ok: true, view: { ...result.view, containersKilled } };
 }
 
 /**

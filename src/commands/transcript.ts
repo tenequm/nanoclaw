@@ -147,7 +147,12 @@ function parseTranscript(file: string): TranscriptStats | null {
  * or file) fall back to the newest .jsonl in the group's projects dir. Returns
  * null when nothing is resolvable or on any error.
  */
-export function readTranscriptStats(agentGroupId: string, sessionId: string | null): TranscriptStats | null {
+export function readTranscriptStats(
+  agentGroupId: string,
+  sessionId: string | null,
+  scope: 'session' | 'group' = 'group',
+): TranscriptStats | null {
+  if (scope === 'session' && !sessionId) return null;
   try {
     const files = transcriptFiles(agentGroupId);
     if (files.length === 0) return null;
@@ -160,6 +165,7 @@ export function readTranscriptStats(agentGroupId: string, sessionId: string | nu
         if (match) target = match.file;
       }
     }
+    if (!target && scope === 'session') return null;
     if (!target) {
       target = files.reduce((newest, f) => (f.mtimeMs > newest.mtimeMs ? f : newest)).file;
     }

@@ -38,6 +38,7 @@ export interface ErrorBody {
   question?: Question | null;
   provider?: string | null;
   field?: string | null;
+  allowed?: readonly (number | string)[];
 }
 
 export interface HelloResponse {
@@ -97,6 +98,37 @@ export interface SetAgentRequest {
 }
 export interface SetAgentResponse {
   agent: AgentCandidate;
+}
+export interface AgentModel {
+  id: string | null;
+  label: string | null;
+}
+export interface AgentSettings extends Agent {
+  model: AgentModel;
+  defaultModel: AgentModel;
+  effort: string | null;
+  provider: string | null;
+  canEdit: boolean;
+  configUpdatedAt: string | null;
+}
+export interface AgentStatus {
+  agent: AgentSettings;
+  session: {
+    contextTokens: number | null;
+    contextWindow: number | null;
+    turns: number | null;
+    outputTokens: number | null;
+    queueDepth: number | null;
+  };
+  taskCount: number | null;
+  options: { models: { id: string; label: string }[]; efforts: readonly string[] };
+}
+export interface AgentStatusResponse {
+  status: AgentStatus;
+}
+export type AgentSettingsRequest = { model: string; effort?: string } | { model?: string; effort: string };
+export interface AgentSettingsResponse {
+  agent: AgentSettings;
 }
 export type UnreadResponse = ReadResponse;
 export interface FileInitRequest {

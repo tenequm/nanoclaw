@@ -63,7 +63,7 @@ it('serves hello with the contract shape without credentials', async () => {
   vi.spyOn(Date, 'now').mockReturnValue(fixtures.hello.serverTime);
   expect(await request('GET', '/app/hello')).toEqual({
     status: 200,
-    body: { ...fixtures.hello, features: ['agents', 'unread'] },
+    body: { ...fixtures.hello, features: ['agents', 'unread', 'agent-status', 'agent-settings'] },
   });
 });
 it('reads the configuration for unsigned hello requests at most once a minute', async () => {
@@ -131,7 +131,12 @@ it('keeps recorded nonces across a reboot', async () => {
 });
 it('advertises only configured features and derives a domain-separated ticket key', () => {
   vi.stubEnv('OPENAI_API_KEY', 'fixture-only');
-  expect(configuredFeatures(readAppConfig(() => undefined))).toEqual(['agents', 'unread']);
+  expect(configuredFeatures(readAppConfig(() => undefined))).toEqual([
+    'agents',
+    'unread',
+    'agent-status',
+    'agent-settings',
+  ]);
   for (const uploadKey of [undefined, 'invalid']) {
     expect(
       configuredFeatures(readAppConfig((key) => (key === 'OPENAI_API_KEY' ? 'fixture-only' : uploadKey))),
@@ -145,7 +150,15 @@ it('advertises only configured features and derives a domain-separated ticket ke
     APP_APNS_SANDBOX_KEY_PATH: '/test.p8',
   };
   const config = readAppConfig((key) => env[key]);
-  expect(configuredFeatures(config)).toEqual(['agents', 'unread', 'files', 'calls', 'voice-picker']);
+  expect(configuredFeatures(config)).toEqual([
+    'agents',
+    'unread',
+    'agent-status',
+    'agent-settings',
+    'files',
+    'calls',
+    'voice-picker',
+  ]);
   expect(config.ticketKey).toHaveLength(32);
   expect(config.ticketKey).not.toEqual(Buffer.alloc(32, 7));
   expect(config.apns.production).toBeNull();
