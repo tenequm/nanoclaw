@@ -199,4 +199,16 @@ it('creates a dedicated chat per remote, drops omitted heartbeat sessions and en
   await expect(
     routeAgentPeer(hub, { id: 'failed', platformId: remote.address, content: '{"text":"hello"}' }),
   ).rejects.toMatchObject({ body: { error: 'not_running' } });
+  const unread = new Database(inboundDbPath('test-agent', hub.id), { readonly: true });
+  try {
+    expect(unread.prepare('SELECT content FROM messages_in WHERE id=?').get('peer-refusal-failed')).toMatchObject({
+      content: JSON.stringify({
+        sender: 'Peer delivery',
+        failureNotice: true,
+        text: 'This session is no longer running.',
+      }),
+    });
+  } finally {
+    unread.close();
+  }
 });

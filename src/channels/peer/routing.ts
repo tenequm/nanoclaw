@@ -12,6 +12,7 @@ import { requestWake } from '../../request-wake.js';
 import { consumeRateLimit } from '../../modules/device-auth/rate-limit.js';
 import type { Session } from '../../types.js';
 import {
+  PeerError,
   agentStatus,
   checkedText,
   checkEpoch,
@@ -513,36 +514,55 @@ export async function routeAgentPeer(
   const hash = createHash('sha256')
     .update(JSON.stringify([msg.platformId, msg.content]))
     .digest('hex');
-  const result = await getDb().transaction(async () => {
-    const sender = await actor(session.id);
-    const old = await previous(session.id, msg.id, hash);
-    if (old) return old;
-    const address = msg.platformId ?? '';
-    let target: Actor;
-    if (address.startsWith('ps_') && !address.includes('@')) target = await actor(address);
-    else if (address.startsWith('pc_') && session.messaging_group_id === address) {
-      const row = await getDb().get<{ remote_id: string }>(
-        'SELECT CASE WHEN party_a=? THEN party_b ELSE party_a END AS remote_id FROM peer_conversations WHERE party_a=? OR party_b=? ORDER BY rowid LIMIT 1',
-        session.id,
-        session.id,
-        session.id,
-      );
-      if (!row) fail(404, 'unknown_session', 'No peer for this chat.');
-      target = await actor(row.remote_id);
-    } else target = await addressTarget(address, sender);
-    const config = await getContainerConfig(session.agent_group_id);
-    const provider = resolveProviderName(session.agent_provider, config?.provider);
-    return queue(sender, target, session.id, {
-      id: randomUUID(),
-      sourceId: msg.id,
-      hash,
-      text: peerText(data),
-      origin: 'unknown',
-      mode: provider === 'claude' ? 'bypass' : null,
-      notify: false,
-      failure: data.failureNotice === true,
+  const result = await getDb()
+    .transaction(async () => {
+      const sender = await actor(session.id);
+      const old = await previous(session.id, msg.id, hash);
+      if (old) return old;
+      const address = msg.platformId ?? '';
+      let target: Actor;
+      if (address.startsWith('ps_') && !address.includes('@')) target = await actor(address);
+      else if (address.startsWith('pc_') && session.messaging_group_id === address) {
+        const row = await getDb().get<{ remote_id: string }>(
+          'SELECT CASE WHEN party_a=? THEN party_b ELSE party_a END AS remote_id FROM peer_conversations WHERE party_a=? OR party_b=? ORDER BY rowid LIMIT 1',
+          session.id,
+          session.id,
+          session.id,
+        );
+        if (!row) fail(404, 'unknown_session', 'No peer for this chat.');
+        target = await actor(row.remote_id);
+      } else target = await addressTarget(address, sender);
+      const config = await getContainerConfig(session.agent_group_id);
+      const provider = resolveProviderName(session.agent_provider, config?.provider);
+      return queue(sender, target, session.id, {
+        id: randomUUID(),
+        sourceId: msg.id,
+        hash,
+        text: peerText(data),
+        origin: 'unknown',
+        mode: provider === 'claude' ? 'bypass' : null,
+        notify: false,
+        failure: data.failureNotice === true,
+      });
+    })
+    .catch(async (error: unknown) => {
+      if (error instanceof PeerError && error.status < 500 && error.status !== 429 && data.failureNotice !== true) {
+        try {
+          await writeSessionMessage(session.agent_group_id, session.id, {
+            id: 'peer-refusal-' + msg.id,
+            kind: 'chat',
+            timestamp: new Date().toISOString(),
+            platformId: msg.platformId,
+            channelType: 'peer',
+            content: JSON.stringify({ sender: 'Peer delivery', failureNotice: true, text: error.body.message }),
+          });
+          await requestWake(session, 'inbound-message');
+        } catch (writeError) {
+          if (!isUniqueViolation(writeError)) throw writeError;
+        }
+      }
+      throw error;
     });
-  });
   if (data.type === 'ask_question' && typeof data.questionId === 'string' && data.questionId === msg.id) {
     try {
       await writeSessionMessage(session.agent_group_id, session.id, {
