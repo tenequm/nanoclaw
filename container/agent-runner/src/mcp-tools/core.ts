@@ -9,6 +9,7 @@
 import fs from 'fs';
 import path from 'path';
 
+import { getAgentMailbox } from '../mailbox/index.js';
 import { findByName, getAllDestinations } from '../destinations.js';
 import { getMessageIdBySeq, getRoutingBySeq, writeMessageOut } from '../db/messages-out.js';
 import { getCurrentInReplyTo, getCurrentReplyRoute } from '../db/session-state.js';
@@ -49,6 +50,18 @@ function destinationList(): string {
 function resolveRouting(
   to: string,
 ): { channel_type: string; platform_id: string; thread_id: string | null; resolvedName: string } | { error: string } {
+  const peers = getAgentMailbox().operations.getMeshPeers();
+  const matches = peers.filter((p) => p.address === to || (p.kind === 'session' && p.address.split(':')[0] === to));
+  if (matches.length > 1)
+    return { error: `Ambiguous peer "${to}". Choose one: ${matches.map((p) => p.address).join(', ')}` };
+  const peer = matches[0];
+  if (peer)
+    return {
+      channel_type: peer.kind === 'agent' ? 'agent' : 'peer',
+      platform_id: peer.agentGroupId ?? peer.address,
+      thread_id: null,
+      resolvedName: peer.address,
+    };
   const dest = findByName(to);
   if (!dest) return { error: `Unknown destination "${to}". Known: ${destinationList()}` };
   if (dest.type === 'channel') {
@@ -76,6 +89,26 @@ function resolveSeqTarget(
     return { error: `Cannot determine destination for message #${seq}` };
   return { messageId, routing: { ...routing, channel_type: routing.channel_type, platform_id: routing.platform_id } };
 }
+
+export const listPeers: McpToolDefinition = {
+  tool: {
+    name: 'list_peers',
+    description: 'List mesh peers you can message, with their address, kind, machine, project and status.',
+    inputSchema: { type: 'object', properties: {} },
+  },
+  async handler() {
+    const peers = getAgentMailbox()
+      .operations.getMeshPeers()
+      .map(({ address, kind, machine, project, status }) => ({
+        address,
+        kind,
+        machine,
+        project,
+        status,
+      }));
+    return ok(JSON.stringify({ peers }));
+  },
+};
 
 const MAX_QUOTE_LENGTH = 1024;
 
@@ -124,7 +157,8 @@ export const sendMessage: McpToolDefinition = {
       properties: {
         to: {
           type: 'string',
-          description: 'Destination name (e.g., "family", "worker-1").',
+          description:
+            'Destination name or mesh address from list_peers (agent, session@project or session@project:machine).',
         },
         text: { type: 'string', description: 'Message content' },
         reply_to: {
@@ -218,6 +252,20 @@ export const sendFile: McpToolDefinition = {
     const routing = resolveRouting(to);
     if ('error' in routing) return err(routing.error);
 
+    if (routing.channel_type === 'peer') {
+      const filename = path.basename((args.filename as string) || filePath);
+      const seq = await writeMessageOut({
+        id: generateId(),
+        in_reply_to: getCurrentInReplyTo(),
+        kind: 'chat',
+        platform_id: routing.platform_id,
+        channel_type: 'peer',
+        content: JSON.stringify({
+          text: [args.text, `File: ${filename} (peer messages are text only)`].filter(Boolean).join('\n'),
+        }),
+      });
+      return ok(`Sent file description to ${routing.resolvedName} (id: ${seq})`);
+    }
     const resolvedPath = path.isAbsolute(filePath) ? filePath : path.resolve('/workspace/agent', filePath);
     if (!fs.existsSync(resolvedPath)) return err(`File not found: ${filePath}`);
 
@@ -339,4 +387,4 @@ export const addReaction: McpToolDefinition = {
   },
 };
 
-registerTools([sendMessage, sendFile, editMessage, addReaction]);
+registerTools([listPeers, sendMessage, sendFile, editMessage, addReaction]);

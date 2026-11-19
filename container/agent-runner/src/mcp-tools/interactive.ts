@@ -29,10 +29,14 @@ function generateId(): string {
  * none: it is what a per-thread session should stay in.
  */
 function routing() {
+  const current = getCurrentReplyRoute();
+  if (current?.channelType === 'peer' && current.platformId) {
+    return { channel_type: 'peer', platform_id: current.platformId, thread_id: null };
+  }
   const session = getSessionRouting();
   const thread =
     session.channel_type && session.platform_id
-      ? resolveDestinationThread(session.channel_type, session.platform_id, getCurrentReplyRoute())
+      ? resolveDestinationThread(session.channel_type, session.platform_id, current)
       : null;
   return { ...session, thread_id: thread?.threadId ?? session.thread_id };
 }
@@ -219,6 +223,16 @@ export const askUserQuestion: McpToolDefinition = {
 
     const questionId = generateId();
     const r = routing();
+
+    if (r.channel_type === 'peer') {
+      await writeMessageOut({
+        id: questionId,
+        kind: 'chat',
+        ...r,
+        content: JSON.stringify({ text: [title, question, ...options.map((o) => o.label)].join('\n') }),
+      });
+      return ok('Question sent as text. The peer can reply in a new message.');
+    }
 
     // Write question card to outbound.db
     await writeMessageOut({
