@@ -1,3 +1,4 @@
+import { AsyncResource } from 'node:async_hooks';
 import { getDb } from '../../db/connection.js';
 import { getActiveSessions } from '../../db/sessions.js';
 import { onHostShutdown, onHostStart } from '../../host-lifecycle.js';
@@ -75,7 +76,8 @@ onHostStart(async ({ signal }) => {
   const update = () => {
     void refresh().catch(() => {});
   };
-  const unsubscribe = onMeshChange(update);
+  // A template stamp can change membership inside a transaction. Read after its commit.
+  const unsubscribe = onMeshChange(AsyncResource.bind(update));
   const timer = setInterval(update, 5_000);
   timer.unref();
   signal.addEventListener(
