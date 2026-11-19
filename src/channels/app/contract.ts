@@ -107,6 +107,7 @@ export interface AgentSettings extends Agent {
   model: AgentModel;
   defaultModel: AgentModel;
   effort: string | null;
+  defaultEffort: string | null;
   provider: string | null;
   canEdit: boolean;
   configUpdatedAt: string | null;

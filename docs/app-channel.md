@@ -84,7 +84,8 @@ item, the host returns `409 nothing_unread`.
 Hosts advertise `agent-status` and `agent-settings` in hello. Status reports the agent's
 model, install default, effort and available choices, with usage for this conversation.
 A null model id inherits the install default. If both ids are null the provider chooses
-the model. A null provider means Claude. Other providers have an empty `options.models`
+the model. A null effort likewise inherits `defaultEffort` (`NANOCLAW_DEFAULT_EFFORT`); if
+both are null the provider chooses the level. A null provider means Claude. Other providers have an empty `options.models`
 list, so the app hides the model rows. The host always reports the configured context
 window (165000 by default) and this conversation's queue depth (zero before a session
 exists, null if its mailbox cannot be read). Turns, output tokens and context tokens are

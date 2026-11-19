@@ -1,4 +1,4 @@
-import { DEFAULT_MODEL } from '../../config.js';
+import { DEFAULT_EFFORT, DEFAULT_MODEL } from '../../config.js';
 import { getAgentConfigStatus, getStatus, setConfigValue, setModel } from '../../commands/service.js';
 import {
   describeModel,
@@ -23,6 +23,7 @@ function agentSettings(
     model: describeModel(view.model),
     defaultModel: describeModel(DEFAULT_MODEL || null),
     effort: view.effort,
+    defaultEffort: DEFAULT_EFFORT || null,
     provider: view.provider,
     canEdit,
     configUpdatedAt: view.configUpdatedAt,

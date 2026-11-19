@@ -55,7 +55,7 @@ async function withEnv(env: Record<string, string | undefined>, row: ContainerCo
   }
 }
 
-const CLEAR = { NANOCLAW_DEFAULT_MODEL: undefined, NANOCLAW_FAST_MODE: undefined };
+const CLEAR = { NANOCLAW_DEFAULT_MODEL: undefined, NANOCLAW_DEFAULT_EFFORT: undefined, NANOCLAW_FAST_MODE: undefined };
 
 describe('install-wide model defaults', () => {
   let row: ContainerConfigRow;
@@ -93,6 +93,21 @@ describe('install-wide model defaults', () => {
   it('treats an empty default as unset rather than shipping an empty model', async () => {
     const cfg = await withEnv({ ...CLEAR, NANOCLAW_DEFAULT_MODEL: '' }, row);
     expect(cfg.model).toBeUndefined();
+  });
+
+  it('fills the effort for a group that has none and never overrides its own', async () => {
+    expect((await withEnv(CLEAR, row)).effort).toBeUndefined();
+    expect((await withEnv({ ...CLEAR, NANOCLAW_DEFAULT_EFFORT: 'high' }, row)).effort).toBe('high');
+    expect((await withEnv({ ...CLEAR, NANOCLAW_DEFAULT_EFFORT: ' HIGH ' }, row)).effort).toBe('high');
+    await updateContainerConfigScalars(GROUP.id, { effort: 'low' });
+    const withEffort = (await getContainerConfig(GROUP.id))!;
+    expect((await withEnv({ ...CLEAR, NANOCLAW_DEFAULT_EFFORT: 'high' }, withEffort)).effort).toBe('low');
+  });
+
+  it('ignores a default effort that is not a known level', async () => {
+    for (const value of ['hgh', 'extreme', '', '3']) {
+      expect((await withEnv({ ...CLEAR, NANOCLAW_DEFAULT_EFFORT: value }, row)).effort).toBeUndefined();
+    }
   });
 
   it("enables fast mode on '1' and 'true', case-insensitively", async () => {

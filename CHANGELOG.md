@@ -24,6 +24,7 @@ NanoClaw 2026.11.0-beta.1 is the first beta of 2026.11.0: an early test build, s
 
 ### ✨ New
 
+- **`NANOCLAW_DEFAULT_EFFORT` sets the reasoning effort for agents without their own.** Like `NANOCLAW_DEFAULT_MODEL`, a group's own effort always wins, the value is read at the next container start, and anything but `low`, `medium`, `high`, `xhigh` or `max` is ignored. The app's agent status reports it as `defaultEffort`. Installs that leave it unset are unaffected.
 - **Agents can create other agents from templates.** Ask for one in chat, pick from `ncl templates list` or the public library, and the agent builds it. Setup's template library list now shows what each template does ([using templates](https://docs.nanoclaw.dev/templates/using-templates)).
 - **Cursor is an agent provider.** The new `/add-cursor` skill runs Cursor's Agent SDK, and setup offers Cursor in the provider picker; it needs a locally built agent image ([providers](https://docs.nanoclaw.dev/extend/providers)).
 - **Setup waits for a slow first reply instead of failing.** The first-chat check waits 2 minutes, then asks whether to keep waiting, and shows each stage (sandbox, agent runtime, model) with its time, so local models that take minutes to load no longer fail setup. Runs without a terminal now stop after 2 minutes instead of 30 seconds.

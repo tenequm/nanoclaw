@@ -117,6 +117,7 @@ vi.mock('../../config.js', async (original) => {
   return {
     ...config,
     DEFAULT_MODEL: 'claude-sonnet-5-5',
+    DEFAULT_EFFORT: 'high',
     get DATA_DIR() {
       return tempData.directory ?? config.DATA_DIR;
     },
