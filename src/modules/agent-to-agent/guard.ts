@@ -17,6 +17,7 @@
  * outcome. Policy rows can only tighten (hold), never allow: absence of a
  * row falls through to the structural checks.
  */
+import { getDb } from '../../db/connection.js';
 import { getAgentGroup } from '../../db/agent-groups.js';
 import { getContainerConfig } from '../../db/container-configs.js';
 import { ALLOW, DENY, HOLD, defineGuardedAction } from '../../guard/index.js';
@@ -75,7 +76,15 @@ export const a2aSend = defineGuardedAction({
     const to = input.resource?.to ?? '';
     const isSelf = to === from;
     if (!isSelf && !(await hasDestination(from, 'agent', to))) {
-      return DENY(`unauthorized agent-to-agent: ${from} has no destination for ${to}`);
+      const db = getDb();
+      const shared =
+        (await db.hasTable('mesh_members')) &&
+        (await db.get(
+          'SELECT 1 FROM mesh_members a JOIN mesh_members b ON b.agent_group_id=? WHERE a.agent_group_id=?',
+          to,
+          from,
+        ));
+      if (!shared) return DENY(`unauthorized agent-to-agent: ${from} has no destination for ${to}`);
     }
     if (!(await getAgentGroup(to))) {
       return DENY(`target agent group ${to} not found for message ${String(input.payload.id)}`);
@@ -85,6 +94,6 @@ export const a2aSend = defineGuardedAction({
     if (policy) {
       return HOLD(`a2a message policy ${from}→${to} holds for ${policy.approver}`, policy.approver);
     }
-    return ALLOW('destination grant exists');
+    return ALLOW('reachable agent');
   },
 });

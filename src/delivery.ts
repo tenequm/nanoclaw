@@ -635,6 +635,13 @@ async function deliverMessage(
     return;
   }
 
+  if (msg.channelType === 'peer') {
+    if (!(await hasTable(getDb(), 'peer_machines'))) throw new Error('Peer channel is not installed');
+    const { routeAgentPeer } = await import('./channels/peer/routing.js');
+    await routeAgentPeer(session, msg);
+    return;
+  }
+
   // Permission check: the source agent must be allowed to deliver to this
   // channel destination. Two ways it passes:
   //
