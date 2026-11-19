@@ -165,49 +165,81 @@ export async function setDelivery(id: string, delivery: Delivery): Promise<void>
 let started = false;
 let timer: ReturnType<typeof setInterval> | undefined;
 let draining: Promise<void> | undefined;
-let transcribing: Promise<void> | undefined;
+const transcriptionWorkers = new Map<AbortController, Promise<void>>();
 
-async function processTranscriptions(transcribe: typeof transcribeAudio): Promise<void> {
+async function processTranscriptions(transcribe: typeof transcribeAudio, signal: AbortSignal): Promise<void> {
   const db = getDb();
-  const jobs = await db.all<RoutingJobRow & { user_id: string; agent_group_id: string }>(
-    `SELECT j.*, c.user_id, c.agent_group_id FROM app_routing_jobs j
-     JOIN app_messages m ON m.id=j.message_id JOIN app_conversations c ON c.id=m.conversation_id
-     WHERE j.state='transcribe' ORDER BY j.created_at, j.rowid`,
-  );
-  for (const job of jobs) {
-    // An interrupted provider call is safe to repeat once. Routing's started_at is reserved for agent handoff.
-    const transcripts = new Map<string, string | null>();
-    if (job.attempts < 2) {
-      await db.run('UPDATE app_routing_jobs SET attempts=attempts+1 WHERE message_id=?', job.message_id);
-      const files = await db.all<{ id: string; storage_path: string }>(
-        "SELECT id,storage_path FROM app_files WHERE message_id=? AND kind='audio'",
-        job.message_id,
-      );
-      for (const file of files) {
-        transcripts.set(file.id, await transcribe(file.storage_path, 'voice.m4a').catch(() => null));
+  while (!signal.aborted) {
+    const job = await db.get<RoutingJobRow>(
+      `UPDATE app_routing_jobs SET state='transcribing', attempts=attempts+1
+       WHERE state='transcribe' AND message_id=(SELECT message_id FROM app_routing_jobs
+         WHERE state='transcribe' ORDER BY created_at, rowid LIMIT 1) RETURNING *`,
+    );
+    if (!job || signal.aborted) return;
+    try {
+      const transcripts = new Map<string, string | null>();
+      if (job.attempts <= 2) {
+        const files = await db.all<{ id: string; storage_path: string }>(
+          "SELECT id,storage_path FROM app_files WHERE message_id=? AND kind='audio'",
+          job.message_id,
+        );
+        for (const file of files) {
+          if (signal.aborted) return;
+          transcripts.set(file.id, await transcribe(file.storage_path, 'voice.m4a', signal).catch(() => null));
+        }
       }
+      if (signal.aborted) return;
+      const row = (await db.get<MessageRow>('SELECT * FROM app_messages WHERE id=?', job.message_id))!;
+      const c = (await getConversation(row.conversation_id))!;
+      const availability = await appHooks.callAvailability(c.user_id, c.agent_group_id);
+      if (signal.aborted) return;
+      await appTransaction(async () => {
+        const current = (await db.get<MessageRow>('SELECT * FROM app_messages WHERE id=?', job.message_id))!;
+        const message = messageEntity(current);
+        for (const file of message.files) {
+          if (file.transcript?.state !== 'pending') continue;
+          const text = transcripts.get(file.id);
+          file.transcript = text?.trim() ? { state: 'done', text } : { state: 'failed' };
+        }
+        await saveMessage(message, c.user_id, c.agent_group_id);
+        await itemChanged((await getConversation(message.conversationId))!, message, false, availability);
+        await db.run("UPDATE app_routing_jobs SET state='pending',attempts=0 WHERE message_id=?", message.id);
+      });
+    } catch (error) {
+      if (!signal.aborted)
+        await db.run(
+          "UPDATE app_routing_jobs SET state='transcribe' WHERE message_id=? AND state='transcribing'",
+          job.message_id,
+        );
+      throw error;
     }
-    const availability = await appHooks.callAvailability(job.user_id, job.agent_group_id);
-    await appTransaction(async () => {
-      const current = (await db.get<MessageRow>('SELECT * FROM app_messages WHERE id=?', job.message_id))!;
-      const message = messageEntity(current);
-      for (const file of message.files) {
-        if (file.transcript?.state !== 'pending') continue;
-        const text = transcripts.get(file.id);
-        file.transcript = text?.trim() ? { state: 'done', text } : { state: 'failed' };
-      }
-      await saveMessage(message, job.user_id, job.agent_group_id);
-      await itemChanged((await getConversation(message.conversationId))!, message, false, availability);
-      await db.run("UPDATE app_routing_jobs SET state='pending',attempts=0 WHERE message_id=?", message.id);
-    });
   }
 }
 
 export async function drainTranscriptions(transcribe = transcribeAudio): Promise<void> {
-  transcribing ??= processTranscriptions(transcribe).finally(() => {
-    transcribing = undefined;
-  });
-  await transcribing;
+  while (transcriptionWorkers.size < 2) {
+    const controller = new AbortController();
+    const worker = processTranscriptions(transcribe, controller.signal).finally(() =>
+      transcriptionWorkers.delete(controller),
+    );
+    transcriptionWorkers.set(controller, worker);
+  }
+  await Promise.all(transcriptionWorkers.values());
+}
+
+export async function stopTranscriptions(): Promise<void> {
+  for (const controller of transcriptionWorkers.keys()) controller.abort();
+  let timeout: NodeJS.Timeout | undefined;
+  try {
+    await Promise.race([
+      Promise.allSettled(transcriptionWorkers.values()),
+      new Promise<void>((resolve) => {
+        timeout = setTimeout(resolve, 2000);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 function wakeWorkers(): void {
@@ -216,6 +248,7 @@ function wakeWorkers(): void {
 }
 
 export async function recoverRoutingJobs(): Promise<void> {
+  await getDb().run("UPDATE app_routing_jobs SET state='transcribe' WHERE state='transcribing'");
   for (const job of await getDb().all<RoutingJobRow>(
     'SELECT * FROM app_routing_jobs WHERE started_at IS NOT NULL AND finished_at IS NULL',
   )) {
@@ -312,5 +345,5 @@ onHostStart(async () => {
 onHostShutdown(async () => {
   started = false;
   clearInterval(timer);
-  await Promise.all([transcribing, draining]);
+  await Promise.all([stopTranscriptions(), draining]);
 });

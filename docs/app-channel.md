@@ -12,6 +12,7 @@ API. Whole messages arrive after a working status, without token streaming.
 | ------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------- |
 | `APP_PUBLIC_BASE`                                            | Public HTTPS base, such as `https://app.example.com`, used in pairing and push host identity.                        | None by itself.                                                                     |
 | `NANOCLAW_ENCRYPTION_KEY`                                    | Host-only encryption key; HKDF-SHA256 derives a separate 32-byte upload-ticket key with info `heydan-app-ticket-v1`. | `files` when the key parses.                                                        |
+| `OPENAI_API_KEY`                                             | Host credential for voice transcription.                                                                             | `voice-messages` when `files` is enabled.                                           |
 | `APP_LIVEKIT_URL`                                            | Public WebSocket address returned in app call grants.                                                                | `calls`, `voice-picker` when set.                                                   |
 | `APP_APNS_TEAM_ID`                                           | Apple developer team for push signing.                                                                               | `push` with a topic, a public base and at least one readable P-256 environment key. |
 | `APP_APNS_TOPIC`                                             | App bundle topic: your application bundle identifier. No default; push stays off without it.                         | Required for `push`.                                                                |
@@ -128,13 +129,13 @@ runner's deadline or when the agent stops waiting.
 
 ## Voice messages
 
-| Configuration or route                 | Voice message behavior                                                                              |
-| -------------------------------------- | --------------------------------------------------------------------------------------------------- |
-| `OPENAI_API_KEY`                       | A configured key enables the `voice-messages` feature in `GET /app/hello`.                          |
-| `POST /app/files`                      | Mint with `mimeType: "audio/mp4"` or `"audio/x-m4a"` and optional nonnegative integer `durationMs`. |
-| `PUT /app/files/:id`                   | Upload up to 25 MiB. The host checks for an M4A brand in the ISO BMFF file type box.                |
-| `GET /app/files/:id`                   | Download the recording as `audio/mp4`.                                                              |
-| `POST /app/conversations/:id/messages` | Send the uploaded file id in `fileIds` with `text: ""`.                                             |
+| Configuration or route                 | Voice message behavior                                                                                                                  |
+| -------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| `OPENAI_API_KEY`                       | A configured key and enabled uploads advertise `voice-messages` in `GET /app/hello`.                                                    |
+| `POST /app/files`                      | Mint with `mimeType: "audio/mp4"` or `"audio/x-m4a"` and a nonnegative integer `durationMs` for recordings. Omit it for ordinary files. |
+| `PUT /app/files/:id`                   | Upload up to 25 MiB. The host checks for an M4A brand in the ISO BMFF file type box.                                                    |
+| `GET /app/files/:id`                   | Download the recording as `audio/mp4`.                                                                                                  |
+| `POST /app/conversations/:id/messages` | Send the uploaded file id in `fileIds` with `text: ""`.                                                                                 |
 
 The send response contains an audio attachment with `kind: "audio"`, the supplied duration,
 and `transcript: {"state":"pending"}`. The conversation preview reads "Voice message".

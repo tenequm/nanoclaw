@@ -7,7 +7,7 @@ import { canonicalSigningText } from './contract.js';
 import { consumeRateLimit } from '../../modules/device-auth/rate-limit.js';
 import { onDeviceRevoked } from '../../modules/device-auth/verify.js';
 import { Socket } from 'node:net';
-import { afterEach, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { closeDb, initDb } from '../../db/connection.js';
 import { runMigrations } from '../../db/migrations/index.js';
 import { routes, dispatchApp } from './routes.js';
@@ -24,7 +24,12 @@ vi.mock('../../env.js', async (original) => {
   return { ...env, envValue: vi.fn(env.envValue) };
 });
 let databaseDirectory: string | undefined;
+beforeEach(() => {
+  vi.stubEnv('OPENAI_API_KEY', undefined);
+  resetAppConfigCache();
+});
 afterEach(async () => {
+  vi.unstubAllEnvs();
   await closeDb();
   if (databaseDirectory) rmSync(databaseDirectory, { recursive: true, force: true });
   databaseDirectory = undefined;
@@ -122,7 +127,13 @@ it('keeps recorded nonces across a reboot', async () => {
   expect(await db.all('SELECT device_id, nonce FROM device_auth_nonces')).toEqual([{ device_id: 'd', nonce: 'n' }]);
 });
 it('advertises only configured features and derives a domain-separated ticket key', () => {
+  vi.stubEnv('OPENAI_API_KEY', 'fixture-only');
   expect(configuredFeatures(readAppConfig(() => undefined))).toEqual([]);
+  for (const uploadKey of [undefined, 'invalid']) {
+    expect(
+      configuredFeatures(readAppConfig((key) => (key === 'OPENAI_API_KEY' ? 'fixture-only' : uploadKey))),
+    ).not.toContain('voice-messages');
+  }
   const env: Record<string, string> = {
     NANOCLAW_ENCRYPTION_KEY: Buffer.alloc(32, 7).toString('base64'),
     APP_LIVEKIT_URL: 'wss://example.test',
