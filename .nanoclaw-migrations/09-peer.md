@@ -4,7 +4,7 @@ Replay after section [08](08-app.md) and the HTTP mailbox in section [06](06-mai
 
 ## Copy
 
-- Copy `src/channels/peer/` in full, including its OpenAPI source, generated types and request schemas, contract tests, store, routing, lifecycle, stream, group instructions and directory projection. Copy `scripts/generate-peer-contract.mjs` and restore its package dependencies. Regenerate both artifacts from the same contract when the wire changes.
+- Copy `src/channels/peer/` in full, including its OpenAPI source, generated types and request schemas, contract tests, store, routing, lifecycle, stream, group instructions and directory projection. Copy `scripts/generate-peer-contract.mjs` and restore its package dependencies. Regenerate both artifacts from the same contract when the wire changes. For A1, use contract version `1.0.0-draft.2026-11-19-a1`.
 - Copy `src/cli/resources/peers.ts`, its dispatcher tests and [the operator guide](../docs/peer-channel.md).
 
 ## Merge into the new upstream
@@ -20,3 +20,11 @@ Replay after section [08](08-app.md) and the HTTP mailbox in section [06](06-mai
 ## Verify
 
 Run `pnpm check --base origin/main` and the peer routing, CLI and mailbox tests against the replayed source. On a disposable test stack, confirm a network-admitted hello through Caddy, directory refresh and removal in a running agent, and a reply to the originating session. Use test identities for live messages.
+
+When replaying A1, verify these cases against the assembled hub and daemon:
+
+- Retry a lost signed hello with the same process `instance`. It gets the same live epoch, including after a hub restart. The `log` id persists with the event log. Switching logs resets the daemon's cursor, outbox and delivered-id record and notifies senders with discarded outbox entries.
+- Reconnect after an endpoint's original event is behind the cursor. The hub snapshots every open endpoint without an SSE id before replay. The daemon binds its relays, processes the replay, then reconciles its directory from the full status list at `synchronized`.
+- Register two live keys on one machine with the same `sessionId`. Each has its own hub session with the agent. When a new key resumes an ended key's `sessionId` on that machine, it takes over the hub session and endpoints.
+- Interrupt routing to an agent while a message is `queued`. Retry by id and mark it `delivered` after exactly one inbox write. On a routing failure, tell the sender it was `dropped` with `route_failed` or a refusal such as `not_member`. Preserve `failureNotice` on the peer outbox row and in the host's inbound content allowlist. A failed turn woken solely by a marked notice emits no return notice.
+- Cross the hop limit twice. The first refusal tells both parties, the second only its sender, and both count against the machine rate. The message's `origin` cannot reset the pair. A session's human-turn report or an owner message to the agent resets the counter and chain together. For a pair of mesh agents, an owner message to either resets the pair. Check that the next delivery carries `hopChain: []`.

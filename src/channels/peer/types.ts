@@ -41,9 +41,17 @@ export type FromMode = 'bypass' | 'prompting';
 export type PeerStatus = 'idle' | 'busy' | 'offline';
 export type Kind = 'agent' | 'session';
 /**
- * A connection epoch (contract.md section 5).
+ * A connection epoch (contract.md section 5); it changes only when the daemon process holding it changes.
  */
 export type Epoch = number;
+/**
+ * 16 random bytes, base64url without padding, minted once per daemon process (contract.md section 5).
+ */
+export type Instance = string;
+/**
+ * The hub event log's id, minted with the log; a new log (another hub, a restored database) has a new id (contract.md section 10).
+ */
+export type LogId = string;
 /**
  * Claude Code's hop-chain tokens, carried unchanged end to end; never minted or read by amesh or the hub.
  *
@@ -87,9 +95,10 @@ export type ErrorCode =
  * queued (stored at the hub); sent (the receiving daemon's heartbeat cursor passed it, or any later report for it arrived, D39);
  * accepted (written to the inbox, no negative receipt within acceptWindowMs; final);
  * held (Claude Code holds it for approval); delivered, denied, expired (final, from a
- * hold); refused (the session refuses peers; final); dropped (with a reason; final);
- * unknown (open when the daemon restarted; final, never told, D25). Open set: an unknown
- * state is logged and treated as not final.
+ * hold; for an agent target, written into the agent's hub session); refused (the session
+ * refuses peers; final); dropped (with a reason; final); unknown (written into the inbox and
+ * still open when the daemon restarted; final, never told, D25). Open set: an unknown state
+ * is logged and treated as not final.
  */
 export type DeliveryState =
   | 'queued'
@@ -107,7 +116,10 @@ export type DeliveryState =
  * duplicate, hop-loop, hop-runaway: never retried); oversized (over the native line
  * limit, refused before writing); session_gone (the inbox no longer accepts);
  * unknown_session (the daemon does not host that key, L18); queue_expired (past
- * queueTtlMs, D19); ended (the target ended with it queued). Open set.
+ * queueTtlMs, D19); ended (the target ended with it queued); interrupted (the daemon
+ * restarted between recording the id and finishing the inbox write, so it may or may not
+ * have arrived; A1); route_failed (the hub could not write it into the agent's hub
+ * session; A1). Open set.
  */
 export type DropReason =
   | 'rate-limited'
@@ -119,12 +131,14 @@ export type DropReason =
   | 'session_gone'
   | 'unknown_session'
   | 'queue_expired'
-  | 'ended';
+  | 'ended'
+  | 'interrupted'
+  | 'route_failed';
 export type Report = StateReport | IdleReport;
 /**
  * Every event kind, discriminated by `kind`, which equals the SSE `event` field. Open
- * set: an event of an unknown kind is logged and ignored, and still advances the cursor
- * when it has an SSE id.
+ * set: an event of an unknown kind is logged and ignored; with an SSE id it counts as
+ * handled on receipt for the low-water mark.
  */
 export type PeerEvent =
   | EndpointEvent
@@ -139,8 +153,8 @@ export type PeerEvent =
 /**
  * One SSE event of `GET /peer/events`. `data` is one line of JSON, a `PeerEvent` whose
  * `kind` equals `event`. Log events (endpoint, message, delivery, limit, idle) carry `id`
- * equal to their `seq` and move the cursor; status, synchronized, revoked and superseded
- * carry no `id`.
+ * equal to their `seq` and are eligible for the low-water mark once handled; status,
+ * synchronized, revoked, superseded and the endpoint snapshot at connect carry no `id`.
  */
 export type EventStreamItem = {
   event: string;
@@ -153,7 +167,7 @@ export type EventStreamItem1 =
       event: 'endpoint' | 'message' | 'delivery' | 'limit' | 'idle';
     }
   | {
-      event: 'status' | 'synchronized' | 'revoked' | 'superseded';
+      event: 'endpoint' | 'status' | 'synchronized' | 'revoked' | 'superseded';
       id?: never;
     };
 /**
@@ -215,6 +229,8 @@ export interface PeerSchemas {
   PeerStatus: PeerStatus;
   Kind: Kind;
   Epoch: Epoch;
+  Instance: Instance;
+  LogId: LogId;
   Hop: Hop;
   HopChain: HopChain;
   ErrorCode: ErrorCode;
@@ -280,6 +296,7 @@ export interface PeerSchemas {
   MachineIdVector: MachineIdVector;
   SessionKeyVector: SessionKeyVector;
   RelaySocketVector: RelaySocketVector;
+  NoticeIdVector: NoticeIdVector;
   LaneSocketVector: LaneSocketVector;
   SignatureVector: SignatureVector;
   EnvelopeInput: EnvelopeInput;
@@ -287,7 +304,7 @@ export interface PeerSchemas {
 }
 export interface Hop {
   /**
-   * Messages in this conversation since a human last took part, this one included.
+   * Messages delivered in this conversation since a human last took part, this one included when it is delivered; in a refusal or a limit event, the count reached, without the stopped message.
    */
   count: number;
   limit: number;
@@ -323,7 +340,11 @@ export interface HelloInfo {
 }
 export interface HelloRequest {
   /**
-   * The epoch this process held before; null at process start.
+   * 16 random bytes, base64url without padding, minted once per daemon process (contract.md section 5).
+   */
+  instance: string;
+  /**
+   * The epoch this process already holds; null at process start. Logged by the hub, which decides by `instance`.
    */
   resumeEpoch: Epoch | null;
   /**
@@ -375,7 +396,7 @@ export interface Settings {
    */
   backoffResetAfterMs: number;
   /**
-   * Silence after an inbox write that means accepted (D25).
+   * Silence after an inbox write that means accepted (D25); above the 5 s after which Claude Code sends coalesced drop receipts (A1).
    */
   acceptWindowMs: number;
   requestTimeoutMs: number;
@@ -389,7 +410,7 @@ export interface Settings {
  */
 export interface Limits {
   /**
-   * R10 (spec, proposed).
+   * R10 (D42).
    */
   maxTextBytes: number;
   /**
@@ -405,7 +426,7 @@ export interface Limits {
    */
   offlineQueueMax: number;
   /**
-   * R21 (spec, proposed); messages only.
+   * R21 (D42); messages only, refused sends included.
    */
   machineRate: {
     limit: number;
@@ -431,6 +452,10 @@ export interface HelloResponse {
     name: string;
   };
   epoch: Epoch;
+  /**
+   * The hub event log's id, minted with the log; a new log (another hub, a restored database) has a new id (contract.md section 10).
+   */
+  log: string;
   features: string[];
   settings: Settings;
   limits: Limits;
@@ -588,13 +613,16 @@ export interface SendRequest {
    */
   text: string;
   hopChain: HopChain;
-  fromMode: FromMode;
   /**
-   * human resets the conversation's hop counter before counting (contract.md section 9).
+   * The sender's real class (R13): from the envelope for a native reply, else from the session's latest hook input; null asserts none.
+   */
+  fromMode: FromMode | null;
+  /**
+   * Recorded in the log only; it never resets the hop counter (contract.md section 9, A1).
    */
   origin: 'human' | 'peer' | 'unknown';
   /**
-   * Tell the sender when the target finishes the turn this message starts.
+   * Tell the sender when the target finishes the turn this message starts. Always false in v1: send_message has no notify_when_idle (A1).
    */
   notifyWhenIdle: boolean;
   /**
@@ -692,7 +720,10 @@ export interface ReportsResponse {
    */
   results: {
     id: Uuid;
-    state: DeliveryState;
+    /**
+     * The message's state after the report; null for an id the hub does not know.
+     */
+    state: DeliveryState | null;
     /**
      * False when the message was already final or the id is unknown.
      */
@@ -700,7 +731,7 @@ export interface ReportsResponse {
   }[];
 }
 /**
- * An endpoint this machine's sessions see messages from; announced before the first message that uses it.
+ * An endpoint this machine's sessions see messages from; announced as a log event before the first message that uses it, and again without an SSE id at every connect while it is open (the snapshot, contract.md section 10).
  */
 export interface EndpointEvent {
   kind: 'endpoint';
@@ -832,7 +863,7 @@ export interface StatusEvent {
   listed: boolean;
 }
 /**
- * The replay is complete up to the log head seq; moves the cursor through its seq field.
+ * The replay is complete up to the log head seq. Counts as a handled event at its seq, so the low-water mark reaches that seq once every event below it is handled (D39).
  */
 export interface SynchronizedEvent {
   kind: 'synchronized';
@@ -860,7 +891,9 @@ export interface SupersededEvent {
 /**
  * A message into a session's inbox socket, one NDJSON line per connection: a delivery
  * (from a message event), a daemon notice, a lane frame, or a native reply read on a relay
- * socket. `content` is the canonical envelope (contract.md section 15).
+ * socket. `content` is the canonical envelope (contract.md section 15). Only a notice with
+ * no conversation relay (a start the hub refused after the tool answered) has no `from`,
+ * in the frame and in the envelope.
  */
 export interface NativeUserFrame {
   type: 'user';
@@ -870,9 +903,9 @@ export interface NativeUserFrame {
   };
   priority: 'next';
   /**
-   * Equal to the envelope's from.
+   * Equal to the envelope's from; absent only when the envelope has none.
    */
-  from: string;
+  from?: string;
   msgV: 1;
   /**
    * A message or frame id, RFC 4122 text form, lower case (it becomes the native msg_id).
@@ -894,7 +927,10 @@ export interface NativeNotifyWhenIdle {
    */
   msg_id: string;
   msgV: 1;
-  from_mode: FromMode;
+  /**
+   * The sending session's real permission class (R13).
+   */
+  from_mode?: 'bypass' | 'prompting';
 }
 /**
  * A receipt for a frame the daemon wrote, correlated by orig_msg_id; read on the relay socket that posted.
@@ -1046,6 +1082,10 @@ export interface DaemonStatus {
   open: {
     count: number;
   };
+  /**
+   * Plain warnings, such as a registered session on a Claude Code version the end-to-end test has not passed on (R24).
+   */
+  warnings?: string[];
 }
 export interface McpListPeersArguments {
   /**
@@ -1062,10 +1102,6 @@ export interface McpSendMessageArguments {
    * Plain text, at most 32 KiB.
    */
   message: string;
-  /**
-   * Also tell me when the peer finishes the turn this message starts.
-   */
-  notify_when_idle?: boolean;
 }
 export interface McpSendToParentArguments {
   /**
@@ -1149,6 +1185,23 @@ export interface RelaySocketVector {
   endpointId: EndpointId;
   path: string;
   address: NativeAddress;
+}
+/**
+ * A notice's msg_id, derived from what caused it, so a replayed event writes no second notice (contract.md section 15).
+ */
+export interface NoticeIdVector {
+  rule: string;
+  namespace: Uuid;
+  machineId: MachineId;
+  /**
+   * The event seq in decimal, or the message id for an outbox notice.
+   */
+  source: string;
+  /**
+   * The event kind (delivery, limit, idle), or outbox.
+   */
+  kind: string;
+  msgId: Uuid;
 }
 export interface LaneSocketVector {
   rule: string;

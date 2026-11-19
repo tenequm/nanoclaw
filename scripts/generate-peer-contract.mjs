@@ -21,7 +21,7 @@ const types = await compile(
     additionalProperties: false,
     maxItems: -1,
     bannerComment: '',
-    style: { singleQuote: true, printWidth: 120 },
+    style: { singleQuote: true, printWidth: 120, trailingComma: 'all' },
   },
 );
 await writeFile(new URL('types.ts', dir), types);

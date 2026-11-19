@@ -30,9 +30,13 @@ Call `list_peers({})` to read the live directory. Each row has an address, kind,
 
 Pass those arguments to `send_message`. A bare agent name uses agent-to-agent delivery. An agent can use `review@sample` when exactly one machine has that session. An ambiguous short address returns the qualified candidates. Registered mesh addresses take precedence over local destination aliases.
 
-The host records the originating agent session for replies. A remote session starting a conversation gets a separate hub session with the recipient agent. Peer messages carry text. Files travel as descriptions, edits as follow-ups, and cards and questions have text fallbacks. A peer answers a question with an ordinary message.
+The host records the originating agent session for replies. When a remote session contacts an agent, the hub pairs the agent with the machine's session key. Two live processes with the same `sessionId` get separate hub sessions. If the old key has ended, a new key on that machine with the same `sessionId` inherits the hub session and its endpoints.
 
-The directory is a host-written table in each active session's inbound mailbox. Membership changes refresh it and removal clears it. The runner reads it directly over SQLite or through the next HTTP mailbox snapshot. An offline session can queue up to 100 messages for 24 hours. An ended session leaves the directory. The default hop limit is 20 between human turns. Message bodies are limited to 32,768 UTF-8 bytes.
+Peer messages carry text. Files travel as descriptions, edits as follow-ups, and cards and questions have text fallbacks. A peer answers a question with an ordinary message. The hub preserves the runner's `failureNotice` flag in both directions. If a failure notice alone wakes an agent and that turn also fails, the runner sends no further notice.
+
+The directory is a host-written table in each active session's inbound mailbox. Membership changes refresh it and removal clears it. The runner reads it directly over SQLite or through the next HTTP mailbox snapshot. An offline session can queue up to 100 messages for 24 hours. An ended session leaves the directory. Message bodies are limited to 32,768 UTF-8 bytes.
+
+The default hop limit permits 20 accepted messages per pair, counting both directions. The first refusal tells both parties. Further refusals tell only the sender until a reset. Refused sends still count toward the machine rate limit. A session's human-turn report resets all its conversations. An owner message to an agent resets that hub session's conversations, including a mesh agent pair when the owner writes to either agent. A reset clears the counter and stored chain, so the next delivery carries `hopChain: []`. The message's `origin` is for logging only.
 
 ## Operate the hub
 
@@ -44,6 +48,12 @@ ncl peers list
 
 Use the id returned by enrollment or listed by `peers list`. Revocation ends the machine's sessions, closes its stream and refuses later signed requests. The listing retains its revocation time.
 
-Forward the `/peer` prefix to the voice webhook service and preserve the voice route's network policy, including `VOICE_MODE_TRUSTED_PROXY_CIDRS` and `VOICE_MODE_ALLOWED_CLIENT_CIDRS`. The network-gated `GET /peer/hello` advertises protocol compatibility. Signed hello establishes a connection epoch. The daemon uses its epoch for registration, heartbeats and delivery reports and resumes the event stream from its cursor. The central database holds conversations, endpoints, message states and replayable events. [Wire contract](../src/channels/peer/openapi.yaml)
+Forward the `/peer` prefix to the voice webhook service and preserve the voice route's network policy, including `VOICE_MODE_TRUSTED_PROXY_CIDRS` and `VOICE_MODE_ALLOWED_CLIENT_CIDRS`. The network-gated `GET /peer/hello` advertises protocol compatibility. The central database holds conversations, endpoints, message states and replayable events. [Wire contract](../src/channels/peer/openapi.yaml)
+
+The daemon mints one random 16-byte `instance` per process. Signed `POST /peer/hello` returns the epoch and the hub event log's id (`log`). A retry or reconnect by the same instance keeps its live epoch, including across a hub restart. A new process requests takeover on its first hello. If superseded, the old process retries hello once and halts on `machine_in_use`. When the log id changes, the daemon starts with an empty cursor, outbox and delivered-id record and tells sending sessions about discarded outbox entries.
+
+On each stream connection, the hub first sends one `endpoint` snapshot per open endpoint on that machine. These snapshots have no SSE id. The daemon rebinds the relay sockets before delivering replayed messages. Replay is followed by the full directory status list, then `synchronized`, then live events. At `synchronized`, the daemon removes cached entries missing from the list.
+
+A message to an agent stays `queued` until the hub writes it to the agent's hub session, when it becomes `delivered`. After a restart the hub retries by message id, preventing duplicate inbox writes. If routing fails, the sender receives `dropped` with `route_failed` or a refusal code such as `not_member` if the agent left the mesh while the message was queued.
 
 For a disposable checkout, start `just local up --profile fast --chain`, request `/peer/hello` through the Caddy port with the local CA, and finish with `just local down`. A protocol-1 hello from an assembled host verifies the route without enrolling a machine or sending a message. [Local stack setup](local-stack.md)

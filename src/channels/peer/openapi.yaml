@@ -5,7 +5,7 @@
 openapi: "3.2.0"
 info:
   title: amesh peer messaging hub
-  version: 1.0.0-draft.2026-11-19
+  version: 1.0.0-draft.2026-11-19-a1
   summary: nanoclaw's /peer API for amesh daemons, the amesh daemon's local socket, and the Claude Code frames they mirror.
   description: |-
     The wire contract of the peer messaging hub (spec.md D28, "contract first"), peer protocol 1.
@@ -39,7 +39,7 @@ info:
     schemas list protocol 1's fields and are not closed, except the MCP tool arguments.
 
     Marking: *proposed* marks a choice this contract makes beyond spec.md.
-  x-amesh-status: accepted by the owner with spec.md and plan.md, 2026-11-19 (D30)
+  x-amesh-status: accepted by the owner with spec.md and plan.md, 2026-11-19 (D30); amended by A1 (the contract review, D44), 2026-11-19
 servers:
   - name: hub
     url: https://nanoclaw.opx.one
@@ -80,9 +80,12 @@ paths:
       operationId: postHello
       summary: Open a connection epoch
       description: |-
-        Sent at daemon start and before every stream (re)connect. Answers a new epoch per the
-        takeover rules (contract.md section 5) and the settings the daemon then validates
-        against the `Settings` bounds.
+        Sent at daemon start and before every stream (re)connect. Idempotent for the daemon
+        process holding the live epoch (same `instance`: the same epoch back); a new process gets
+        a new epoch per the takeover rules (contract.md section 5). Answers the hub's event-log id
+        (`log`) and the settings the daemon then validates against the `Settings` bounds. An
+        error without an `ErrorBody` (a proxy 502, a hub build without `/peer`, the gate's 403)
+        means back off and retry, never a halt.
       requestBody:
         required: true
         content:
@@ -114,9 +117,10 @@ paths:
       operationId: getEvents
       summary: The machine's event stream
       description: |-
-        One stream per machine, signed once at connect. Replays the log after `after`, then one
-        `status` event per directory entry, then `synchronized`, then live events (contract.md
-        section 10). `: ping` comments every `keepaliveMs`. Lines end in LF.
+        One stream per machine, signed once at connect. Sends one `endpoint` event without an SSE
+        id per open endpoint of the machine, then replays the log after `after`, then one
+        `status` event per directory entry (the whole directory), then `synchronized`, then live
+        events (contract.md section 10). `: ping` comments every `keepaliveMs`. Lines end in LF.
       parameters:
         - name: after
           in: query
@@ -298,7 +302,7 @@ paths:
       tags: [hub]
       operationId: postSessionEnd
       summary: End a session
-      description: Sent only after the session's outbox is empty (per-session order, L17). Messages still queued for it are dropped with `ended`.
+      description: Sent only after the session's outbox is empty (per-session order, L17); until then the session stays in the heartbeat list. Messages still queued for it are dropped with `ended`. A `404 unknown_session` answer means the session is already ended, so the end is done.
       requestBody:
         required: true
         content:
@@ -333,8 +337,9 @@ paths:
       description: |-
         One route for a start from `send_message` (`to.address`, D3) and a native reply from a
         relay socket (`to.endpoint`, D18). Idempotent on `(machine, id)`: the same id with the
-        same body hash answers the stored state again; a different body is `409 id_conflict`
-        (contract.md section 8).
+        same `from.session`, `to` and `text` answers the stored state again, whatever the
+        `epoch` and the other fields; a different `from.session`, `to` or `text` is
+        `409 id_conflict` (contract.md section 8). The body bytes are never compared.
       requestBody:
         required: true
         content:
@@ -368,7 +373,7 @@ paths:
       tags: [hub]
       operationId: postReports
       summary: Delivery state and idle reports from the receiving daemon
-      description: Batched, at most 100 per request (*proposed*). First final state wins; an unknown id answers `applied false` with state `unknown`, never an error for the batch.
+      description: Batched, at most 100 per request (*proposed*). First final state wins; an unknown id answers `applied false` with state `null`, never an error for the batch.
       requestBody:
         required: true
         content:
@@ -492,10 +497,17 @@ paths:
 
         - `UserPromptSubmit` (async hook): a prompt starting with any `NotHumanPromptPrefixes`
           entry, or from a session that is not a mesh member, is `204`; anything else is `202`,
-          and the daemon then confirms it against the transcript and posts
+          and the daemon then must confirm it against the transcript (`origin.kind == "human"`
+          on that prompt's row; no row by the session's end means no report) before it posts
           `POST /peer/sessions/{key}/human`.
         - `PreToolUse` on `mcp__amesh__.*` (D33, D34): with `agent_id` (a
           subagent) the answer is `200` with the deny; without it `204`.
+        - `PreToolUse` on native `SendMessage` (trial in M1): with `agent_id` and a
+          `tool_input.to` that is one of the daemon's relay addresses, `200` with the deny;
+          otherwise `204`.
+
+        Every hook input's `permission_mode` is kept per session as its real class (R13):
+        `bypassPermissions` is `bypass`, anything else `prompting`.
       security: []
       requestBody:
         required: true
@@ -505,6 +517,7 @@ paths:
             examples:
               hookPromptHuman: {$ref: '#/components/examples/hookPromptHuman'}
               hookGuardSubagent: {$ref: '#/components/examples/hookGuardSubagent'}
+              hookGuardSubagentSendMessage: {$ref: '#/components/examples/hookGuardSubagentSendMessage'}
       responses:
         '200':
           description: Hook output for Claude Code, printed as is.
@@ -640,7 +653,7 @@ components:
             errNotMember: {$ref: '#/components/examples/errNotMember'}
             errNotAParty: {$ref: '#/components/examples/errNotAParty'}
     SessionNotFound:
-      description: The session key is not registered; the daemon registers it again and retries once.
+      description: The session key is not registered; the daemon registers it again and retries once, except on `POST /peer/sessions/{key}/end`, where it means done.
       content:
         application/json:
           schema: {$ref: '#/components/schemas/ErrorBody'}
@@ -657,7 +670,7 @@ components:
             errUnknownSession: {$ref: '#/components/examples/errUnknownSession'}
             errUnknownEndpoint: {$ref: '#/components/examples/errUnknownEndpoint'}
     Superseded:
-      description: The request carried an older epoch; another daemon owns the machine. The daemon halts.
+      description: The request carried an older epoch. The daemon sends one fresh `hello`; it halts only if that answers `409 machine_in_use` (another daemon owns the machine).
       content:
         application/json:
           schema: {$ref: '#/components/schemas/ErrorBody'}
@@ -777,14 +790,22 @@ components:
       type: string
       enum: [agent, session]
     Epoch:
-      description: A connection epoch (contract.md section 5).
+      description: A connection epoch (contract.md section 5); it changes only when the daemon process holding it changes.
       type: integer
       minimum: 1
+    Instance:
+      description: 16 random bytes, base64url without padding, minted once per daemon process (contract.md section 5).
+      type: string
+      pattern: '^[A-Za-z0-9_-]{22}$'
+    LogId:
+      description: The hub event log's id, minted with the log; a new log (another hub, a restored database) has a new id (contract.md section 10).
+      type: string
+      pattern: '^lg_[A-Za-z0-9_-]{8,64}$'
     Hop:
       type: object
       required: [count, limit]
       properties:
-        count: {type: integer, minimum: 0, description: 'Messages in this conversation since a human last took part, this one included.'}
+        count: {type: integer, minimum: 0, description: 'Messages delivered in this conversation since a human last took part, this one included when it is delivered; in a refusal or a limit event, the count reached, without the stopped message.'}
         limit: {type: integer, minimum: 1}
     HopChain:
       description: Claude Code's hop-chain tokens, carried unchanged end to end; never minted or read by amesh or the hub.
@@ -858,10 +879,11 @@ components:
         serverTime: {$ref: '#/components/schemas/Ms'}
     HelloRequest:
       type: object
-      required: [resumeEpoch, takeover, amesh, claudeCode, capabilities]
+      required: [instance, resumeEpoch, takeover, amesh, claudeCode, capabilities]
       properties:
+        instance: {$ref: '#/components/schemas/Instance', description: 'This daemon process; the hub tells a reconnect from a second daemon by it.'}
         resumeEpoch:
-          description: The epoch this process held before; null at process start.
+          description: The epoch this process already holds; null at process start. Logged by the hub, which decides by `instance`.
           oneOf:
             - {$ref: '#/components/schemas/Epoch'}
             - {type: 'null'}
@@ -900,7 +922,7 @@ components:
         backoffInitialMs: {type: integer, default: 500, minimum: 100, maximum: 5000}
         backoffMaxMs: {type: integer, default: 10000, minimum: 1000, maximum: 60000}
         backoffResetAfterMs: {type: integer, default: 5000, minimum: 1000, maximum: 60000, description: 'Connected time that resets the backoff.'}
-        acceptWindowMs: {type: integer, default: 5000, minimum: 1000, maximum: 30000, description: 'Silence after an inbox write that means accepted (D25).'}
+        acceptWindowMs: {type: integer, default: 8000, minimum: 1000, maximum: 30000, description: 'Silence after an inbox write that means accepted (D25); above the 5 s after which Claude Code sends coalesced drop receipts (A1).'}
         requestTimeoutMs: {type: integer, default: 10000, minimum: 2000, maximum: 60000}
         sendWaitMs: {type: integer, default: 5000, minimum: 0, maximum: 15000, description: 'How long send_message waits for the hub''s answer.'}
     Limits:
@@ -908,12 +930,12 @@ components:
       type: object
       required: [maxTextBytes, hopLimit, queueTtlMs, offlineQueueMax, machineRate, keepaliveMs, offlineAfterMs]
       properties:
-        maxTextBytes: {type: integer, default: 32768, description: 'R10 (spec, proposed).'}
+        maxTextBytes: {type: integer, default: 32768, description: 'R10 (D42).'}
         hopLimit: {type: integer, default: 20, description: 'D20.'}
         queueTtlMs: {type: integer, default: 86400000, description: 'D19.'}
         offlineQueueMax: {type: integer, default: 100, description: 'Per target session (*proposed*).'}
         machineRate:
-          description: R21 (spec, proposed); messages only.
+          description: R21 (D42); messages only, refused sends included.
           type: object
           required: [limit, windowMs]
           properties:
@@ -923,7 +945,7 @@ components:
         offlineAfterMs: {type: integer, default: 60000, description: 'L10.'}
     HelloResponse:
       type: object
-      required: [protocol, minProtocol, machine, epoch, features, settings, limits, serverTime]
+      required: [protocol, minProtocol, machine, epoch, log, features, settings, limits, serverTime]
       properties:
         protocol: {type: integer}
         minProtocol: {type: integer}
@@ -934,6 +956,7 @@ components:
             id: {$ref: '#/components/schemas/MachineId'}
             name: {$ref: '#/components/schemas/MachineName', description: 'The name set at enrollment is authoritative.'}
         epoch: {$ref: '#/components/schemas/Epoch'}
+        log: {$ref: '#/components/schemas/LogId', description: 'The daemon keys its cursor, outbox and delivered-id record on it and starts them from 0 when it changes.'}
         features:
           type: array
           items: {type: string}
@@ -1087,12 +1110,16 @@ components:
           type: string
           minLength: 1
         hopChain: {$ref: '#/components/schemas/HopChain'}
-        fromMode: {$ref: '#/components/schemas/FromMode'}
+        fromMode:
+          description: "The sender's real class (R13): from the envelope for a native reply, else from the session's latest hook input; null asserts none."
+          oneOf:
+            - {$ref: '#/components/schemas/FromMode'}
+            - {type: 'null'}
         origin:
-          description: 'human resets the conversation''s hop counter before counting (contract.md section 9).'
+          description: 'Recorded in the log only; it never resets the hop counter (contract.md section 9, A1).'
           type: string
           enum: [human, peer, unknown]
-        notifyWhenIdle: {type: boolean, description: 'Tell the sender when the target finishes the turn this message starts.'}
+        notifyWhenIdle: {type: boolean, description: 'Tell the sender when the target finishes the turn this message starts. Always false in v1: send_message has no notify_when_idle (A1).'}
         failureNotice: {type: boolean, description: 'Carried both ways so error chains stop after one (r-nanoclaw).'}
     EndpointRef:
       type: object
@@ -1127,9 +1154,10 @@ components:
         queued (stored at the hub); sent (the receiving daemon's heartbeat cursor passed it, or any later report for it arrived, D39);
         accepted (written to the inbox, no negative receipt within acceptWindowMs; final);
         held (Claude Code holds it for approval); delivered, denied, expired (final, from a
-        hold); refused (the session refuses peers; final); dropped (with a reason; final);
-        unknown (open when the daemon restarted; final, never told, D25). Open set: an unknown
-        state is logged and treated as not final.
+        hold; for an agent target, written into the agent's hub session); refused (the session
+        refuses peers; final); dropped (with a reason; final); unknown (written into the inbox and
+        still open when the daemon restarted; final, never told, D25). Open set: an unknown state
+        is logged and treated as not final.
       type: string
       enum: [queued, sent, accepted, held, delivered, denied, expired, refused, dropped, unknown]
     DropReason:
@@ -1138,9 +1166,12 @@ components:
         duplicate, hop-loop, hop-runaway: never retried); oversized (over the native line
         limit, refused before writing); session_gone (the inbox no longer accepts);
         unknown_session (the daemon does not host that key, L18); queue_expired (past
-        queueTtlMs, D19); ended (the target ended with it queued). Open set.
+        queueTtlMs, D19); ended (the target ended with it queued); interrupted (the daemon
+        restarted between recording the id and finishing the inbox write, so it may or may not
+        have arrived; A1); route_failed (the hub could not write it into the agent's hub
+        session; A1). Open set.
       type: string
-      enum: [rate-limited, queue-full, duplicate, hop-loop, hop-runaway, oversized, session_gone, unknown_session, queue_expired, ended]
+      enum: [rate-limited, queue-full, duplicate, hop-loop, hop-runaway, oversized, session_gone, unknown_session, queue_expired, ended, interrupted, route_failed]
     StateReport:
       type: object
       required: [kind, id, session, state, reason, at]
@@ -1196,12 +1227,16 @@ components:
             required: [id, state, applied]
             properties:
               id: {$ref: '#/components/schemas/Uuid'}
-              state: {$ref: '#/components/schemas/DeliveryState'}
+              state:
+                description: The message's state after the report; null for an id the hub does not know.
+                oneOf:
+                  - {$ref: '#/components/schemas/DeliveryState'}
+                  - {type: 'null'}
               applied: {type: boolean, description: 'False when the message was already final or the id is unknown.'}
 
     # ---------------------------------------------------------------- events
     EndpointEvent:
-      description: An endpoint this machine's sessions see messages from; announced before the first message that uses it.
+      description: An endpoint this machine's sessions see messages from; announced as a log event before the first message that uses it, and again without an SSE id at every connect while it is open (the snapshot, contract.md section 10).
       type: object
       required: [kind, seq, id, name, peer, context, sessions, state, createdAt, closedAt]
       properties:
@@ -1305,7 +1340,7 @@ components:
         peer: {$ref: '#/components/schemas/Peer'}
         listed: {type: boolean}
     SynchronizedEvent:
-      description: The replay is complete up to the log head seq; moves the cursor through its seq field.
+      description: The replay is complete up to the log head seq. Counts as a handled event at its seq, so the low-water mark reaches that seq once every event below it is handled (D39).
       type: object
       required: [kind, seq]
       properties:
@@ -1333,8 +1368,8 @@ components:
     PeerEvent:
       description: |-
         Every event kind, discriminated by `kind`, which equals the SSE `event` field. Open
-        set: an event of an unknown kind is logged and ignored, and still advances the cursor
-        when it has an SSE id.
+        set: an event of an unknown kind is logged and ignored; with an SSE id it counts as
+        handled on receipt for the low-water mark.
       oneOf:
         - {$ref: '#/components/schemas/EndpointEvent'}
         - {$ref: '#/components/schemas/MessageEvent'}
@@ -1361,8 +1396,8 @@ components:
       description: |-
         One SSE event of `GET /peer/events`. `data` is one line of JSON, a `PeerEvent` whose
         `kind` equals `event`. Log events (endpoint, message, delivery, limit, idle) carry `id`
-        equal to their `seq` and move the cursor; status, synchronized, revoked and superseded
-        carry no `id`.
+        equal to their `seq` and are eligible for the low-water mark once handled; status,
+        synchronized, revoked, superseded and the endpoint snapshot at connect carry no `id`.
       type: object
       required: [event, data]
       properties:
@@ -1379,7 +1414,7 @@ components:
             event: {enum: [endpoint, message, delivery, limit, idle]}
         - required: [event]
           properties:
-            event: {enum: [status, synchronized, revoked, superseded]}
+            event: {enum: [endpoint, status, synchronized, revoked, superseded]}
             id: false
 
     # ---------------------------------------------------------------- native frames (Claude Code)
@@ -1387,11 +1422,13 @@ components:
       description: |-
         A message into a session's inbox socket, one NDJSON line per connection: a delivery
         (from a message event), a daemon notice, a lane frame, or a native reply read on a relay
-        socket. `content` is the canonical envelope (contract.md section 15).
+        socket. `content` is the canonical envelope (contract.md section 15). Only a notice with
+        no conversation relay (a start the hub refused after the tool answered) has no `from`,
+        in the frame and in the envelope.
       x-amesh-native: true
       externalDocs: {description: 's-native.md: exact frame and envelope formats', url: './s-native.md#exact-frame-and-envelope-formats-that-worked'}
       type: object
-      required: [type, message, priority, from, msgV, msg_id]
+      required: [type, message, priority, msgV, msg_id]
       properties:
         type: {type: string, const: user}
         message:
@@ -1403,7 +1440,7 @@ components:
               type: string
               pattern: '^<cross-session-message( [^>]*)?>\n[\s\S]*\n</cross-session-message>$'
         priority: {type: string, const: next}
-        from: {$ref: '#/components/schemas/NativeAddress', description: 'Equal to the envelope''s from.'}
+        from: {$ref: '#/components/schemas/NativeAddress', description: 'Equal to the envelope''s from; absent only when the envelope has none.'}
         msgV: {type: integer, const: 1}
         msg_id: {$ref: '#/components/schemas/Uuid', description: 'The hub message id (D25) or the replier''s own id.'}
     NativeAddress:
@@ -1417,14 +1454,14 @@ components:
       x-amesh-native: true
       externalDocs: {description: 's-native.md: what a Go daemon must implement', url: './s-native.md#what-a-go-daemon-must-implement'}
       type: object
-      required: [type, action, from, msg_id, msgV, from_mode]
+      required: [type, action, from, msg_id, msgV]
       properties:
         type: {type: string, const: control}
         action: {type: string, const: notify_when_idle}
         from: {$ref: '#/components/schemas/NativeAddress', description: 'The relay address the answer comes back to.'}
         msg_id: {$ref: '#/components/schemas/Uuid', description: 'The subscription id, echoed as orig_msg_id.'}
         msgV: {type: integer, const: 1}
-        from_mode: {$ref: '#/components/schemas/FromMode'}
+        from_mode: {$ref: '#/components/schemas/FromMode', description: 'bypass for a bypass receiver; absent for a prompting receiver or one of unknown class (contract.md section 15).'}
     NativeReceipt:
       description: A receipt for a frame the daemon wrote, correlated by orig_msg_id; read on the relay socket that posted.
       x-amesh-native: true
@@ -1621,6 +1658,10 @@ components:
           required: [count]
           properties:
             count: {type: integer, minimum: 0}
+        warnings:
+          description: Plain warnings, such as a registered session on a Claude Code version the end-to-end test has not passed on (R24).
+          type: array
+          items: {type: string}
     LaneId:
       description: '"ln_" + first 16 hex of SHA-256("amesh-ln-id" LF parent argument LF child sessionId) (*proposed*, contract.md section 18); also the lane frames'' from-session.'
       type: string
@@ -1640,7 +1681,6 @@ components:
       properties:
         to: {type: string, description: 'Peer address from list_peers, for example "stan" or "review@pond:bl".', minLength: 1, maxLength: 100}
         message: {type: string, description: 'Plain text, at most 32 KiB.', minLength: 1}
-        notify_when_idle: {type: boolean, description: 'Also tell me when the peer finishes the turn this message starts.', default: false}
       required: [to, message]
       additionalProperties: false
     McpSendToParentArguments:
@@ -1765,6 +1805,17 @@ components:
         endpointId: {$ref: '#/components/schemas/EndpointId'}
         path: {type: string, pattern: '^/tmp/cc-socks/a[0-9a-f]{15}\.sock$'}
         address: {$ref: '#/components/schemas/NativeAddress'}
+    NoticeIdVector:
+      description: A notice's msg_id, derived from what caused it, so a replayed event writes no second notice (contract.md section 15).
+      type: object
+      required: [rule, namespace, machineId, source, kind, msgId]
+      properties:
+        rule: {type: string}
+        namespace: {$ref: '#/components/schemas/Uuid'}
+        machineId: {$ref: '#/components/schemas/MachineId'}
+        source: {type: string, description: 'The event seq in decimal, or the message id for an outbox notice.'}
+        kind: {type: string, description: 'The event kind (delivery, limit, idle), or outbox.'}
+        msgId: {$ref: '#/components/schemas/Uuid'}
     LaneSocketVector:
       type: object
       required: [rule, parentArgument, childSessionId, machineId, laneId, path]
@@ -1840,10 +1891,28 @@ components:
       summary: 'Session key from pid and procStart'
       x-amesh-schema: SessionKeyVector
       dataValue:
-        rule: <pid> + "-" + first 8 hex of SHA-256(procStart string as in the registry)
+        rule: '<pid> + "-" + first 8 hex of SHA-256(procStart string as in the registry); on macOS what LC_ALL=C TZ=UTC ps -o lstart= prints: UTC, English names, the day space-padded to two columns (Go time.ANSIC)'
         pid: 15355
         procStart: Thu Nov 19 10:52:33 2026
         sessionKey: 15355-4f6c8c61
+    derivationSessionKeySingleDigitDay:
+      summary: 'Session key, procStart on a day below 10 (space-padded)'
+      x-amesh-schema: SessionKeyVector
+      dataValue:
+        rule: As sessionKey; a day below 10 is padded with a space, never a zero and never dropped
+        pid: 4821
+        procStart: Thu Nov  5 09:04:11 2026
+        sessionKey: 4821-f2151faf
+    derivationNoticeId:
+      summary: 'A notice msg_id derived from its event'
+      x-amesh-schema: NoticeIdVector
+      dataValue:
+        rule: UUID version 5 (SHA-1) in the RFC 4122 URL namespace over "amesh-notice" LF machineId LF source LF kind; source is the event seq in decimal, or the message id for an outbox notice
+        namespace: 6ba7b811-9dad-11d1-80b4-00c04fd430c8
+        machineId: pm_PCly-PiMxyo5IXRSo4i70g
+        source: "122"
+        kind: limit
+        msgId: 526f9867-4242-53ad-bab5-352609886b66
     derivationRelaySocket:
       summary: 'Relay socket name for an endpoint'
       x-amesh-schema: RelaySocketVector
@@ -1871,11 +1940,11 @@ components:
         protocol: 1
         method: POST
         target: /peer/hello
-        body: '{"resumeEpoch":6,"takeover":false,"amesh":{"version":"0.1.0","os":"darwin","arch":"arm64"},"claudeCode":{"versions":["2.1.328"],"peerProtocol":1,"nativeCheck":"ok"},"capabilities":["receipts","idle","human-turn"]}'
+        body: '{"instance":"Rk3v9QpX2mLs8TzW1nYc4A","resumeEpoch":null,"takeover":true,"amesh":{"version":"0.1.0","os":"darwin","arch":"arm64"},"claudeCode":{"versions":["2.1.328"],"peerProtocol":1,"nativeCheck":"ok"},"capabilities":["receipts","idle","human-turn"]}'
         ts: 1795089600
         nonce: c3n-MHUOLraqLSy4lX8rIw
         machineId: pm_PCly-PiMxyo5IXRSo4i70g
-        bodyHash: 8f71fb46acbd262dbcbb8ece88aeea0353bdffd88ee5d8c6bb4e78ab68f41c5c
+        bodyHash: d221fa3aaeb579032b13aaa0a188552a107b27e327973a8797ad08e3d50764d1
         canonical: |-
           HEYDAN-SIG-V1
           1
@@ -1883,10 +1952,10 @@ components:
           /peer/hello
           1795089600
           c3n-MHUOLraqLSy4lX8rIw
-          8f71fb46acbd262dbcbb8ece88aeea0353bdffd88ee5d8c6bb4e78ab68f41c5c
+          d221fa3aaeb579032b13aaa0a188552a107b27e327973a8797ad08e3d50764d1
           pm_PCly-PiMxyo5IXRSo4i70g
-        signature: MEQCIDYoQIMGBEcPZMqRKpWxhBeMttee7PdEfKrJ_h1HDgsGAiBM5lIg5zqbFi9z9J0aEJllbOaeeEYFAK95zBCGSGEWew
-        authorization: HeyDan-Sig v=1,p=1,d=pm_PCly-PiMxyo5IXRSo4i70g,t=1795089600,n=c3n-MHUOLraqLSy4lX8rIw,bh=8f71fb46acbd262dbcbb8ece88aeea0353bdffd88ee5d8c6bb4e78ab68f41c5c,s=MEQCIDYoQIMGBEcPZMqRKpWxhBeMttee7PdEfKrJ_h1HDgsGAiBM5lIg5zqbFi9z9J0aEJllbOaeeEYFAK95zBCGSGEWew
+        signature: MEUCIDGxNB4hVZPG4zhHkMeVO5NkwJ08bv0hy_OIfIG-OM_MAiEAsIZbuYwo3bTodqdjK4TG4RfWFRUhgxoFturNiHb5KPw
+        authorization: HeyDan-Sig v=1,p=1,d=pm_PCly-PiMxyo5IXRSo4i70g,t=1795089600,n=c3n-MHUOLraqLSy4lX8rIw,bh=d221fa3aaeb579032b13aaa0a188552a107b27e327973a8797ad08e3d50764d1,s=MEUCIDGxNB4hVZPG4zhHkMeVO5NkwJ08bv0hy_OIfIG-OM_MAiEAsIZbuYwo3bTodqdjK4TG4RfWFRUhgxoFturNiHb5KPw
         signatureValid: true
     sigEventsConnect:
       summary: 'Valid, GET /peer/events'
@@ -1910,8 +1979,8 @@ components:
           gDZl6DWT3atXh6Z_x2AT1A
           e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
           pm_PCly-PiMxyo5IXRSo4i70g
-        signature: MEUCIQCoCYRPYkf-xG53ZTQZQTBtOB6_2qxwNk7HxZsL8NpJogIga_Hr36QmchFepG17yga1v9Snb9HaUJaUqxGX5IMjUCw
-        authorization: HeyDan-Sig v=1,p=1,d=pm_PCly-PiMxyo5IXRSo4i70g,t=1795089600,n=gDZl6DWT3atXh6Z_x2AT1A,bh=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855,s=MEUCIQCoCYRPYkf-xG53ZTQZQTBtOB6_2qxwNk7HxZsL8NpJogIga_Hr36QmchFepG17yga1v9Snb9HaUJaUqxGX5IMjUCw
+        signature: MEUCICWjByw4Tu6zZLnALCKCrX6ZQos2hmNfPez9FpQAaFcTAiEAramXpTwwkBJ8xDiJi0tWVe9fOC9uZaDjWBFYY60Cjsc
+        authorization: HeyDan-Sig v=1,p=1,d=pm_PCly-PiMxyo5IXRSo4i70g,t=1795089600,n=gDZl6DWT3atXh6Z_x2AT1A,bh=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855,s=MEUCICWjByw4Tu6zZLnALCKCrX6ZQos2hmNfPez9FpQAaFcTAiEAramXpTwwkBJ8xDiJi0tWVe9fOC9uZaDjWBFYY60Cjsc
         signatureValid: true
     sigGetPeersFilter:
       summary: 'Valid, GET /peer/peers with a filter'
@@ -1935,8 +2004,8 @@ components:
           4eIavNJcFsJcPJOWdcqsfg
           e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
           pm_PCly-PiMxyo5IXRSo4i70g
-        signature: MEYCIQC-XzxYvwoIln2tPha89eaNCNwr8TF8dqT9QFDG9YGK5AIhAPh8T49QltuOGL2HZjjNCSpvoGc7kxm9VB9mLcsi0Tlt
-        authorization: HeyDan-Sig v=1,p=1,d=pm_PCly-PiMxyo5IXRSo4i70g,t=1795089600,n=4eIavNJcFsJcPJOWdcqsfg,bh=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855,s=MEYCIQC-XzxYvwoIln2tPha89eaNCNwr8TF8dqT9QFDG9YGK5AIhAPh8T49QltuOGL2HZjjNCSpvoGc7kxm9VB9mLcsi0Tlt
+        signature: MEQCIDafQRYE_WcKhcfdek_whSZ_gW2-Zto7FFSPH1kcq2t7AiB7Jlc70ZGNLa87ZnUqe2w5k1N5370HXt3Ebk8wG2r69Q
+        authorization: HeyDan-Sig v=1,p=1,d=pm_PCly-PiMxyo5IXRSo4i70g,t=1795089600,n=4eIavNJcFsJcPJOWdcqsfg,bh=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855,s=MEQCIDafQRYE_WcKhcfdek_whSZ_gW2-Zto7FFSPH1kcq2t7AiB7Jlc70ZGNLa87ZnUqe2w5k1N5370HXt3Ebk8wG2r69Q
         signatureValid: true
     sigPostMessage:
       summary: 'Valid, POST /peer/messages'
@@ -1960,8 +2029,8 @@ components:
           f302A6d7AdJeQ4Xd1umgBQ
           6f8d1ae1728dba083c1a574deaeca3d0b2013f1b394ec32378b49a24daf4d65c
           pm_PCly-PiMxyo5IXRSo4i70g
-        signature: MEUCIQD9hGnuilNhhkQsFgHFc09IJ-DqzjvMZKHhFnS91E0nZgIgENCyOyHuZ1OOlghdKxE4CUlk9UmTv09vfPfFWaqYVN8
-        authorization: HeyDan-Sig v=1,p=1,d=pm_PCly-PiMxyo5IXRSo4i70g,t=1795089600,n=f302A6d7AdJeQ4Xd1umgBQ,bh=6f8d1ae1728dba083c1a574deaeca3d0b2013f1b394ec32378b49a24daf4d65c,s=MEUCIQD9hGnuilNhhkQsFgHFc09IJ-DqzjvMZKHhFnS91E0nZgIgENCyOyHuZ1OOlghdKxE4CUlk9UmTv09vfPfFWaqYVN8
+        signature: MEUCIQCQSx3Z-us6Go68qsptSx_-V3e3mhLaSwpLhB8ihNjkBwIgQS_ffZHd-UO5Zh7g_dU726I-8JKW5ev_BgdQI_dIBPg
+        authorization: HeyDan-Sig v=1,p=1,d=pm_PCly-PiMxyo5IXRSo4i70g,t=1795089600,n=f302A6d7AdJeQ4Xd1umgBQ,bh=6f8d1ae1728dba083c1a574deaeca3d0b2013f1b394ec32378b49a24daf4d65c,s=MEUCIQCQSx3Z-us6Go68qsptSx_-V3e3mhLaSwpLhB8ihNjkBwIgQS_ffZHd-UO5Zh7g_dU726I-8JKW5ev_BgdQI_dIBPg
         signatureValid: true
     sigBadChangedBody:
       summary: 'Tampered body, must not verify'
@@ -1985,8 +2054,8 @@ components:
           agYlKuRtFDQDhynLE0sM7g
           f33853ea9aa170eb1eff6cf541d3bc0fc1de444e30fceccb679eb08fcde5ba15
           pm_PCly-PiMxyo5IXRSo4i70g
-        signature: MEYCIQClqnBOV0nMiZFf7b39A1nQ9LQnX0tY_wOUQuEdABh_YgIhAPgSJg5Q2gEcYhPHbKrsOJLY8qzy3QiAVIM6fnLK3s0n
-        authorization: HeyDan-Sig v=1,p=1,d=pm_PCly-PiMxyo5IXRSo4i70g,t=1795089600,n=agYlKuRtFDQDhynLE0sM7g,bh=f33853ea9aa170eb1eff6cf541d3bc0fc1de444e30fceccb679eb08fcde5ba15,s=MEYCIQClqnBOV0nMiZFf7b39A1nQ9LQnX0tY_wOUQuEdABh_YgIhAPgSJg5Q2gEcYhPHbKrsOJLY8qzy3QiAVIM6fnLK3s0n
+        signature: MEYCIQCMvHuStbqDwQ2NrH0WIPtEBr3IOXkuCq60OwF7bWvwbQIhAMf4WbY397wnLRswDR-buvFOBItRiKK748bcDe-8nmPK
+        authorization: HeyDan-Sig v=1,p=1,d=pm_PCly-PiMxyo5IXRSo4i70g,t=1795089600,n=agYlKuRtFDQDhynLE0sM7g,bh=f33853ea9aa170eb1eff6cf541d3bc0fc1de444e30fceccb679eb08fcde5ba15,s=MEYCIQCMvHuStbqDwQ2NrH0WIPtEBr3IOXkuCq60OwF7bWvwbQIhAMf4WbY397wnLRswDR-buvFOBItRiKK748bcDe-8nmPK
         signatureValid: false
         note: Signed over the original body hash; the header carries the changed body hash, so the signature does not verify.
     envAgentMessage:
@@ -2073,11 +2142,12 @@ components:
         features: ["agents", "sessions", "hop-limit", "idle"]
         serverTime: 1795089600000
     helloRequest:
-      summary: 'First hello after the daemon started'
+      summary: 'First hello after the daemon started (takeover, no resumeEpoch)'
       x-amesh-schema: HelloRequest
       dataValue:
-        resumeEpoch: 6
-        takeover: false
+        instance: Rk3v9QpX2mLs8TzW1nYc4A
+        resumeEpoch: null
+        takeover: true
         amesh:
           version: "0.1.0"
           os: darwin
@@ -2088,7 +2158,7 @@ components:
           nativeCheck: ok
         capabilities: ["receipts", "idle", "human-turn"]
     helloResponse:
-      summary: 'Epoch 7'
+      summary: 'Epoch 7 on log lg_3Xq9Vm2Lp7Kd'
       x-amesh-schema: HelloResponse
       dataValue:
         protocol: 1
@@ -2097,6 +2167,7 @@ components:
           id: pm_PCly-PiMxyo5IXRSo4i70g
           name: mac
         epoch: 7
+        log: lg_3Xq9Vm2Lp7Kd
         features: ["agents", "sessions", "hop-limit", "idle"]
         settings:
           heartbeatMs: 20000
@@ -2104,7 +2175,7 @@ components:
           backoffInitialMs: 500
           backoffMaxMs: 10000
           backoffResetAfterMs: 5000
-          acceptWindowMs: 5000
+          acceptWindowMs: 8000
           requestTimeoutMs: 10000
           sendWaitMs: 5000
         limits:
@@ -2294,7 +2365,7 @@ components:
           createdAt: 1795089603000
           expiresAt: 1795176003000
     reportsRequest:
-      summary: 'Accepted, a duplicate drop, an idle report'
+      summary: 'Accepted, a duplicate drop, an idle report, an id the hub does not know'
       x-amesh-schema: ReportsRequest
       dataValue:
         epoch: 7
@@ -2312,11 +2383,17 @@ components:
             reason: duplicate
             at: 1795089647000
           - kind: idle
-            id: c2b7e1f0-4d5a-4e3b-8c9d-0f1e2d3c4b5a
+            id: d4e5f6a7-b8c9-4dae-8f01-2a3b4c5d6e7f
             session: 15355-4f6c8c61
             at: 1795089652000
+          - kind: state
+            id: e5f6a7b8-c9d0-4ebf-9012-3b4c5d6e7f80
+            session: 15355-4f6c8c61
+            state: accepted
+            reason: null
+            at: 1795089653000
     reportsResponse:
-      summary: 'All applied'
+      summary: 'Three applied, the unknown id with state null'
       x-amesh-schema: ReportsResponse
       dataValue:
         results:
@@ -2326,9 +2403,12 @@ components:
           - id: c2b7e1f0-4d5a-4e3b-8c9d-0f1e2d3c4b5a
             state: dropped
             applied: true
-          - id: c2b7e1f0-4d5a-4e3b-8c9d-0f1e2d3c4b5a
-            state: dropped
+          - id: d4e5f6a7-b8c9-4dae-8f01-2a3b4c5d6e7f
+            state: accepted
             applied: true
+          - id: e5f6a7b8-c9d0-4ebf-9012-3b4c5d6e7f80
+            state: null
+            applied: false
     # ---- events
     eventEndpoint:
       summary: 'endpoint'
@@ -2345,6 +2425,22 @@ components:
         sessions: ["15355-4f6c8c61"]
         state: open
         createdAt: 1795089602000
+        closedAt: null
+    eventEndpointSnapshot:
+      summary: 'endpoint opened below the cursor, sent without an SSE id at connect'
+      x-amesh-schema: PeerEvent
+      dataValue:
+        kind: endpoint
+        seq: 64
+        id: pe_K3d8Wn1pRz6c
+        name: stan
+        peer:
+          address: stan
+          kind: agent
+        context: telegram
+        sessions: ["15355-4f6c8c61"]
+        state: open
+        createdAt: 1795086600000
         closedAt: null
     eventMessage:
       summary: 'message'
@@ -2369,7 +2465,7 @@ components:
         createdAt: 1795089641000
         expiresAt: 1795176041000
     eventDelivery:
-      summary: 'delivery (refused)'
+      summary: 'delivery (dropped: the agent left mesh after the message was queued)'
       x-amesh-schema: PeerEvent
       dataValue:
         kind: delivery
@@ -2379,7 +2475,7 @@ components:
         to:
           address: stan
           endpoint: pe_K3d8Wn1pRz6c
-        state: refused
+        state: dropped
         reason: not_member
         message: stan no longer takes messages from peers.
         at: 1795089665000
@@ -2403,12 +2499,12 @@ components:
         message: This conversation with stan has had 20 messages without the owner taking part, so it is paused until the owner writes in it.
         at: 1795089670000
     eventIdle:
-      summary: 'idle'
+      summary: 'idle (a shape for later: no v1 send asks for it)'
       x-amesh-schema: PeerEvent
       dataValue:
         kind: idle
         seq: 123
-        id: 3f6c2a9e-8b1d-4c7a-9e05-1a2b3c4d5e6f
+        id: d4e5f6a7-b8c9-4dae-8f01-2a3b4c5d6e7f
         session: 15355-4f6c8c61
         peer: stan
         at: 1795089680000
@@ -2451,13 +2547,20 @@ components:
         at: 1795089695000
     streamReplay:
       summary: One connection opened with after=117&epoch=7 while the log ends at 123
-      description: Raw bytes of one connection opened with after=117&epoch=7 while the log ends at 123. Lines end in LF; an empty line ends an event; a line starting with a colon is a comment. seq 120 is another machine's event and is not sent. Status events and synchronized carry no id.
+      description: Raw bytes of one connection opened with after=117&epoch=7 while the log ends at 123. Lines end in LF; an empty line ends an event; a line starting with a colon is a comment. First one endpoint event per open endpoint without an id (the snapshot), then the log replay, then the status events, then synchronized. seq 120 is another machine's event and is not sent. Snapshot endpoints, status events and synchronized carry no id. cursorAfter is the cursor once every event in the example is handled.
       x-amesh-schema: EventStreamItem
       x-amesh-expect:
         cursorAfter: 123
         logEvents: [118, 119, 121, 122, 123]
         statusEvents: 1
+        endpointSnapshots: ["pe_K3d8Wn1pRz6c", "pe_Q7m2Hx4tLs9v"]
       serializedValue: |+
+        event: endpoint
+        data: {"kind":"endpoint","seq":64,"id":"pe_K3d8Wn1pRz6c","name":"stan","peer":{"address":"stan","kind":"agent"},"context":"telegram","sessions":["15355-4f6c8c61"],"state":"open","createdAt":1795086600000,"closedAt":null}
+
+        event: endpoint
+        data: {"kind":"endpoint","seq":118,"id":"pe_Q7m2Hx4tLs9v","name":"stan","peer":{"address":"stan","kind":"agent"},"context":"peer","sessions":["15355-4f6c8c61"],"state":"open","createdAt":1795089602000,"closedAt":null}
+
         id: 118
         event: endpoint
         data: {"kind":"endpoint","seq":118,"id":"pe_Q7m2Hx4tLs9v","name":"stan","peer":{"address":"stan","kind":"agent"},"context":"peer","sessions":["15355-4f6c8c61"],"state":"open","createdAt":1795089602000,"closedAt":null}
@@ -2468,7 +2571,7 @@ components:
 
         id: 121
         event: delivery
-        data: {"kind":"delivery","seq":121,"id":"1a616f5d-ad9d-4185-a462-0bf442288517","session":"15355-4f6c8c61","to":{"address":"stan","endpoint":"pe_K3d8Wn1pRz6c"},"state":"refused","reason":"not_member","message":"stan no longer takes messages from peers.","at":1795089665000}
+        data: {"kind":"delivery","seq":121,"id":"1a616f5d-ad9d-4185-a462-0bf442288517","session":"15355-4f6c8c61","to":{"address":"stan","endpoint":"pe_K3d8Wn1pRz6c"},"state":"dropped","reason":"not_member","message":"stan no longer takes messages from peers.","at":1795089665000}
 
         id: 122
         event: limit
@@ -2476,7 +2579,7 @@ components:
 
         id: 123
         event: idle
-        data: {"kind":"idle","seq":123,"id":"3f6c2a9e-8b1d-4c7a-9e05-1a2b3c4d5e6f","session":"15355-4f6c8c61","peer":"stan","at":1795089680000}
+        data: {"kind":"idle","seq":123,"id":"d4e5f6a7-b8c9-4dae-8f01-2a3b4c5d6e7f","session":"15355-4f6c8c61","peer":"stan","at":1795089680000}
 
         event: status
         data: {"kind":"status","peer":{"address":"infra@infra:bl","kind":"session","name":"infra","machine":"bl","project":"infra","status":"busy","lastSeen":1795089588000},"listed":true}
@@ -2709,6 +2812,13 @@ components:
     nativeDeliveryFrame:
       summary: "A message event written into the receiving session's inbox"
       x-amesh-schema: NativeUserFrame
+      x-amesh-envelope:
+        body: "Rerun done. Two reports changed: weekly-usage and agent-costs. Want the diff?"
+        from: uds:/tmp/cc-socks/ab737c79d448059c.sock
+        fromSession: pe_Q7m2Hx4tLs9v
+        hopChain: ["c4eb2881cd514ae75a89e6ac"]
+        fromName: stan
+        fromMode: bypass
       dataValue:
         type: user
         message:
@@ -2722,8 +2832,16 @@ components:
         msgV: 1
         msg_id: 7d1e4b2a-6c3f-4a8e-b9d0-2e3f4a5b6c7d
     nativeNoticeFrame:
-      summary: 'A hop-limit notice from the endpoint''s relay (*proposed*)'
+      summary: 'A hop-limit notice from the endpoint''s relay, to a receiver of unknown class (*proposed*)'
       x-amesh-schema: NativeUserFrame
+      x-amesh-envelope:
+        body: "amesh notice: This conversation with stan has had 20 messages without the owner taking part, so it is paused until the owner writes in it. No reply needed."
+        from: uds:/tmp/cc-socks/ab737c79d448059c.sock
+        fromSession: pe_Q7m2Hx4tLs9v
+        fromName: stan
+      x-amesh-notice:
+        source: "122"
+        kind: limit
       dataValue:
         type: user
         message:
@@ -2735,10 +2853,36 @@ components:
         priority: next
         from: uds:/tmp/cc-socks/ab737c79d448059c.sock
         msgV: 1
-        msg_id: e4c1b8a2-3f5d-4b6e-9a7c-8d0e1f2a3b4c
+        msg_id: 526f9867-4242-53ad-bab5-352609886b66
+    nativeNoticeNoFromFrame:
+      summary: 'A notice with no conversation relay: a start refused after the tool answered (A1)'
+      x-amesh-schema: NativeUserFrame
+      x-amesh-envelope:
+        body: "amesh notice: your message to notes@db-work:air was not delivered: notes@db-work:air is offline and already has 100 messages waiting. No reply needed."
+        fromName: amesh
+      x-amesh-notice:
+        source: f6a7b8c9-d0e1-4fc0-8123-4c5d6e7f8091
+        kind: outbox
+      dataValue:
+        type: user
+        message:
+          role: user
+          content: |-
+            <cross-session-message from-name="amesh">
+            amesh notice: your message to notes@db-work:air was not delivered: notes@db-work:air is offline and already has 100 messages waiting. No reply needed.
+            </cross-session-message>
+        priority: next
+        msgV: 1
+        msg_id: 252c26bd-8fa3-5536-bb57-d4898f3c4f36
     nativeReplyFrame:
       summary: 'A native reply read on a relay socket'
       x-amesh-schema: NativeUserFrame
+      x-amesh-envelope:
+        body: "Yes: the deploy finished at 11:58 UTC and the health check is green."
+        from: uds:/tmp/cc-socks/15355.sock
+        hopChain: ["c4eb2881cd514ae75a89e6ac"]
+        fromName: review
+        fromMode: bypass
       dataValue:
         msgV: 1
         msg_id: 1a616f5d-ad9d-4185-a462-0bf442288517
@@ -2850,14 +2994,19 @@ components:
         msgV: 1
         msg_id: 83a59193-4b9f-4e80-9db2-6f50718293a4
     laneStartedFrame:
-      summary: 'Lane started, into the parent'
+      summary: 'Lane started, into a parent of unknown or prompting class (no from-mode)'
       x-amesh-schema: NativeUserFrame
+      x-amesh-envelope:
+        body: "Lane started: c-claude-e6 (a session you launched, working in ~/pj/pond). It can message you, and you can message it by sending to this message's from address. No reply needed."
+        from: uds:/tmp/cc-socks/a5bce10d4370073a.sock
+        fromSession: ln_0d049992f294f2a2
+        fromName: c-claude-e6
       dataValue:
         type: user
         message:
           role: user
           content: |-
-            <cross-session-message from="uds:/tmp/cc-socks/a5bce10d4370073a.sock" from-session="ln_0d049992f294f2a2" from-name="c-claude-e6" from-mode="bypass">
+            <cross-session-message from="uds:/tmp/cc-socks/a5bce10d4370073a.sock" from-session="ln_0d049992f294f2a2" from-name="c-claude-e6">
             Lane started: c-claude-e6 (a session you launched, working in ~/pj/pond). It can message you, and you can message it by sending to this message's from address. No reply needed.
             </cross-session-message>
         priority: next
@@ -2865,14 +3014,20 @@ components:
         msgV: 1
         msg_id: a0b1c2d3-e4f5-4a6b-8c7d-9e0f1a2b3c4d
     laneMessageFrame:
-      summary: 'send_to_parent text, into the parent'
+      summary: 'send_to_parent text from a client-seat child (class unknown), with the lane chain'
       x-amesh-schema: NativeUserFrame
+      x-amesh-envelope:
+        body: Tests pass on the branch; pushing now.
+        from: uds:/tmp/cc-socks/a5bce10d4370073a.sock
+        fromSession: ln_0d049992f294f2a2
+        hopChain: ["b551102c847d34ee8a425f54"]
+        fromName: c-claude-e6
       dataValue:
         type: user
         message:
           role: user
           content: |-
-            <cross-session-message from="uds:/tmp/cc-socks/a5bce10d4370073a.sock" from-session="ln_0d049992f294f2a2" from-name="c-claude-e6" from-mode="bypass">
+            <cross-session-message from="uds:/tmp/cc-socks/a5bce10d4370073a.sock" from-session="ln_0d049992f294f2a2" hop-chain="b551102c847d34ee8a425f54" from-name="c-claude-e6">
             Tests pass on the branch; pushing now.
             </cross-session-message>
         priority: next
@@ -2882,6 +3037,11 @@ components:
     laneTurnEndFrame:
       summary: 'Turn-end notice, into the parent'
       x-amesh-schema: NativeUserFrame
+      x-amesh-envelope:
+        body: c-claude-e6 finished its turn and is idle. No reply needed.
+        from: uds:/tmp/cc-socks/a5bce10d4370073a.sock
+        fromSession: ln_0d049992f294f2a2
+        fromName: c-claude-e6
       dataValue:
         type: user
         message:
@@ -2897,6 +3057,11 @@ components:
     laneEndedFrame:
       summary: 'Lane ended, into the parent'
       x-amesh-schema: NativeUserFrame
+      x-amesh-envelope:
+        body: "Lane ended: c-claude-e6 exited. No reply needed."
+        from: uds:/tmp/cc-socks/a5bce10d4370073a.sock
+        fromSession: ln_0d049992f294f2a2
+        fromName: c-claude-e6
       dataValue:
         type: user
         message:
@@ -2937,6 +3102,21 @@ components:
           to: stan
           message: hi
         tool_use_id: toolu_01VPM2LCZZUAjpLo66RRdHkW
+    hookGuardSubagentSendMessage:
+      summary: "PreToolUse on native SendMessage from a subagent to a relay address (200, deny; trial in M1)"
+      x-amesh-schema: HookInput
+      dataValue:
+        session_id: 88946e76-2b1f-4f0e-9c3a-5d7e1b2c4a90
+        cwd: /Users/tenequm/pj/pond
+        permission_mode: bypassPermissions
+        agent_id: a3f9c27e1b05d4e68
+        agent_type: fork
+        hook_event_name: PreToolUse
+        tool_name: SendMessage
+        tool_input:
+          to: uds:/tmp/cc-socks/ab737c79d448059c.sock
+          message: Yes, rerun it.
+        tool_use_id: toolu_01Hq8V3kXo2bN7mRt5LcWs9e
     hookGuardDeny:
       summary: 'The R15 deny'
       x-amesh-schema: HookOutputPreToolUse
@@ -2947,7 +3127,7 @@ components:
           permissionDecisionReason: peer messaging is for the main session only, not subagents
     # ---- daemon socket
     status:
-      summary: 'Connected, one member, one lane'
+      summary: 'Connected, one member, one lane, one warning'
       x-amesh-schema: DaemonStatus
       dataValue:
         daemon:
@@ -2988,6 +3168,7 @@ components:
           oldestAt: null
         open:
           count: 1
+        warnings: ["review@pond:mac runs Claude Code 2.1.330; the end-to-end test has passed only on 2.1.328."]
     statusHalted:
       summary: 'Halted after a revocation'
       x-amesh-schema: DaemonStatus
@@ -3054,7 +3235,6 @@ components:
       dataValue:
         to: stan
         message: The pond index rebuild finished; can you rerun the nightly report against it?
-        notify_when_idle: false
     mcpArgsSendToParent:
       summary: 'send_to_parent'
       x-amesh-schema: McpSendToParentArguments
