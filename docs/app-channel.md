@@ -142,6 +142,27 @@ Read state is shared between the user's devices. The first question answer wins;
 choice returns the current question with `not_open`. The server expires buttons at the
 runner's deadline or when the agent stops waiting.
 
+## Voice messages
+
+| Configuration or route                 | Voice message behavior                                                                              |
+| -------------------------------------- | --------------------------------------------------------------------------------------------------- |
+| `OPENAI_API_KEY`                       | A configured key enables the `voice-messages` feature in `GET /app/hello`.                          |
+| `POST /app/files`                      | Mint with `mimeType: "audio/mp4"` or `"audio/x-m4a"` and optional nonnegative integer `durationMs`. |
+| `PUT /app/files/:id`                   | Upload up to 25 MiB. The host checks for an M4A brand in the ISO BMFF file type box.                |
+| `GET /app/files/:id`                   | Download the recording as `audio/mp4`.                                                              |
+| `POST /app/conversations/:id/messages` | Send the uploaded file id in `fileIds` with `text: ""`.                                             |
+
+The send response contains an audio attachment with `kind: "audio"`, the supplied duration,
+and `transcript: {"state":"pending"}`. The conversation preview reads "Voice message".
+The host transcribes in the background. Devices with access receive a message event with the
+same id and creation order and a newer seq. Its attachment carries
+`{"state":"done","text":"..."}` or `{"state":"failed"}` in `transcript`. If the recording
+is still the last message, its completed transcript becomes the preview.
+
+The agent receives a staged voice attachment after transcription finishes. A successful
+transcript appears beside the file in the agent's prompt. Failure still delivers the audio.
+The host retries an interrupted transcription once across restarts.
+
 ## Push and calls
 
 Store separate APNs signing keys for sandbox and production. Register each device token

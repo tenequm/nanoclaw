@@ -13,7 +13,10 @@ export interface AppHooks {
     db: DbDriver,
     c: { userId: string; conversationId: string; messageId: string; fileIds: string[] },
   ): Promise<{ ok: true; files: FileAttachment[] } | { ok: false; fileId: string }>;
-  stageFiles(messageId: string): Promise<{ name: string; mimeType: string; size: number; stagedPath: string }[]>;
+  stageFiles(
+    messageId: string,
+    files: FileAttachment[],
+  ): Promise<{ name: string; mimeType: string; size: number; stagedPath: string }[]>;
   storeOutboundFiles(o: {
     userId: string;
     conversationId: string;

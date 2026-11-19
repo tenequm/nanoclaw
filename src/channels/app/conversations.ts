@@ -180,10 +180,13 @@ export async function itemChanged(
   const role = 'role' in item ? item.role : 'agent';
   const previous = c.last_message_json ? JSON.parse(c.last_message_json) : null;
   if (created || previous?.id === item.id) {
+    const audio = 'files' in item ? item.files.find((f) => f.kind === 'audio') : undefined;
+    const preview =
+      item.text || (audio?.transcript?.state === 'done' ? audio.transcript.text : audio ? 'Voice message' : '');
     c.last_message_json = JSON.stringify({
       id: item.id,
       role,
-      preview: plainPreview(item.text),
+      preview: plainPreview(preview),
       at: ('editedAt' in item ? item.editedAt : null) ?? item.createdAt,
     });
     await getDb().run('UPDATE app_conversations SET last_message_json = ? WHERE id = ?', c.last_message_json, c.id);

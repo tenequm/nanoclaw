@@ -99,15 +99,25 @@ export interface SetAgentResponse {
   agent: AgentCandidate;
 }
 export type UnreadResponse = ReadResponse;
+export interface FileInitRequest {
+  uploadKey: string;
+  name: string;
+  mimeType: string;
+  size: number;
+  sha256: string;
+  durationMs?: number;
+}
 
 export interface FileAttachment {
   id: string;
   name: string;
   mimeType: string;
   size: number;
-  kind: Kind;
+  kind: 'image' | 'file' | 'audio' | (string & {});
   width: number | null;
   height: number | null;
+  durationMs?: number;
+  transcript?: { state: 'pending' | 'failed' } | { state: 'done'; text: string };
 }
 
 export interface Reaction {

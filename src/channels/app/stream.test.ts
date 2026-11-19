@@ -9,7 +9,7 @@ import * as deviceAuth from '../../modules/device-auth/verify.js';
 import { EventEmitter } from 'node:events';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { afterEach, expect, it, vi } from 'vitest';
-import { configureStream, openStream, type StreamDeps } from './stream.js';
+import { configureStream, openStream, streamEvents, type StreamDeps } from './stream.js';
 import type { EventRow, ConversationRow } from './db.js';
 import fixtures from './app-contract.fixtures.json' with { type: 'json' };
 
@@ -248,27 +248,39 @@ it('uses signed dispatch and real device access and revocation seams', async () 
   }
 });
 
-it('streams committed messages through the module-level event log wiring', async () => {
-  const s = setup();
+it('streams both committed versions of a voice note to each live device', async () => {
+  const devices = [setup('phone'), setup('tablet')];
   const db = await initDb(':memory:', { role: 'test' });
   await runMigrations(db);
   configureStream();
-  s.ctx.req.url = '/app/events?after=0';
   try {
-    await openModuleStream();
-    expect(s.output()).toContain('event: synchronized');
-    const message = { ...fixtures.messages.agentMarkdown, id: 'msg_integration', seq: 0, order: 0 } as Message;
-    await appTransaction(() => appendEvent(db, 'u', 'ag_taylor', message));
-    await vi.waitFor(() => expect(s.output()).toContain('msg_integration'));
-    expect(s.output()).toContain('event: message');
+    for (const device of devices) {
+      device.ctx.req.url = '/app/events?after=0';
+      await streamEvents(device.ctx);
+      expect(device.output()).toContain('event: synchronized');
+    }
+    const message = {
+      ...fixtures.messages.userWithFile,
+      id: 'msg_integration',
+      seq: 0,
+      order: 0,
+      files: [{ ...fixtures.voiceMessages.pendingFile }],
+    } as Message;
+    for (const transcript of [
+      { state: 'pending' },
+      { state: 'done', text: fixtures.voiceMessages.done.text },
+    ] as const) {
+      message.files[0].transcript = transcript;
+      await appTransaction(() => appendEvent(db, 'u', 'ag_taylor', message));
+      const frame = `id: ${message.seq}\nevent: message\ndata: ${JSON.stringify(message)}\n\n`;
+      await vi.waitFor(() => {
+        for (const device of devices) expect(device.output()).toContain(frame);
+      });
+    }
   } finally {
-    s.res.emit('close');
+    for (const device of devices) device.res.emit('close');
     await stopStatus();
     await closeDb();
-  }
-  async function openModuleStream() {
-    const { streamEvents } = await import('./stream.js');
-    await streamEvents(s.ctx);
   }
 });
 

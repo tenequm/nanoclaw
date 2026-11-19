@@ -696,7 +696,14 @@ describe('signed HTTP fixture producers', () => {
     vi.stubEnv('APP_APNS_SANDBOX_KEY_ID', 'fixture-key');
     vi.stubEnv('APP_APNS_SANDBOX_KEY_PATH', keyPath);
     resetAppConfigCache();
+    vi.stubEnv('OPENAI_API_KEY', '');
     same((await request('GET', '/app/hello')).body, fixtures.hello);
+    vi.stubEnv('OPENAI_API_KEY', 'fixture-only');
+    resetAppConfigCache();
+    same((await request('GET', '/app/hello')).body, {
+      ...fixtures.hello,
+      features: [...fixtures.hello.features, 'voice-messages'],
+    });
   });
   it('pairs the fixture proof through the real gate and consumes the code once', async () => {
     await getDb().run(
