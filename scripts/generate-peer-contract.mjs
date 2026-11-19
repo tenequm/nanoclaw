@@ -6,6 +6,10 @@ const dir = new URL('../src/channels/peer/', import.meta.url);
 const { components } = parse(await readFile(new URL('openapi.yaml', dir), 'utf8'));
 const definitions = JSON.parse(
   JSON.stringify(components.schemas).replaceAll('#/components/schemas/', '#/definitions/'),
+  (_key, schema) =>
+    schema?.type === 'object' && !schema.properties && schema.additionalProperties === undefined
+      ? { ...schema, additionalProperties: true }
+      : schema,
 );
 const properties = Object.fromEntries(
   Object.keys(definitions).map((name) => [name, { $ref: '#/definitions/' + name }]),

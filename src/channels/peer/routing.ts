@@ -1,4 +1,6 @@
 import { randomUUID, createHash } from 'node:crypto';
+import { getContainerConfig } from '../../db/container-configs.js';
+import { resolveProviderName } from '../../providers/provider-name.js';
 import { getDb } from '../../db/connection.js';
 import { getSession, findSessionForAgent, createSession } from '../../db/sessions.js';
 import { createMessagingGroupIfAbsent, getMessagingGroup } from '../../db/messaging-groups.js';
@@ -526,13 +528,15 @@ export async function routeAgentPeer(
       if (!row) fail(404, 'unknown_session', 'No peer for this chat.');
       target = await actor(row.remote_id);
     } else target = await addressTarget(address, sender);
+    const config = await getContainerConfig(session.agent_group_id);
+    const provider = resolveProviderName(session.agent_provider, config?.provider);
     return queue(sender, target, session.id, {
       id: randomUUID(),
       sourceId: msg.id,
       hash,
       text: peerText(data),
       origin: 'unknown',
-      mode: 'bypass',
+      mode: provider === 'claude' ? 'bypass' : null,
       notify: false,
       failure: data.failureNotice === true,
     });
