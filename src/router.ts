@@ -23,7 +23,7 @@ import { runJevGate } from './modules/jev-gate/index.js';
 import { applyNormalizedText, classifyHostCommand, gateCommand } from './command-gate.js';
 import { runHostCommand } from './commands/fallback.js';
 import { getDeliveryAdapter } from './delivery.js';
-import { getDb } from './db/connection.js';
+import { getDb, hasTable } from './db/connection.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import { recordDroppedMessage } from './db/dropped-messages.js';
 import {
@@ -726,7 +726,7 @@ export async function deliverToAgent(
     trigger: wake,
   });
 
-  if (isChat && senderRole === 'owner' && (await getDb().hasTable('peer_conversations'))) {
+  if (isChat && senderRole === 'owner' && (await hasTable(getDb(), 'peer_conversations'))) {
     const { resetHops } = await import('./channels/peer/lifecycle.js');
     await resetHops(session.id);
   }

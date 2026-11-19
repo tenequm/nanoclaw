@@ -19,7 +19,7 @@
  * core throws with a "module not installed" message so retry → mark failed.
  */
 import { createHash } from 'node:crypto';
-import { getDb } from '../../db/connection.js';
+import { getDb, hasTable } from '../../db/connection.js';
 import { isUniqueViolation } from '../../db/errors.js';
 import { AnchoredDir, copyRegularFile } from '../../anchored-dir.js';
 import { fenceForCard, quoteForCard } from '../../card-text.js';
@@ -309,7 +309,7 @@ async function performAgentRoute(
   for (let attempt = 1; attempt <= 2; attempt++) {
     const targetSession = await resolveTargetSession(msg, session, targetAgentGroupId);
     let meshRoute = false;
-    if (session.agent_group_id !== targetAgentGroupId && (await getDb().hasTable('peer_agent_sends'))) {
+    if (session.agent_group_id !== targetAgentGroupId && (await hasTable(getDb(), 'peer_agent_sends'))) {
       const { reserveAgentHop } = await import('../../channels/peer/routing.js');
       const decision = await reserveAgentHop(session, targetSession, msg.id);
       if (decision === 'refused') return;

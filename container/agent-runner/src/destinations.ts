@@ -41,7 +41,7 @@ export function getAllDestinations(): DestinationEntry[] {
 }
 
 export function getMeshPeers() {
-  return getAgentMailbox().operations.getMeshPeers?.() ?? [];
+  return getAgentMailbox().operations.getMeshPeers();
 }
 
 export function resolveNamedDestination(name: string): DestinationEntry | { error: string } | undefined {

@@ -86,7 +86,9 @@ describe('buildSystemPromptAddendum — multi-destination routing guidance', () 
 
     const prompt = buildSystemPromptAddendum('Casa', { kind: 'task', taskId: 'weekly-report' });
 
-    expect(prompt).toContain('For user-visible escalation output, default to your own channel destination(s): `casa`');
+    expect(prompt).toContain(
+      'For user-visible escalation output, default to your own channel destination(s): `casa`',
+    );
     expect(prompt).toContain(
       'Use an agent-type destination like `parent` only when the task explicitly calls for routing through another agent, not as your default escalation path.',
     );

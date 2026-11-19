@@ -76,7 +76,7 @@ export async function openStream(res: ServerResponse, machineId: string, epoch: 
       if (rows.length < 100) cursor = head;
     }
   }
-  async function status(peers: Peer[]) {
+  function status(peers: Peer[]) {
     const current = new Map(peers.map((p) => [p.address, p]));
     for (const [address, peer] of directory)
       if (!current.has(address)) write(frame({ kind: 'status', peer, listed: false }));
@@ -88,7 +88,7 @@ export async function openStream(res: ServerResponse, machineId: string, epoch: 
   async function tick() {
     try {
       await events(await eventHead());
-      await status(await listPeers());
+      status(await listPeers());
       if (Date.now() - lastPing >= limits.keepaliveMs) {
         await db.run('UPDATE peer_machines SET epoch_seen_at=? WHERE id=? AND epoch=?', Date.now(), machineId, epoch);
         write(': ping\n\n');
@@ -125,7 +125,7 @@ export async function openStream(res: ServerResponse, machineId: string, epoch: 
   });
   try {
     await events(replayHead);
-    await status(initialDirectory);
+    status(initialDirectory);
     write(frame({ kind: 'synchronized', seq: replayHead }));
     if (!closed) await tick();
   } catch {

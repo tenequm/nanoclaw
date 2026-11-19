@@ -338,9 +338,7 @@ describe('send_message - rich', () => {
   beforeEach(() => seedChannelDestination('tg', 'telegram', 'telegram:42'));
 
   it('always offers rich and stores it only for a Telegram destination', async () => {
-    expect((sendMessage.tool.inputSchema.properties as Record<string, unknown>).rich).toMatchObject({
-      type: 'boolean',
-    });
+    expect((sendMessage.tool.inputSchema.properties as Record<string, unknown>).rich).toMatchObject({ type: 'boolean' });
     await send('| a |');
     expect(lastContent()).toEqual({ text: '| a |', rich: true });
     await send('| a |', 'peer');

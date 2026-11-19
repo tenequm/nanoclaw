@@ -2,7 +2,6 @@ import { randomUUID } from 'crypto';
 import fs from 'fs';
 import path from 'path';
 
-import { setMeshMembership } from '../channels/peer/store.js';
 import { getDb } from '../db/connection.js';
 import { CONTAINER_PLUGINS_DIR } from '../container-config.js';
 import { DATA_DIR, GROUPS_DIR, TIMEZONE } from '../config.js';
@@ -126,6 +125,7 @@ export async function createAgentFromTemplate(ref: string, opts?: CreateAgentOpt
   if (tpl.mesh) {
     await getDb().transaction(async () => {
       await createAgentGroup(group);
+      const { setMeshMembership } = await import('../channels/peer/store.js');
       await setMeshMembership(id, true);
     });
   } else {
