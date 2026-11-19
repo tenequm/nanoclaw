@@ -4,7 +4,9 @@ import { transcriptionKey } from '../../transcription.js';
 import { envValue } from '../../env.js';
 import { parseEncryptionKey } from '../../secret-seal.js';
 
-export function readAppConfig(read: (key: string) => string | undefined = envValue) {
+export function readAppConfig(
+  read: (key: string) => string | undefined = (key) => (key === 'OPENAI_API_KEY' ? transcriptionKey() : envValue(key)),
+) {
   const key = parseEncryptionKey(read('NANOCLAW_ENCRYPTION_KEY'));
   const apnsKey = (environment: 'SANDBOX' | 'PRODUCTION') => {
     const keyId = read(`APP_APNS_${environment}_KEY_ID`);
@@ -12,7 +14,7 @@ export function readAppConfig(read: (key: string) => string | undefined = envVal
     return keyId && keyPath ? { keyId, keyPath } : null;
   };
   return {
-    transcriptionConfigured: Boolean(transcriptionKey(read)),
+    transcriptionConfigured: Boolean(read('OPENAI_API_KEY')),
     publicBase: read('APP_PUBLIC_BASE')?.replace(/\/+$/, '') || null,
     livekitUrl: read('APP_LIVEKIT_URL') || null,
     ticketKey: key ? Buffer.from(hkdfSync('sha256', key, Buffer.alloc(0), 'heydan-app-ticket-v1', 32)) : null,
@@ -45,7 +47,7 @@ export function configuredFeatures(config: AppConfig): string[] {
     ...(config.livekitUrl ? ['calls'] : []),
     ...(pushReady ? ['push'] : []),
     ...(config.livekitUrl ? ['voice-picker'] : []),
-    ...(config.transcriptionConfigured ? ['voice-messages'] : []),
+    ...(config.ticketKey && config.transcriptionConfigured ? ['voice-messages'] : []),
   ];
 }
 

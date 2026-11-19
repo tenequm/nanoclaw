@@ -106,8 +106,8 @@ function isM4a(data: Buffer): boolean {
   return false;
 }
 
-export function fileMetadata(data: Buffer, name: string) {
-  if (isM4a(data)) return { mimeType: 'audio/mp4', kind: 'audio' as const, width: null, height: null };
+export function fileMetadata(data: Buffer, name: string, recording = false) {
+  if (recording && isM4a(data)) return { mimeType: 'audio/mp4', kind: 'audio' as const, width: null, height: null };
   let mimeType =
     (
       {
@@ -376,9 +376,8 @@ export function createFileService(deps: FileDeps) {
         refuse(400, 'bad_body', 'The request body does not match its signature.');
       await handle.close();
       await live();
-      const metadata = fileMetadata(await readHead(temporary), row.name);
-      if ((row.mime_type === 'audio/mp4' || row.mime_type === 'audio/x-m4a') && metadata.kind !== 'audio')
-        refuse(400, 'bad_body', 'Expected an M4A audio file.');
+      const metadata = fileMetadata(await readHead(temporary), row.name, row.duration_ms !== null);
+      if (row.duration_ms !== null && metadata.kind !== 'audio') refuse(400, 'bad_body', 'Expected an M4A audio file.');
       try {
         await fs.link(temporary, target);
         published = true;
