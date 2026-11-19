@@ -4,6 +4,7 @@ import { initTestSessionDb, closeSessionDb, getInboundDb } from './mailbox/sqlit
 import { getUndeliveredMessages } from './db/messages-out.js';
 import type { MessageInRow } from './db/messages-in.js';
 import { categorizeMessage, isClearCommand } from './formatter.js';
+import { claudeRuntimeContract } from './provider-contracts/claude.js';
 import { MockProvider } from './providers/mock.js';
 import { runPollLoop } from './poll-loop.js';
 import { isUploadTraceCommand } from './upload-trace.js';
@@ -63,6 +64,37 @@ describe('runner command names match the host gate', () => {
     const info = categorizeMessage(chat(text), 'claude');
     expect([info.category, info.command, info.text]).toEqual([category, command, sent]);
   });
+});
+
+it.each(['app', 'telegram'])('sends the admin compact command raw to Claude from %s', async (channel) => {
+  const content = JSON.stringify({ senderId: 'telegram:operator', senderRole: 'admin', text: '/compact' });
+  getInboundDb()
+    .prepare(
+      "INSERT INTO messages_in (id, kind, timestamp, status, channel_type, content) VALUES ('command','chat',datetime('now'),'pending',?,?)",
+    )
+    .run(channel, content);
+  const row = { kind: 'chat', channel_type: channel, content } as MessageInRow;
+  expect(categorizeMessage(row, 'claude')).toMatchObject({ category: 'admin', senderId: 'telegram:operator' });
+  let prompt: string | undefined;
+  const provider = new MockProvider({}, (input) => {
+    prompt = input;
+    return '';
+  });
+  const controller = new AbortController();
+  const loop = runPollLoop({
+    provider,
+    providerName: 'claude',
+    providerContract: claudeRuntimeContract,
+    cwd: '/tmp',
+    signal: controller.signal,
+  });
+  try {
+    await waitFor(() => prompt !== undefined, 3000);
+    expect(prompt).toBe('/compact');
+  } finally {
+    controller.abort();
+    await loop;
+  }
 });
 
 describe('poll loop — suffixed /clear', () => {

@@ -215,7 +215,7 @@
     "protocol": 1,
     "minProtocol": 1,
     "voiceProtocol": 6,
-    "features": ["agents", "unread", "files", "calls", "push", "voice-picker"],
+    "features": ["agents", "unread", "agent-status", "agent-settings", "files", "calls", "push", "voice-picker"],
     "serverTime": 1794943562000
   },
   "pairLink": {
@@ -1662,6 +1662,128 @@
           "id": "ag_taylor",
           "name": "Taylor"
         }
+      }
+    }
+  },
+  "agentStatusResponse": {
+    "status": {
+      "agent": {
+        "id": "ag_taylor",
+        "name": "Taylor",
+        "model": {
+          "id": null,
+          "label": null
+        },
+        "defaultModel": {
+          "id": "claude-sonnet-5-5",
+          "label": "Sonnet 5.5"
+        },
+        "effort": null,
+        "provider": null,
+        "canEdit": true,
+        "configUpdatedAt": null
+      },
+      "session": {
+        "contextTokens": null,
+        "contextWindow": 165000,
+        "turns": null,
+        "outputTokens": null,
+        "queueDepth": 0
+      },
+      "options": {
+        "models": [
+          {
+            "id": "claude-sonnet-5-5",
+            "label": "Sonnet 5.5"
+          },
+          {
+            "id": "claude-sonnet-5",
+            "label": "Sonnet 5"
+          },
+          {
+            "id": "claude-opus-5",
+            "label": "Opus 5"
+          },
+          {
+            "id": "claude-opus-5-5",
+            "label": "Opus 5.5"
+          },
+          {
+            "id": "claude-fable-5",
+            "label": "Fable 5"
+          },
+          {
+            "id": "claude-fable-5-2",
+            "label": "Fable 5.2"
+          }
+        ],
+        "efforts": ["low", "medium", "high", "xhigh", "max"]
+      }
+    }
+  },
+  "agentSettingsRequest": {
+    "model": "opus",
+    "effort": "high"
+  },
+  "agentSettingsResetRequest": { "model": null, "effort": null },
+  "agentSettingsResponse": {
+    "agent": {
+      "id": "ag_taylor",
+      "name": "Taylor",
+      "model": {
+        "id": "claude-opus-5",
+        "label": "Opus 5"
+      },
+      "defaultModel": {
+        "id": "claude-sonnet-5-5",
+        "label": "Sonnet 5.5"
+      },
+      "effort": "high",
+      "provider": null,
+      "canEdit": true,
+      "configUpdatedAt": "2026-01-01T00:00:00.000Z"
+    }
+  },
+  "agentSettingsErrors": {
+    "invalidEffort": {
+      "status": 400,
+      "body": {
+        "error": "invalid_value",
+        "message": "Choose a supported setting.",
+        "field": "effort",
+        "allowed": ["low", "medium", "high", "xhigh", "max"]
+      }
+    },
+    "invalidModel": {
+      "status": 400,
+      "body": {
+        "error": "invalid_value",
+        "message": "Choose a supported setting.",
+        "field": "model",
+        "allowed": ["claude-sonnet-5-5", "claude-sonnet-5", "claude-opus-5", "claude-opus-5-5", "claude-fable-5", "claude-fable-5-2"]
+      }
+    },
+    "invalidSettings": {
+      "status": 400,
+      "body": {
+        "error": "invalid_value",
+        "message": "Choose a supported setting.",
+        "field": "settings",
+        "allowed": ["model", "effort"]
+      }
+    },
+    "forbidden": {
+      "status": 403,
+      "body": {
+        "error": "forbidden",
+        "message": "Admin access is required."
+      }
+    },
+    "notFound": {
+      "status": 404,
+      "body": {
+        "error": "not_found",
+        "message": "Not found."
       }
     }
   }

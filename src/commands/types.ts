@@ -188,6 +188,7 @@ export interface ActivationView {
  * (and which session) a card should reflect. Omitted for chat-less reads.
  */
 export interface StatusChatContext {
+  transcriptScope?: 'session' | 'group';
   messagingGroupId: string;
   threadId: string | null;
 }
@@ -269,7 +270,7 @@ export interface ConfigChangeView {
   /** Previous stored value (raw), or null when unset. */
   previous: string | number | null;
   /** New stored value (raw). */
-  current: string | number;
+  current: string | number | null;
   /** Set only for the `model` field: friendly labels for previous/current. */
   previousLabel?: string | null;
   currentLabel?: string | null;

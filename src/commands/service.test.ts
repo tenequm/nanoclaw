@@ -29,7 +29,8 @@ vi.mock('../config.js', async () => {
   return { ...actual, DATA_DIR: `/tmp/nanoclaw-test-commands-${process.pid}` };
 });
 
-import { closeDb, initTestDb } from '../db/connection.js';
+import { log } from '../log.js';
+import { closeDb, getDb, initTestDb } from '../db/connection.js';
 import { createAgentGroup } from '../db/agent-groups.js';
 import { ensureContainerConfig, getContainerConfig, updateContainerConfigScalars } from '../db/container-configs.js';
 import { createMessagingGroup, createMessagingGroupAgent } from '../db/messaging-groups.js';
@@ -291,7 +292,10 @@ describe('setModel', () => {
   });
 
   it('rejects an invalid model with allowed aliases', async () => {
+    const lock = vi.spyOn(getDb(), 'transaction');
     const res = await setModel('ag-1', 'not a model', OWNER);
+    expect(lock).not.toHaveBeenCalled();
+    lock.mockRestore();
     expect(res.ok).toBe(false);
     if (res.ok) throw new Error('expected failure');
     expect(res.reason).toBe('invalid-value');
@@ -399,7 +403,14 @@ describe('setConfigValue', () => {
     expect(good.view.current).toBe('xhigh');
     expect((await getContainerConfig('ag-1'))?.effort).toBe('xhigh');
 
+    expect(log.info).toHaveBeenCalledWith(
+      'Config changed via chat command',
+      expect.objectContaining({ field: 'effort', from: null, to: 'xhigh' }),
+    );
+    const lock = vi.spyOn(getDb(), 'transaction');
     const bad = await setConfigValue('ag-1', 'effort', 'ultra', OWNER);
+    expect(lock).not.toHaveBeenCalled();
+    lock.mockRestore();
     expect(bad.ok).toBe(false);
     if (bad.ok) throw new Error('expected failure');
     expect(bad.reason).toBe('invalid-value');

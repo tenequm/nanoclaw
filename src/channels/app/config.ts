@@ -43,6 +43,8 @@ export function configuredFeatures(config: AppConfig): string[] {
   return [
     'agents',
     'unread',
+    'agent-status',
+    'agent-settings',
     ...(config.ticketKey ? ['files'] : []),
     ...(config.livekitUrl ? ['calls'] : []),
     ...(pushReady ? ['push'] : []),

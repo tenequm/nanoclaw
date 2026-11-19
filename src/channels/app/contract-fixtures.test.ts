@@ -1,9 +1,13 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { closeDb, createAgentGroup, initDb, runMigrations } from '../../db/index.js';
-import { ensureContainerConfig, updateContainerConfigJson } from '../../db/container-configs.js';
+import {
+  ensureContainerConfig,
+  updateContainerConfigJson,
+  updateContainerConfigScalars,
+} from '../../db/container-configs.js';
 import { createMessagingGroup, createMessagingGroupAgent, getMessagingGroup } from '../../db/messaging-groups.js';
 import { composeGroupProjectDoc } from '../../project-doc-compose.js';
 import type { AgentGroup, Session } from '../../types.js';
@@ -12,6 +16,7 @@ import { appAgentInstructions } from './agent-docs.js';
 let directory: string;
 beforeEach(async () => {
   directory = mkdtempSync(join(tmpdir(), 'app-doc-'));
+  tempData.directory = directory;
   await runMigrations(await initDb(join(directory, 'test.db'), { role: 'test' }));
 });
 afterEach(async () => {
@@ -103,7 +108,30 @@ vi.mock('../../env.js', async (original) => ({
   ...(await original<typeof import('../../env.js')>()),
   envValue: (key: string) => process.env[key],
 }));
-vi.mock('../../router.js', () => ({ routeInbound: vi.fn(), registerMessageInterceptor: vi.fn() }));
+vi.mock('../../router.js', async (original) => ({
+  ...(await original<typeof import('../../router.js')>()),
+  routeInbound: vi.fn(),
+}));
+vi.mock('../../config.js', async (original) => {
+  const config = await original<typeof import('../../config.js')>();
+  return {
+    ...config,
+    DEFAULT_MODEL: 'claude-sonnet-5-5',
+    get DATA_DIR() {
+      return tempData.directory ?? config.DATA_DIR;
+    },
+  };
+});
+const tempData = vi.hoisted(() => ({ directory: undefined as string | undefined }));
+import * as runner from '../../container-runner.js';
+import * as roles from '../../modules/permissions/db/user-roles.js';
+import * as wake from '../../request-wake.js';
+import { getStatus } from '../../commands/service.js';
+import { readSessionStatus } from '../../commands/transcript.js';
+import { inboundDbPath, outboundDbPath } from '../../mailbox/sqlite/paths.js';
+import { ensureSchema, openInboundDb, openOutboundDbRw } from '../../mailbox/sqlite/session-db.js';
+import { sessionDir, sessionsBaseDir } from '../../session-manager.js';
+import { findSessionForAgent } from '../../db/sessions.js';
 vi.mock('../../modules/interactive/index.js', () => ({ handleInteractiveResponse: async () => true }));
 const hostWritten = vi.hoisted(() => new Set<string>());
 const mailbox = vi.hoisted(() => ({ containerState: null as ContainerRecord | null }));
@@ -282,6 +310,221 @@ describe('signed HTTP fixture producers', () => {
     );
     return (await getDb().get<Session>("SELECT * FROM sessions WHERE id = 'fixture-session'"))!;
   }
+  it.each(['owner', 'scoped admin'])(
+    'reads only this conversation transcript before and after a turn as %s',
+    async (role) => {
+      if (role === 'scoped admin')
+        await getDb().run("UPDATE user_roles SET role='admin', agent_group_id=? WHERE user_id=?", agent.id, user);
+      const target = `/app/conversations/${conversation}/status`;
+      const expected = fixtures.agentStatusResponse;
+      const project = join(sessionsBaseDir(), agent.id, '.claude-shared', 'projects', '-workspace-agent');
+      mkdirSync(project, { recursive: true });
+      const turn = JSON.stringify({
+        type: 'assistant',
+        message: { id: 'turn', usage: { input_tokens: 19, cache_read_input_tokens: 5, output_tokens: 7 } },
+      });
+      writeFileSync(join(project, 'other-chat.jsonl'), turn);
+      expect(await request('GET', target)).toEqual({ status: 200, body: expected });
+      const session = await agentSession();
+      mkdirSync(sessionDir(agent.id, session.id), { recursive: true });
+      ensureSchema(inboundDbPath(agent.id, session.id), 'inbound');
+      const outbound = outboundDbPath(agent.id, session.id);
+      ensureSchema(outbound, 'outbound');
+      const db = openOutboundDbRw(outbound);
+      db.prepare("INSERT INTO session_state VALUES ('continuation:claude','app-chat','2026-01-01')").run();
+      db.close();
+      expect(await request('GET', target)).toEqual({ status: 200, body: expected });
+      writeFileSync(join(project, 'app-chat.jsonl'), turn);
+      expect((await request('GET', target)).body.status.session).toEqual({
+        turns: 1,
+        contextTokens: 24,
+        outputTokens: 7,
+        contextWindow: 165000,
+        queueDepth: 0,
+      });
+    },
+  );
+
+  it.each([null, 'codex'])('counts the queue before usage exists for provider %s', async (provider) => {
+    const session = await agentSession();
+    await ensureContainerConfig(agent.id);
+    await updateContainerConfigScalars(agent.id, { provider, auto_compact_window: 240000 });
+    mkdirSync(sessionDir(agent.id, session.id), { recursive: true });
+    const inbound = inboundDbPath(agent.id, session.id);
+    ensureSchema(inbound, 'inbound');
+    const db = openInboundDb(inbound);
+    db.prepare("INSERT INTO messages_in (id,kind,timestamp,content) VALUES ('queued','chat','2026-01-01','{}')").run();
+    db.close();
+    const status = (await request('GET', `/app/conversations/${conversation}/status`)).body.status;
+    expect(status.agent.provider).toBe(provider);
+    expect(status.session).toEqual({
+      contextTokens: null,
+      contextWindow: 240000,
+      turns: null,
+      outputTokens: null,
+      queueDepth: 1,
+    });
+    expect(status.options.models).toEqual(provider ? [] : fixtures.agentStatusResponse.status.options.models);
+    for (const model of ['bad model', false]) {
+      const error = await request('PUT', `/app/agents/${agent.id}/settings`, { model });
+      expect(error.status).toBe(400);
+      expect(error.body.allowed).toEqual(status.options.models.map((m: { id: string }) => m.id));
+    }
+  });
+
+  it('keeps transcript usage and other conversations readable while an inbound mailbox is locked', async () => {
+    const session = await agentSession();
+    mkdirSync(sessionDir(agent.id, session.id), { recursive: true });
+    const inbound = inboundDbPath(agent.id, session.id);
+    ensureSchema(inbound, 'inbound');
+    const outbound = outboundDbPath(agent.id, session.id);
+    ensureSchema(outbound, 'outbound');
+    const state = openOutboundDbRw(outbound);
+    state.prepare("INSERT INTO session_state VALUES ('continuation:claude','app-chat','2026-01-01')").run();
+    state.close();
+    const project = join(sessionsBaseDir(), agent.id, '.claude-shared', 'projects', '-workspace-agent');
+    mkdirSync(project, { recursive: true });
+    writeFileSync(
+      join(project, 'app-chat.jsonl'),
+      JSON.stringify({
+        type: 'assistant',
+        message: { id: 'turn', usage: { input_tokens: 9, output_tokens: 4 } },
+      }),
+    );
+    mkdirSync(sessionDir(agent.id, 'other'), { recursive: true });
+    ensureSchema(inboundDbPath(agent.id, 'other'), 'inbound');
+    const target = `/app/conversations/${conversation}/status`;
+    const db = openInboundDb(inbound);
+    db.exec('BEGIN EXCLUSIVE');
+    try {
+      const [locked, other] = await Promise.all([
+        request('GET', target),
+        readSessionStatus(agent.id, 'other', 'session'),
+      ]);
+      expect(locked.status).toBe(200);
+      expect(locked.body.status.session).toMatchObject({
+        queueDepth: null,
+        turns: 1,
+        contextTokens: 9,
+        outputTokens: 4,
+      });
+      expect(other.queueDepth).toBe(0);
+    } finally {
+      db.close();
+    }
+    writeFileSync(outbound, 'broken mailbox');
+    expect((await request('GET', target)).body.status.session).toEqual({
+      queueDepth: 0,
+      turns: null,
+      contextWindow: 165000,
+      contextTokens: null,
+      outputTokens: null,
+    });
+    const telegram = await getStatus(agent.id, { messagingGroupId: conversation, threadId: null });
+    expect(telegram).toMatchObject({ ok: true, view: { queueDepth: 0, contextTokens: null, taskCount: 0 } });
+  }, 4000);
+
+  it('applies both settings as a scoped admin and stops each running container once', async () => {
+    await getDb().run("UPDATE user_roles SET role='admin', agent_group_id=? WHERE user_id=?", agent.id, user);
+    const session = await agentSession();
+    mkdirSync(sessionDir(agent.id, session.id), { recursive: true });
+    ensureSchema(inboundDbPath(agent.id, session.id), 'inbound');
+    vi.spyOn(runner, 'isContainerRunning').mockReturnValue(true);
+    const kill = vi.spyOn(runner, 'killContainer').mockImplementation(() => {});
+    const target = `/app/agents/${agent.id}/settings`;
+    const input = fixtures.agentSettingsRequest;
+    const expected = fixtures.agentSettingsResponse;
+    const errors = fixtures.agentSettingsErrors;
+    expect(await request('PUT', target, { ...input, effort: 'invalid' })).toEqual(errors.invalidEffort);
+    expect(await request('PUT', target, { ...input, model: 'bad model' })).toEqual(errors.invalidModel);
+    expect(await request('PUT', target, {})).toEqual(errors.invalidSettings);
+    expect(await request('PUT', target, { model: 1 })).toEqual(errors.invalidModel);
+    expect(await request('PUT', target, { effort: 1 })).toEqual(errors.invalidEffort);
+    const choices = fixtures.agentStatusResponse.status.options;
+    expect(errors.invalidModel.body.allowed).toEqual(choices.models.map(({ id }) => id));
+    expect(errors.invalidEffort.body.allowed).toEqual(choices.efforts);
+    expect((await request('PUT', target, fixtures.agentSettingsResetRequest)).body.agent.configUpdatedAt).toBeNull();
+    expect(kill).not.toHaveBeenCalled();
+    expect((await request('GET', `/app/conversations/${conversation}/status`)).body).toEqual(
+      fixtures.agentStatusResponse,
+    );
+    const changed = await request('PUT', target, input);
+    expect(changed.status).toBe(200);
+    const { configUpdatedAt } = changed.body.agent;
+    expect(new Date(configUpdatedAt).toISOString()).toBe(configUpdatedAt);
+    expect(changed.body).toEqual({ agent: { ...expected.agent, configUpdatedAt } });
+    expect(await request('PUT', target, input)).toEqual(changed);
+    expect(kill).toHaveBeenCalledTimes(1);
+    expect(kill).toHaveBeenCalledWith(session.id, expect.any(String));
+    expect((await request('PUT', target, { effort: 'low' })).body.agent).toMatchObject({
+      effort: 'low',
+      model: expected.agent.model,
+    });
+    expect((await request('PUT', target, { model: 'sonnet' })).body.agent).toMatchObject({
+      effort: 'low',
+      model: expected.agent.defaultModel,
+    });
+    const resetModel = await request('PUT', target, { model: null });
+    expect(resetModel.body.agent).toMatchObject({ model: { id: null, label: null }, effort: 'low' });
+    expect(kill).toHaveBeenCalledTimes(4);
+    const reset = await request('PUT', target, { effort: null });
+    expect(reset.body.agent).toMatchObject({ model: { id: null, label: null }, effort: null });
+    expect(await request('PUT', target, fixtures.agentSettingsResetRequest)).toEqual(reset);
+    expect(kill).toHaveBeenCalledTimes(5);
+  });
+
+  it('rechecks the actor if admin access changes after device verification', async () => {
+    vi.spyOn(roles, 'hasAdminPrivilege').mockResolvedValue(false);
+    expect((await request('GET', `/app/conversations/${conversation}/status`)).body.status.agent.canEdit).toBe(false);
+    expect(await request('PUT', `/app/agents/${agent.id}/settings`, { effort: 'high' })).toEqual(
+      fixtures.agentSettingsErrors.forbidden,
+    );
+  });
+
+  it('conceals other people and agents outside the signed device scope', async () => {
+    const missing = fixtures.agentSettingsErrors.notFound;
+    const other = await ensureConversation('telegram:another', agent.id);
+    expect(await request('GET', `/app/conversations/${other.id}/status`)).toEqual(missing);
+    await createAgentGroup({
+      id: 'second',
+      name: 'Second',
+      folder: 'second',
+      agent_provider: null,
+      created_at: '2026-01-01',
+    });
+    await getDb().run('INSERT INTO device_auth_user_agents VALUES (?,?,?)', user, 'second', Date.now());
+    const blocked = await ensureConversation(user, 'second');
+    expect(await request('GET', `/app/conversations/${blocked.id}/status`)).toEqual(missing);
+    expect(await request('PUT', '/app/agents/second/settings', { effort: 'low' })).toEqual(missing);
+  });
+
+  it('routes a scoped admin compact message from the signed app to its session mailbox', async () => {
+    await getDb().run("UPDATE user_roles SET role='admin', agent_group_id=? WHERE user_id=?", agent.id, user);
+    await import('../../modules/permissions/index.js');
+    const { routeInbound } = await vi.importActual<typeof import('../../router.js')>('../../router.js');
+    vi.spyOn(wake, 'requestWake').mockResolvedValue(false);
+    const sent = await request('POST', `/app/conversations/${conversation}/messages`, {
+      text: '/compact',
+      fileIds: [],
+      clientId: randomUUID(),
+    });
+    expect(sent.status).toBe(200);
+    await drainRoutingJobs(routeInbound);
+    const session = await findSessionForAgent(agent.id, conversation, null);
+    expect(session).toBeDefined();
+    const db = openInboundDb(inboundDbPath(agent.id, session!.id));
+    const row = db.prepare("SELECT * FROM messages_in WHERE channel_type='app'").get() as {
+      kind: string;
+      channel_type: string;
+      content: string;
+    };
+    db.close();
+    expect(row).toMatchObject({ kind: 'chat', channel_type: 'app' });
+    expect(JSON.parse(row.content)).toMatchObject({ text: '/compact', senderId: user, senderRole: 'admin' });
+    expect(await items()).toMatchObject([
+      { id: sent.body.message.id, role: 'user', text: '/compact', delivery: 'reached' },
+    ]);
+  });
   // Plays the router: the turn is stored in the agent's session, then reported through onStored.
   async function storeInSession(event: InboundEvent): Promise<void> {
     event.onStored?.(await agentSession());

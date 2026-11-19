@@ -13,6 +13,7 @@ import { streamEvents } from './stream.js';
 import { mintFile, renewFileTicket, uploadFile, downloadFile } from './files.js';
 import { registerPushToken } from './push.js';
 import { startCall, endCall, cancelCallAttempt } from './calls.js';
+import { conversationStatus, updateAgentSettings } from './agent-settings.js';
 import { getVoice, patchVoice, listVoices } from './voice.js';
 
 export { json, type AppHandler, type AppRequest } from './http.js';
@@ -35,6 +36,8 @@ export const hello: AppHandler = async ({ res }) => {
 export const routes: readonly AppRoute[] = [
   { method: 'GET', path: '/app/hello', signed: false, handler: hello },
   { method: 'POST', path: '/app/pair', signed: false, handler: handlePair },
+  { method: 'GET', path: '/app/conversations/:id/status', signed: true, handler: conversationStatus },
+  { method: 'PUT', path: '/app/agents/:id/settings', signed: true, handler: updateAgentSettings },
   { method: 'GET', path: '/app/agents', signed: true, handler: listAgents },
   { method: 'PUT', path: '/app/agents/:id', signed: true, handler: setAgentShown },
   { method: 'POST', path: '/app/conversations/:id/unread', signed: true, handler: markUnread },
