@@ -412,6 +412,32 @@ describe('add_reaction - Telegram glyphs', () => {
 });
 
 describe('mesh addresses', () => {
+  it('refuses missing mesh addresses locally and lists the current peers', async () => {
+    const peers = getInboundDb().prepare('INSERT INTO mesh_peers VALUES (?, ?, ?, ?, ?, ?)');
+    peers.run('tester', 'agent', null, null, 'idle', 'ag-test');
+    peers.run('review@repo:mac', 'session', 'mac', 'repo', 'offline', null);
+    seedChannelDestination('gone@repo:mac', 'cli', 'alias');
+    for (const to of ['gone@repo:mac', 'gone@repo', 'gone']) {
+      const result = await sendMessage.handler({ to, text: 'test' });
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toBe(`Error: No mesh peer "${to}" is running. Peers: review@repo:mac, tester`);
+    }
+    const missing = await sendMessage.handler({ to: '@repo', text: 'test' });
+    expect(missing.content[0].text).toBe('Error: Unknown destination "@repo". Known: gone@repo:mac, peer, review@repo:mac, tester');
+    expect(getUndeliveredMessages()).toHaveLength(0);
+    expect((await sendMessage.handler({ to: 'peer', text: 'test' })).isError).toBeFalsy();
+  });
+
+  it('recognizes session addresses even with an empty mesh directory', async () => {
+    for (const to of ['gone@repo', 'gone@repo:mac']) {
+      const result = await sendMessage.handler({ to, text: 'test' });
+      expect(result.content[0].text).toBe(`Error: No mesh peer "${to}" is running. Peers: (none)`);
+    }
+    const missing = await sendMessage.handler({ to: 'gone', text: 'test' });
+    expect(missing.content[0].text).toBe('Error: Unknown destination "gone". Known: peer');
+    expect(getUndeliveredMessages()).toHaveLength(0);
+  });
+
   it('lists public directory fields and routes agent, short and qualified addresses', async () => {
     const { listPeers } = await import('./core.js');
     const insert = getInboundDb().prepare('INSERT INTO mesh_peers VALUES (?, ?, ?, ?, ?, ?)');

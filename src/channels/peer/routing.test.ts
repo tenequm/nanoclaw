@@ -279,6 +279,77 @@ it('creates a dedicated chat per remote, drops omitted heartbeat sessions and en
   }
 });
 
+it('permanently refuses a stale address and a reply to its ended sender, telling the agent once per send', async () => {
+  const remote = await registerTestMachine('ended');
+  const agent = 'test-agent';
+  await createAgentGroup({
+    id: agent,
+    name: agent,
+    folder: agent,
+    agent_provider: null,
+    created_at: new Date().toISOString(),
+  });
+  await setMeshMembership(agent, true);
+  const start = await sendRemote(remote.id, {
+    epoch: 1,
+    id: randomUUID(),
+    from: { session: remote.key },
+    to: { address: agent },
+    text: 'question',
+    hopChain: [],
+    fromMode: null,
+    origin: 'unknown',
+    notifyWhenIdle: false,
+    failureNotice: false,
+  });
+  await drainInbound();
+  const db = getDb();
+  const { getSession } = await import('../../db/sessions.js');
+  const endpoint = await db.get<{ actor: string }>(
+    'SELECT actor FROM peer_endpoints WHERE id=?',
+    start.message.endpoint.id,
+  );
+  const session = (await getSession(endpoint!.actor))!;
+  const inbox = new Database(inboundDbPath(agent, session.id));
+  const outbox = new Database(outboundDbPath(agent, session.id));
+  try {
+    const inbound = inbox.prepare("SELECT id,platform_id FROM messages_in WHERE channel_type='peer'").get() as {
+      id: string;
+      platform_id: string;
+    };
+    const { endRemote } = await import('./lifecycle.js');
+    await endRemote(remote.id, remote.key);
+    const insert = outbox.prepare(
+      "INSERT INTO messages_out(id,timestamp,kind,channel_type,platform_id,in_reply_to,content) VALUES (?,datetime('now'),'chat','peer',?,?,?)",
+    );
+    insert.run('stale', remote.address, null, '{"text":"hello"}');
+    insert.run('reply', inbound.platform_id, inbound.id, '{"text":"answer"}');
+    inbox.exec(`CREATE TRIGGER fail_receipt BEFORE INSERT ON delivered WHEN NEW.message_out_id='reply'
+      BEGIN SELECT RAISE(ABORT, 'failed receipt write'); END`);
+    await deliverSessionMessages(session);
+    expect(inbox.prepare("SELECT id FROM messages_in WHERE json_extract(content,'$.failureNotice')=1").all()).toEqual([
+      { id: 'peer-refusal-stale' },
+    ]);
+    inbox.exec('DROP TRIGGER fail_receipt');
+    await deliverSessionMessages(session);
+    expect(inbox.prepare('SELECT message_out_id,status FROM delivered ORDER BY message_out_id').all()).toEqual([
+      { message_out_id: 'reply', status: 'failed' },
+      { message_out_id: 'stale', status: 'failed' },
+    ]);
+    await deliverSessionMessages(session);
+    const notices = inbox
+      .prepare("SELECT id,content FROM messages_in WHERE json_extract(content,'$.failureNotice')=1 ORDER BY id")
+      .all() as { id: string; content: string }[];
+    expect(notices.map((n) => n.id)).toEqual(['peer-refusal-reply', 'peer-refusal-stale']);
+    for (const notice of notices) expect(JSON.parse(notice.content).text).toMatch(/no longer running/);
+    expect(await db.all('SELECT id FROM peer_messages')).toEqual([{ id: start.message.id }]);
+    expect(await db.get("SELECT count(*) AS n FROM peer_events WHERE kind='message'")).toEqual({ n: 0 });
+  } finally {
+    inbox.close();
+    outbox.close();
+  }
+});
+
 it('resumes the ended process hub chat and endpoints while concurrent keys keep separate chats', async () => {
   const remote = await registerTestMachine('resume');
   const { endRemote } = await import('./lifecycle.js');

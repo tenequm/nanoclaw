@@ -25,6 +25,8 @@ export interface DestinationEntry {
 
 export type SessionMode = { kind: 'chat' } | { kind: 'task'; taskId: string };
 
+const MESH_ADDRESS = /^[a-z0-9][a-z0-9._-]{0,39}(@[a-z0-9][a-z0-9._-]{0,39}(:[a-z0-9][a-z0-9-]{0,15})?)?$/;
+
 function destinationEntry(destination: Destination): DestinationEntry {
   return {
     name: destination.name,
@@ -45,7 +47,8 @@ export function getMeshPeers() {
 }
 
 export function resolveNamedDestination(name: string): DestinationEntry | { error: string } | undefined {
-  const matches = getMeshPeers().filter(
+  const peers = getMeshPeers();
+  const matches = peers.filter(
     (p) => p.address === name || (p.kind === 'session' && p.address.split(':')[0] === name),
   );
   if (matches.length > 1)
@@ -60,8 +63,15 @@ export function resolveNamedDestination(name: string): DestinationEntry | { erro
       ? { ...base, type: 'agent', agentGroupId: peer.agentGroupId }
       : { ...base, type: 'channel', channelType: 'peer', platformId: peer.address };
   }
-  const destination = getAgentMailbox().operations.findDestinationByName(name);
-  return destination && destinationEntry(destination);
+  const meshAddress = MESH_ADDRESS.test(name);
+  const sessionAddress = meshAddress && name.includes('@');
+  if (!sessionAddress) {
+    const destination = getAgentMailbox().operations.findDestinationByName(name);
+    if (destination) return destinationEntry(destination);
+  }
+  if (sessionAddress || (meshAddress && peers.length > 0))
+    return { error: `No mesh peer "${name}" is running. Peers: ${peers.map((p) => p.address).join(', ') || '(none)'}` };
+  return undefined;
 }
 
 export function findByName(name: string): DestinationEntry | undefined {

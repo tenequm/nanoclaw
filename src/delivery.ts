@@ -480,6 +480,13 @@ async function failDelivery(
   agentGroup: AgentGroup,
   err: unknown,
 ): Promise<void> {
+  if (msg.channelType === 'peer') {
+    const { PeerError } = await import('./channels/peer/store.js');
+    if (err instanceof PeerError && err.body.error === 'not_running') {
+      await markFailed(msg, session, agentGroup);
+      return;
+    }
+  }
   const attempts = await recordAttemptRow(msg.id, session.id, err);
   if (attempts !== null && attempts >= MAX_DELIVERY_ATTEMPTS) {
     log.error('Message delivery failed permanently, giving up', {
@@ -638,7 +645,7 @@ async function deliverMessage(
   if (msg.channelType === 'peer') {
     if (!(await hasTable(getDb(), 'peer_machines'))) throw new Error('Peer channel is not installed');
     const { routeAgentPeer } = await import('./channels/peer/routing.js');
-    const reply = await routeAgentPeer(session, msg);
+    const reply = await routeAgentPeer(session, msg, { fromOutbox: true });
     clearOutbox(session.agent_group_id, session.id, msg.id);
     return reply.message.id;
   }

@@ -300,6 +300,7 @@ export async function writeSessionMessage(
      * Dying containers (past first poll) skip these rows.
      */
     onWake?: boolean;
+    failedOutboundId?: string;
   },
 ): Promise<void> {
   // Documented reset: operators `rm -rf` a session folder to clear a stuck
@@ -314,7 +315,7 @@ export async function writeSessionMessage(
   const content = extractAttachmentFiles(agentGroupId, sessionId, message.id, message.content);
 
   await withMailboxSession(agentGroupId, sessionId, async (mailbox) => {
-    await mailbox.insertMessage({
+    const inbound: InboundMessage = {
       id: message.id,
       kind: message.kind,
       timestamp: message.timestamp,
@@ -327,7 +328,8 @@ export async function writeSessionMessage(
       trigger: message.trigger ?? true,
       sourceSessionId: message.sourceSessionId ?? null,
       onWake: message.onWake ?? false,
-    });
+    };
+    await mailbox.insertMessage(inbound, message.failedOutboundId);
   });
   await updateSession(sessionId, { last_active: new Date().toISOString() });
   // Ask for a prompt reconcile now that the message is durable: a wake that

@@ -617,6 +617,7 @@ export function peerText(content: Record<string, unknown>) {
 export async function routeAgentPeer(
   session: Session,
   msg: { id: string; platformId: string | null; content: string },
+  { fromOutbox = false } = {},
 ) {
   const data = JSON.parse(msg.content);
   const hash = createHash('sha256')
@@ -670,6 +671,7 @@ export async function routeAgentPeer(
             platformId: msg.platformId,
             channelType: 'peer',
             content: JSON.stringify({ sender: 'Peer delivery', failureNotice: true, text: error.body.message }),
+            failedOutboundId: fromOutbox && error.body.error === 'not_running' ? msg.id : undefined,
           });
           await requestWake(session, 'inbound-message');
         } catch (writeError) {

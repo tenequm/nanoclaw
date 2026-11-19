@@ -33,9 +33,8 @@ function err(text: string) {
 }
 
 function destinationList(): string {
-  const all = getAllDestinations();
-  if (all.length === 0) return '(none)';
-  return all.map((d) => d.name).join(', ');
+  const names = [...getAllDestinations().map((d) => d.name), ...getMeshPeers().map((p) => p.address)];
+  return [...new Set(names)].join(', ') || '(none)';
 }
 
 /**

@@ -207,7 +207,13 @@ export function wrapSqliteInbound(db: Database.Database, nextSequence = () => ne
           };
         }),
       ),
-    insertMessage: async (message) => insertMessage(db, message, nextSequence()),
+    insertMessage: async (message, failedOutboundId) => {
+      if (failedOutboundId === undefined) return insertMessage(db, message, nextSequence());
+      db.transaction(() => {
+        insertMessage(db, message, nextSequence());
+        markDeliveryFailed(db, failedOutboundId);
+      })();
+    },
     countDueMessages: () => countDueMessages(db),
     markMessageFailed: (messageId) => markMessageFailed(db, messageId),
     retryWithBackoff: (messageId, backoffSec) => retryWithBackoff(db, messageId, backoffSec),
