@@ -1679,6 +1679,7 @@
           "label": "Sonnet 5.5"
         },
         "effort": null,
+        "defaultEffort": "high",
         "provider": null,
         "canEdit": true,
         "configUpdatedAt": null
@@ -1739,6 +1740,7 @@
         "label": "Sonnet 5.5"
       },
       "effort": "high",
+      "defaultEffort": "high",
       "provider": null,
       "canEdit": true,
       "configUpdatedAt": "2026-01-01T00:00:00.000Z"

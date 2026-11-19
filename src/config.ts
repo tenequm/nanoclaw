@@ -2,6 +2,7 @@ import net from 'net';
 import os from 'os';
 import path from 'path';
 
+import { EFFORT_LEVELS } from './commands/types.js';
 import { readEnvFile } from './env.js';
 import { getContainerImageBase, getDefaultContainerImage, getInstallSlug } from './install-slug.js';
 import { isValidTimezone } from './timezone.js';
@@ -13,6 +14,7 @@ const envConfig = readEnvFile([
   'TZ',
   'DEFAULT_AGENT_PROVIDER',
   'NANOCLAW_DEFAULT_MODEL',
+  'NANOCLAW_DEFAULT_EFFORT',
   'NANOCLAW_FAST_MODE',
   'CONTAINER_CPU_LIMIT',
   'CONTAINER_MEMORY_LIMIT',
@@ -52,6 +54,13 @@ export const DEFAULT_AGENT_PROVIDER = (
 // at spawn rather than stamped at creation, so changing it takes effect on the
 // next container start for every group that has not set one.
 export const DEFAULT_MODEL = process.env.NANOCLAW_DEFAULT_MODEL || envConfig.NANOCLAW_DEFAULT_MODEL || '';
+
+// Reasoning effort for groups with no effort of their own, read at spawn like DEFAULT_MODEL. Only a
+// known level counts: a typo leaves the SDK's own default instead of sending an invalid value.
+const defaultEffort = (process.env.NANOCLAW_DEFAULT_EFFORT || envConfig.NANOCLAW_DEFAULT_EFFORT || '')
+  .trim()
+  .toLowerCase();
+export const DEFAULT_EFFORT: string = (EFFORT_LEVELS as readonly string[]).includes(defaultEffort) ? defaultEffort : '';
 
 // Fast serving tier for every agent container: faster output at a higher
 // per-token price. Off unless explicitly turned on, and only by '1' or 'true' —
