@@ -248,3 +248,54 @@ it('fences epochs, rejects future cursors, expires offline messages and omits th
   expect(frames).not.toContain('event: message');
   await reader.cancel();
 });
+
+it('prefers a local address, returns ambiguity candidates, and reserves bare names for agents', async () => {
+  const a = await machine('one'),
+    b = await machine('two'),
+    c = await machine('three');
+  const local = await a.register(),
+    other = await b.register(),
+    third = await c.register();
+  const foreign = await a.register('43-1234abcd');
+  const send = (address: string) => a.call('POST', '/peer/messages', a.send({ address }, '43-1234abcd'));
+  expect(await (await send('review@test')).json()).toMatchObject({ message: { to: { address: local } } });
+  expect(await (await send(other)).json()).toMatchObject({ message: { to: { address: other } } });
+  for (const address of ['@test', foreign])
+    expect(await (await send(address)).json()).toMatchObject({ error: 'bad_address' });
+  expect(await (await send('review')).json()).toMatchObject({ error: 'not_found' });
+  await a.call('POST', '/peer/sessions/' + a.key + '/end', { epoch: a.epoch, reason: 'exited' });
+  expect(await (await send('review@test')).json()).toMatchObject({
+    error: 'ambiguous',
+    candidates: expect.arrayContaining([other, third]),
+  });
+  await c.call('POST', '/peer/sessions/' + c.key + '/end', { epoch: c.epoch, reason: 'exited' });
+  expect(await (await send('review@test')).json()).toMatchObject({ message: { to: { address: other } } });
+  expect(await (await send(third)).json()).toMatchObject({ error: 'not_running' });
+});
+
+it('keeps reports scoped to the receiver and preserves the first final state, including new report values', async () => {
+  const a = await machine('one'),
+    b = await machine('two');
+  await a.register();
+  const address = await b.register();
+  for (const state of ['accepted', 'denied', 'expired', 'delivered', 'refused', 'dropped', 'unknown']) {
+    const message = a.send({ address });
+    expect((await a.call('POST', '/peer/messages', message)).status).toBe(200);
+    const report = { kind: 'state', id: message.id, session: b.key, state, reason: null, at: Date.now() };
+    const submit = (daemon: typeof a, record: typeof report) =>
+      daemon.call('POST', '/peer/reports', { epoch: daemon.epoch, reports: [record] });
+    expect(await (await submit(a, report)).json()).toMatchObject({ results: [{ applied: false, state: 'unknown' }] });
+    expect(await (await submit(b, { ...report, state: 'future_state' })).json()).toMatchObject({
+      results: [{ applied: false, state: 'sent' }],
+    });
+    expect(await (await submit(b, report)).json()).toMatchObject({ results: [{ applied: true, state }] });
+    expect(await (await submit(b, { ...report, state: 'held' })).json()).toMatchObject({
+      results: [{ applied: false, state }],
+    });
+  }
+  const result = await b.call('POST', '/peer/reports', {
+    epoch: b.epoch,
+    reports: [{ kind: 'future', id: randomUUID() }],
+  });
+  expect(await result.json()).toMatchObject({ results: [{ applied: false, state: 'unknown' }] });
+});

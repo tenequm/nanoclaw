@@ -6,11 +6,13 @@ import Database from 'better-sqlite3';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { initTestDb, runMigrations, getDb, closeDb, createAgentGroup } from '../../db/index.js';
 import { createSession } from '../../db/sessions.js';
-import { inboundDbPath } from '../../mailbox/sqlite/paths.js';
+import { initSessionFolder } from '../../session-manager.js';
+import { setDeliveryAdapter, deliverSessionMessages } from '../../delivery.js';
+import { outboundDbPath, inboundDbPath } from '../../mailbox/sqlite/paths.js';
 import { DATA_DIR } from '../../config.js';
 import type { Session } from '../../types.js';
 import { registerSession, setMeshMembership, enrollMachine } from './store.js';
-import { routeAgentPeer, sendRemote } from './routing.js';
+import { drainInbound, routeAgentPeer, sendRemote } from './routing.js';
 
 vi.mock('../../config.js', async (original) => ({
   ...(await original<typeof import('../../config.js')>()),
@@ -69,11 +71,21 @@ it('delivers a reply only to the agent session that asked, even when another ses
   };
   await createSession(session);
   await createSession({ ...session, id: 'sess-newer', last_active: new Date().toISOString() });
-  await routeAgentPeer(session, {
-    id: 'ask',
-    platformId: remote.address,
-    content: JSON.stringify({ text: 'question' }),
-  });
+  initSessionFolder(agent, session.id);
+  const outbox = new Database(outboundDbPath(agent, session.id));
+  try {
+    outbox
+      .prepare(
+        "INSERT INTO messages_out(id,timestamp,kind,platform_id,channel_type,content) VALUES ('ask',datetime('now'),'chat',?,'peer',?)",
+      )
+      .run(remote.address, JSON.stringify({ text: 'question' }));
+  } finally {
+    outbox.close();
+  }
+  const external = vi.fn();
+  setDeliveryAdapter({ deliver: external });
+  await deliverSessionMessages(session);
+  expect(external).not.toHaveBeenCalled();
   const endpoint = await getDb().get<{ id: string }>('SELECT id FROM peer_endpoints WHERE actor=?', session.id);
   const reply = {
     epoch: 1,
@@ -92,6 +104,7 @@ it('delivers a reply only to the agent session that asked, even when another ses
   };
   await sendRemote(remote.id, reply, 'retry-hash');
   await sendRemote(remote.id, reply, 'retry-hash');
+  await drainInbound();
   const inbox = new Database(inboundDbPath(agent, session.id), { readonly: true });
   try {
     const rows = inbox.prepare('SELECT content,channel_type FROM messages_in').all() as {

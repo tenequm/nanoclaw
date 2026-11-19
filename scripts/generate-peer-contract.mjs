@@ -43,6 +43,16 @@ for (const name of [
   'SendRequest',
 ])
   includeSchema(name);
+// Protocol 1 readers ignore new status, report kind and reason values.
+delete requestSchemas.StateReport.properties.state.enum;
+delete requestSchemas.DropReason.enum;
+delete requestSchemas.SessionRegisterRequest.properties.status.enum;
+delete requestSchemas.HeartbeatRequest.properties.sessions.items.properties.status.enum;
+requestSchemas.Report.oneOf.push({
+  type: 'object',
+  required: ['kind', 'id'],
+  properties: { kind: { type: 'string', not: { enum: ['idle', 'state'] } }, id: { $ref: '#/components/schemas/Uuid' } },
+});
 await writeFile(
   new URL('requests.json', dir),
   JSON.stringify({ components: { schemas: requestSchemas } }, null, 2) + '\n',

@@ -206,15 +206,25 @@ function label(value: string) {
 }
 export async function setMeshMembership(agentId: string, member: boolean) {
   const db = getDb();
-  if (member) {
-    const agent = await db.get<{ name: string }>('SELECT name FROM agent_groups WHERE id=?', agentId);
-    if (!agent) fail(404, 'not_found', 'Agent is not registered.');
-    await db.run(
-      'INSERT INTO mesh_members(agent_group_id,address) VALUES (?,?) ON CONFLICT(agent_group_id) DO NOTHING',
+  await db.transaction(async () => {
+    if (member) {
+      const agent = await db.get<{ name: string }>('SELECT name FROM agent_groups WHERE id=?', agentId);
+      if (!agent) fail(404, 'not_found', 'Agent is not registered.');
+      await db.run(
+        'INSERT INTO mesh_members(agent_group_id,address) VALUES (?,?) ON CONFLICT(agent_group_id) DO NOTHING',
+        agentId,
+        label(agent.name),
+      );
+    } else await db.run('DELETE FROM mesh_members WHERE agent_group_id=?', agentId);
+    const endpoints = await db.all<{ id: string }>(
+      'SELECT e.id FROM peer_endpoints e JOIN sessions s ON s.id=e.actor WHERE s.agent_group_id=?',
       agentId,
-      label(agent.name),
     );
-  } else await db.run('DELETE FROM mesh_members WHERE agent_group_id=?', agentId);
+    if (endpoints.length) {
+      const { announceEndpoint } = await import('./routing.js');
+      for (const e of endpoints) await announceEndpoint(e.id);
+    }
+  });
   meshChanged();
 }
 export async function isMeshMember(agentId: string) {
@@ -273,6 +283,12 @@ export async function registerSession(
     }
     const now = Date.now();
     const registeredAt = prior?.registered_at ?? now;
+    const status =
+      request.status === 'idle' || request.status === 'busy'
+        ? request.status
+        : prior?.status === 'idle'
+          ? 'idle'
+          : 'busy';
     await db.run(
       `INSERT INTO peer_sessions (id,machine_id,key,name,project,address,status,registry_json,registered_at,updated_at)
       VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(machine_id,key) DO UPDATE SET name=excluded.name,project=excluded.project,
@@ -283,12 +299,12 @@ export async function registerSession(
       name,
       project,
       address(),
-      request.status,
+      status,
       JSON.stringify({ name: request.name, sessionId: request.sessionId, startedAt: request.startedAt }),
       registeredAt,
       now,
     );
-    return { key, address: address(), name, project, machine: machine.name, status: request.status, registeredAt };
+    return { key, address: address(), name, project, machine: machine.name, status, registeredAt };
   });
   meshChanged();
   return session;

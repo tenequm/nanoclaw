@@ -282,6 +282,9 @@ async function queue(sender: Actor, target: Actor, scope: string, input: Send): 
     if (queued!.n >= limits.offlineQueueMax) fail(409, 'queue_full', 'Offline queue is full.');
   }
   const chain = input.chain ?? JSON.parse(conversation!.chain);
+  // Receipts name only the recipient session and the wire id.
+  if (target.remote && (await db.get('SELECT 1 FROM peer_messages WHERE recipient=? AND id=?', target.id, input.id)))
+    fail(409, 'id_conflict', 'Message id already used for this recipient.');
   const row = randomUUID();
   const from = target.remote && (await endpoint(sender, target.remote));
   const to = sender.remote && (await endpoint(target, sender.remote));
@@ -466,7 +469,6 @@ export async function sendRemote(machineId: string, request: SendRequest, hash: 
       failure: request.failureNotice,
     });
   });
-  await drainInbound();
   if (
     result.message.state === 'refused' &&
     (await getDb().get(

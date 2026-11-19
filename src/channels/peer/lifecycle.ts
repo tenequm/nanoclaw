@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { log } from '../../log.js';
 import { getDb } from '../../db/connection.js';
 import { appendEvent, announceEndpoint, type MessageRow } from './routing.js';
 import { checkEpoch, fail, limits, meshChanged, remoteById, remoteSession } from './store.js';
@@ -107,11 +108,11 @@ export async function heartbeat(machineId: string, body: HeartbeatRequest) {
     let changed = false;
     for (const s of live) {
       const status = reported.get(s.key);
-      if (!status) {
+      if (!reported.has(s.key)) {
         await endRemote(machineId, s.key);
         ended.push(s.key);
         changed = true;
-      } else if (s.status !== status) {
+      } else if ((status === 'busy' || status === 'idle') && s.status !== status) {
         await db.run(
           'UPDATE peer_sessions SET status=?,updated_at=? WHERE machine_id=? AND key=?',
           status,
@@ -134,6 +135,11 @@ export async function reports(machineId: string, body: ReportsRequest) {
     await checkEpoch(machineId, body.epoch);
     const results: ReportsResponse['results'] = [];
     for (const report of body.reports) {
+      const { kind, id } = report;
+      if (kind !== 'idle' && kind !== 'state') {
+        results.push({ id, state: 'unknown', applied: false });
+        continue;
+      }
       const remote = await remoteSession(machineId, report.session);
       const row =
         remote &&
@@ -163,6 +169,9 @@ export async function reports(machineId: string, body: ReportsRequest) {
             await endRemote(machineId, report.session);
             ended = true;
           }
+        } else {
+          if (row.state === 'queued') await advanceDelivery(row, 'sent', null, report.at);
+          log.info('Unknown peer delivery state', { id });
         }
       }
       results.push({ id: report.id, state: row?.state ?? 'unknown', applied });

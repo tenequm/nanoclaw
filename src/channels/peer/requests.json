@@ -120,10 +120,6 @@
           },
           "status": {
             "type": "string",
-            "enum": [
-              "idle",
-              "busy"
-            ],
             "description": "The registry's status; waiting and others map to busy."
           },
           "entrypoint": {
@@ -215,11 +211,7 @@
                   "$ref": "#/components/schemas/SessionKey"
                 },
                 "status": {
-                  "type": "string",
-                  "enum": [
-                    "idle",
-                    "busy"
-                  ]
+                  "type": "string"
                 }
               }
             }
@@ -258,6 +250,27 @@
           },
           {
             "$ref": "#/components/schemas/IdleReport"
+          },
+          {
+            "type": "object",
+            "required": [
+              "kind",
+              "id"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "not": {
+                  "enum": [
+                    "idle",
+                    "state"
+                  ]
+                }
+              },
+              "id": {
+                "$ref": "#/components/schemas/Uuid"
+              }
+            }
           }
         ],
         "discriminator": {
@@ -291,17 +304,7 @@
             "description": "The receiving session."
           },
           "state": {
-            "type": "string",
-            "enum": [
-              "accepted",
-              "held",
-              "delivered",
-              "denied",
-              "expired",
-              "refused",
-              "dropped",
-              "unknown"
-            ]
+            "type": "string"
           },
           "reason": {
             "oneOf": [
@@ -325,19 +328,7 @@
       },
       "DropReason": {
         "description": "Claude Code's guard (rate-limited, queue-full: retried after pacing, then dropped;\nduplicate, hop-loop, hop-runaway: never retried); oversized (over the native line\nlimit, refused before writing); session_gone (the inbox no longer accepts);\nunknown_session (the daemon does not host that key, L18); queue_expired (past\nqueueTtlMs, D19); ended (the target ended with it queued). Open set.",
-        "type": "string",
-        "enum": [
-          "rate-limited",
-          "queue-full",
-          "duplicate",
-          "hop-loop",
-          "hop-runaway",
-          "oversized",
-          "session_gone",
-          "unknown_session",
-          "queue_expired",
-          "ended"
-        ]
+        "type": "string"
       },
       "IdleReport": {
         "description": "The turn the message started has ended.",
