@@ -81,6 +81,7 @@ export interface FileRow {
   upload_key: string | null;
   name: string;
   mime_type: string;
+  duration_ms: number | null;
   size: number;
   kind: string;
   width: number | null;
@@ -143,5 +144,13 @@ registerMigration({
   name: 'module:app:message-card',
   async up(db) {
     await db.exec('ALTER TABLE app_messages ADD COLUMN card_json TEXT');
+  },
+});
+
+registerMigration({
+  version: 1,
+  name: 'module:app:voice-messages',
+  async up(db) {
+    await db.exec('ALTER TABLE app_files ADD COLUMN duration_ms INTEGER');
   },
 });

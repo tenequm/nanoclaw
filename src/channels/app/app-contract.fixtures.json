@@ -1393,6 +1393,37 @@
       }
     }
   },
+  "voiceMessages": {
+    "fileInitRequest": {
+      "uploadKey": "ab1b4596-10bb-43aa-bdd6-20876ca375ce",
+      "name": "voice.m4a",
+      "mimeType": "audio/mp4",
+      "size": 24,
+      "sha256": "5ce6b1f7f3e467a670414f51e0159add65b349eba7a21a024223190a7a43e7df",
+      "durationMs": 1250
+    },
+    "headerHex": "00000018667479704d3441200000000069736f6d6d703432",
+    "pendingFile": {
+      "id": "file_recording",
+      "name": "voice.m4a",
+      "mimeType": "audio/mp4",
+      "size": 24,
+      "kind": "audio",
+      "width": null,
+      "height": null,
+      "durationMs": 1250,
+      "transcript": {
+        "state": "pending"
+      }
+    },
+    "done": {
+      "state": "done",
+      "text": "Sample recording."
+    },
+    "failed": {
+      "state": "failed"
+    }
+  },
   "fileInitRequest": {
     "uploadKey": "c7d1e2f3-4a5b-4c6d-8e7f-90a1b2c3d4e5",
     "name": "notes.txt",
