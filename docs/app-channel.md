@@ -12,6 +12,7 @@ API. Whole messages arrive after a working status, without token streaming.
 | ------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------- |
 | `APP_PUBLIC_BASE`                                            | Public HTTPS base, such as `https://app.example.com`, used in pairing and push host identity.                        | None by itself.                                                                     |
 | `NANOCLAW_ENCRYPTION_KEY`                                    | Host-only encryption key; HKDF-SHA256 derives a separate 32-byte upload-ticket key with info `heydan-app-ticket-v1`. | `files` when the key parses.                                                        |
+| `OPENAI_API_KEY`                                             | Host credential for voice transcription.                                                                             | `voice-messages` when `files` is enabled.                                           |
 | `APP_LIVEKIT_URL`                                            | Public WebSocket address returned in app call grants.                                                                | `calls`, `voice-picker` when set.                                                   |
 | `APP_APNS_TEAM_ID`                                           | Apple developer team for push signing.                                                                               | `push` with a topic, a public base and at least one readable P-256 environment key. |
 | `APP_APNS_TOPIC`                                             | App bundle topic: your application bundle identifier. No default; push stays off without it.                         | Required for `push`.                                                                |
@@ -31,7 +32,7 @@ Pairing starts with `/pair` in Telegram, restricted to an owner or admin over
 the target agent. Paste its single-use link into the app within 10 minutes. The code is in
 the URL fragment and is submitted only in the pairing body. The phone proves possession
 of its P-256 private key; the host stores its public key and the permitted agent set.
-Only paired agents appear, not every agent the user's role could otherwise access.
+Pairing shows the agents wired to that chat in the person's app.
 
 Every successful pairing sends a direct notice with the device name, UTC time and revocation
 instructions, after the pairing has been answered; a failed or slow notice does not undo or
@@ -61,6 +62,23 @@ restart. Only hello, pairing and ticketed uploads omit request signatures. Uploa
 are limited to one file's exact size and hash, expire after one hour and remain subject to
 device revocation. Never paste links or authorization headers into logs or reports.
 
+## Agents
+
+The signed agent list contains the agents the person administers that have a non-app chat, are
+already shown, or have an existing app conversation with that person. Each entry includes the
+oldest named non-app chat, or null if none has a name. The list sorts by agent name, then chat,
+ignoring case. A CLI-paired device can only list or change agents in its pairing scope.
+Showing or hiding an agent changes the person's list across devices. Open streams receive the
+conversation and an updated badge. A hide sets `hidden: true` on the final conversation event
+and stops delivery to that person's devices. Hiding before a conversation exists creates no app
+wiring. Showing a hidden conversation again, including through pairing, restores its history
+and updates the badge on the person's live devices.
+
+The `agents` and `unread` features are always available on this host version. Marking a conversation
+unread moves its shared read order back only if needed to make the newest agent message or
+question unread. The response includes the conversation and device badge. If there is no such
+item, the host returns `409 nothing_unread`.
+
 ## Routes
 
 All paths below are under `/app`. `:id` denotes an opaque identifier.
@@ -69,6 +87,9 @@ All paths below are under `/app`. `:id` denotes an opaque identifier.
 | ------ | ----------------------------------- | ---------------------------------------------- | ------------- |
 | GET    | `/hello`                            | Versions and configured features               | None          |
 | POST   | `/pair`                             | Consume pairing code and proof                 | Pairing proof |
+| GET    | `/agents`                           | List candidates and their shown state          | Signature     |
+| PUT    | `/agents/:id`                       | Set whether the person shows an agent          | Signature     |
+| POST   | `/conversations/:id/unread`         | Mark the newest agent item unread              | Signature     |
 | GET    | `/conversations`                    | Conversations, statuses and badge              | Signature     |
 | GET    | `/conversations/:id/messages`       | History; `before` or `after`, optional `limit` | Signature     |
 | POST   | `/conversations/:id/messages`       | Store and enqueue a message                    | Signature     |
@@ -125,6 +146,27 @@ The stream cursor advances only on stream events or `synchronized`, never on RES
 Read state is shared between the user's devices. The first question answer wins; another
 choice returns the current question with `not_open`. The server expires buttons at the
 runner's deadline or when the agent stops waiting.
+
+## Voice messages
+
+| Configuration or route                 | Voice message behavior                                                                                                                  |
+| -------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| `OPENAI_API_KEY`                       | A configured key and enabled uploads advertise `voice-messages` in `GET /app/hello`.                                                    |
+| `POST /app/files`                      | Mint with `mimeType: "audio/mp4"` or `"audio/x-m4a"` and a nonnegative integer `durationMs` for recordings. Omit it for ordinary files. |
+| `PUT /app/files/:id`                   | Upload up to 25 MiB. The host checks for an M4A brand in the ISO BMFF file type box.                                                    |
+| `GET /app/files/:id`                   | Download the recording as `audio/mp4`.                                                                                                  |
+| `POST /app/conversations/:id/messages` | Send the uploaded file id in `fileIds` with `text: ""`.                                                                                 |
+
+The send response contains an audio attachment with `kind: "audio"`, the supplied duration,
+and `transcript: {"state":"pending"}`. The conversation preview reads "Voice message".
+The host transcribes in the background. Devices with access receive a message event with the
+same id and creation order and a newer seq. Its attachment carries
+`{"state":"done","text":"..."}` or `{"state":"failed"}` in `transcript`. If the recording
+is still the last message, its completed transcript becomes the preview.
+
+The agent receives a staged voice attachment after transcription finishes. A successful
+transcript appears beside the file in the agent's prompt. Failure still delivers the audio.
+The host retries an interrupted transcription once across restarts.
 
 ## Push and calls
 

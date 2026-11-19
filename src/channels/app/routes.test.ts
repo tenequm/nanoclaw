@@ -7,7 +7,7 @@ import { canonicalSigningText } from './contract.js';
 import { consumeRateLimit } from '../../modules/device-auth/rate-limit.js';
 import { onDeviceRevoked } from '../../modules/device-auth/verify.js';
 import { Socket } from 'node:net';
-import { afterEach, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { closeDb, initDb } from '../../db/connection.js';
 import { runMigrations } from '../../db/migrations/index.js';
 import { routes, dispatchApp } from './routes.js';
@@ -24,7 +24,12 @@ vi.mock('../../env.js', async (original) => {
   return { ...env, envValue: vi.fn(env.envValue) };
 });
 let databaseDirectory: string | undefined;
+beforeEach(() => {
+  vi.stubEnv('OPENAI_API_KEY', undefined);
+  resetAppConfigCache();
+});
 afterEach(async () => {
+  vi.unstubAllEnvs();
   await closeDb();
   if (databaseDirectory) rmSync(databaseDirectory, { recursive: true, force: true });
   databaseDirectory = undefined;
@@ -56,7 +61,10 @@ async function request(method: string, target: string, peer = '127.0.0.1', autho
 }
 it('serves hello with the contract shape without credentials', async () => {
   vi.spyOn(Date, 'now').mockReturnValue(fixtures.hello.serverTime);
-  expect(await request('GET', '/app/hello')).toEqual({ status: 200, body: { ...fixtures.hello, features: [] } });
+  expect(await request('GET', '/app/hello')).toEqual({
+    status: 200,
+    body: { ...fixtures.hello, features: ['agents', 'unread'] },
+  });
 });
 it('reads the configuration for unsigned hello requests at most once a minute', async () => {
   resetAppConfigCache();
@@ -122,7 +130,13 @@ it('keeps recorded nonces across a reboot', async () => {
   expect(await db.all('SELECT device_id, nonce FROM device_auth_nonces')).toEqual([{ device_id: 'd', nonce: 'n' }]);
 });
 it('advertises only configured features and derives a domain-separated ticket key', () => {
-  expect(configuredFeatures(readAppConfig(() => undefined))).toEqual([]);
+  vi.stubEnv('OPENAI_API_KEY', 'fixture-only');
+  expect(configuredFeatures(readAppConfig(() => undefined))).toEqual(['agents', 'unread']);
+  for (const uploadKey of [undefined, 'invalid']) {
+    expect(
+      configuredFeatures(readAppConfig((key) => (key === 'OPENAI_API_KEY' ? 'fixture-only' : uploadKey))),
+    ).not.toContain('voice-messages');
+  }
   const env: Record<string, string> = {
     NANOCLAW_ENCRYPTION_KEY: Buffer.alloc(32, 7).toString('base64'),
     APP_LIVEKIT_URL: 'wss://example.test',
@@ -131,7 +145,7 @@ it('advertises only configured features and derives a domain-separated ticket ke
     APP_APNS_SANDBOX_KEY_PATH: '/test.p8',
   };
   const config = readAppConfig((key) => env[key]);
-  expect(configuredFeatures(config)).toEqual(['files', 'calls', 'voice-picker']);
+  expect(configuredFeatures(config)).toEqual(['agents', 'unread', 'files', 'calls', 'voice-picker']);
   expect(config.ticketKey).toHaveLength(32);
   expect(config.ticketKey).not.toEqual(Buffer.alloc(32, 7));
   expect(config.apns.production).toBeNull();

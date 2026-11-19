@@ -3,7 +3,12 @@ import { setImmediate as yieldToHost } from 'node:timers/promises';
 import { lastEventSeq, readEventsAfter, onEventAppended } from './log.js';
 import { onBadgeChanged, conversationsFor, badgeFor } from './conversations.js';
 import { statuses, onStatusChanged } from './status.js';
-import { getLiveDevice, reachableAgentIds, onDeviceRevoked } from '../../modules/device-auth/verify.js';
+import {
+  devicePermitsAgent,
+  getLiveDevice,
+  reachableAgentIds,
+  onDeviceRevoked,
+} from '../../modules/device-auth/verify.js';
 import { formatEvent, type Badge, type Status } from './contract.js';
 import type { ConversationRow, EventRow } from './db.js';
 import { json, type AppHandler, type AppRequest } from './routes.js';
@@ -12,7 +17,7 @@ export interface StreamDeps {
   lastEventSeq(): Promise<number>;
   readEventsAfter(after: number, limit: number, userId: string): Promise<EventRow[]>;
   onEventAppended(listener: (event: EventRow) => void): () => void;
-  onBadgeChanged(listener: (userId: string) => void): () => void;
+  onBadgeChanged: typeof onBadgeChanged;
   onStatusChanged(listener: (status: Status) => void): () => void;
   conversationsFor(userId: string, agentIds: string[]): Promise<ConversationRow[]>;
   badgeFor(userId: string, agentIds: string[]): Promise<Badge>;
@@ -33,7 +38,7 @@ export function configureStream(deps: StreamDeps = defaults): void {
   configured = deps;
 }
 const streams = new Map<string, Set<() => void>>();
-type Pending = { event: EventRow } | { status: Status } | { badge: true } | { ping: true };
+type Pending = { event: EventRow } | { status: Status } | { badge: true; agentId?: string } | { ping: true };
 
 export const streamEvents: AppHandler = (ctx) => openStream(ctx, configured);
 export async function openStream({ req, res, identity }: AppRequest, deps: StreamDeps): Promise<void> {
@@ -71,15 +76,18 @@ export async function openStream({ req, res, identity }: AppRequest, deps: Strea
   active.add(close);
   if (active.size > 3) active.values().next().value!();
   let access: { ids: string[]; at: number } | undefined;
+  let accessVersion = 0;
   async function agents(): Promise<string[]> {
     if (closed) return [];
     if (access && Date.now() - access.at < 2_000) return access.ids;
+    const version = accessVersion;
     if (!(await getLiveDevice(identity!.deviceId))) {
       close();
       return [];
     }
     const at = Date.now();
     const ids = await reachableAgentIds(identity!.deviceId);
+    if (version !== accessVersion) return agents();
     access = { ids, at };
     return ids;
   }
@@ -106,11 +114,17 @@ export async function openStream({ req, res, identity }: AppRequest, deps: Strea
   }
   async function event(row: EventRow): Promise<void> {
     if (row.seq <= cursor) return;
-    if (row.user_id === identity!.userId && (await agents()).includes(row.agent_group_id)) {
+    if (row.user_id !== identity!.userId) return;
+    const allowed = (await agents()).includes(row.agent_group_id);
+    if (allowed || row.kind === 'conversation') {
       const data = JSON.parse(row.entity_json);
-      // Pre-card snapshots remain in the replay log.
-      if (row.kind === 'message') data.card ??= null;
-      await write(formatEvent({ kind: row.kind, data, id: row.seq }));
+      // A hide removes reachability in the same commit. Its final snapshot still requires device and role access.
+      const hidden = row.kind === 'conversation' && data.hidden === true;
+      if (allowed || (hidden && (await devicePermitsAgent(identity!.deviceId, row.agent_group_id)))) {
+        // Pre-card snapshots remain in the replay log.
+        if (row.kind === 'message') data.card ??= null;
+        await write(formatEvent({ kind: row.kind, data, id: row.seq }));
+      }
     }
     cursor = row.seq;
   }
@@ -120,9 +134,10 @@ export async function openStream({ req, res, identity }: AppRequest, deps: Strea
     if (conversations.some((c) => c.id === value.conversationId && allowed.includes(c.agent_group_id)))
       await write(formatEvent({ kind: 'status', data: value }));
   }
-  async function badge(): Promise<void> {
+  async function badge(agentId?: string): Promise<void> {
     let allowed = await agents();
     while (!closed) {
+      if (agentId && !allowed.includes(agentId)) return;
       const value = await deps!.badgeFor(identity!.userId, allowed);
       const current = await agents();
       if (current.length === allowed.length && current.every((id) => allowed.includes(id))) {
@@ -147,7 +162,7 @@ export async function openStream({ req, res, identity }: AppRequest, deps: Strea
         const item = pending.shift()!;
         if ('event' in item) await event(item.event);
         else if ('status' in item) await status(item.status);
-        else if ('badge' in item) await badge();
+        else if ('badge' in item) await badge(item.agentId);
         else {
           await agents();
           await write(formatEvent({ comment: 'ping' }));
@@ -168,12 +183,17 @@ export async function openStream({ req, res, identity }: AppRequest, deps: Strea
   try {
     cleanup.push(
       deps.onEventAppended((row) => {
-        if (row.user_id === identity.userId) enqueue({ event: row });
+        if (row.user_id !== identity.userId) return;
+        if (row.kind === 'conversation') {
+          accessVersion++;
+          access = undefined;
+        }
+        enqueue({ event: row });
       }),
     );
     cleanup.push(
-      deps.onBadgeChanged((user) => {
-        if (user === identity.userId) enqueue({ badge: true });
+      deps.onBadgeChanged((user, agentId) => {
+        if (user === identity.userId) enqueue({ badge: true, agentId });
       }),
     );
     cleanup.push(deps.onStatusChanged((value) => enqueue({ status: value })));

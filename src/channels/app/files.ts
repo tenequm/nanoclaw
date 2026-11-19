@@ -76,9 +76,10 @@ function reference(row: StoredFile): FileAttachment {
   return {
     id: row.id,
     name: row.name,
-    mimeType: row.mime_type,
+    mimeType: row.kind === 'audio' ? 'audio/mp4' : row.mime_type,
     size: row.size,
-    kind: row.kind as 'image' | 'file',
+    kind: row.kind,
+    ...(row.kind === 'audio' && row.duration_ms !== null ? { durationMs: row.duration_ms } : {}),
     width: row.width,
     height: row.height,
   };
@@ -95,7 +96,18 @@ async function readHead(file: string): Promise<Buffer> {
     await handle.close();
   }
 }
-export function fileMetadata(data: Buffer, name: string) {
+function isM4a(data: Buffer): boolean {
+  if (data.length < 16 || data.toString('latin1', 4, 8) !== 'ftyp') return false;
+  const end = data.readUInt32BE(0);
+  if (end < 16 || end > data.length || end % 4 !== 0) return false;
+  for (let offset = 8; offset < end; offset += 4) {
+    if (offset !== 12 && data.toString('latin1', offset, offset + 4) === 'M4A ') return true;
+  }
+  return false;
+}
+
+export function fileMetadata(data: Buffer, name: string, recording = false) {
+  if (recording && isM4a(data)) return { mimeType: 'audio/mp4', kind: 'audio' as const, width: null, height: null };
   let mimeType =
     (
       {
@@ -244,7 +256,13 @@ export function createFileService(deps: FileDeps) {
       refuse(400, 'bad_request', 'Invalid JSON.');
     }
     if (!input || typeof input !== 'object') refuse(400, 'bad_request', 'Invalid file metadata.');
-    const { uploadKey, size, sha256, mimeType } = input;
+    const { uploadKey, size, sha256, durationMs } = input;
+    const mimeType = input.mimeType === 'audio/x-m4a' ? 'audio/mp4' : input.mimeType;
+    if (
+      durationMs !== undefined &&
+      (mimeType !== 'audio/mp4' || !Number.isSafeInteger(durationMs) || Number(durationMs) < 0)
+    )
+      refuse(400, 'bad_request', 'Invalid audio duration.');
     if (!Number.isSafeInteger(size) || Number(size) < 1 || Number(size) > MAX_BYTES)
       throw new FileError(413, 'too_large', 'A file can be at most 25 MB.', { maxBytes: MAX_BYTES });
     if (
@@ -263,7 +281,7 @@ export function createFileService(deps: FileDeps) {
       await deps
         .db()
         .run(
-          'INSERT INTO app_files (id,user_id,device_id,upload_key,name,mime_type,size,sha256,kind,created_at) VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT (user_id,upload_key) DO NOTHING',
+          'INSERT INTO app_files (id,user_id,device_id,upload_key,name,mime_type,size,sha256,duration_ms,kind,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT (user_id,upload_key) DO NOTHING',
           `file_${randomUUID()}`,
           identity.userId,
           identity.deviceId,
@@ -272,6 +290,7 @@ export function createFileService(deps: FileDeps) {
           mimeType,
           size,
           sha256,
+          durationMs ?? null,
           'file',
           Date.now(),
         );
@@ -280,7 +299,8 @@ export function createFileService(deps: FileDeps) {
         .get<StoredFile>('SELECT * FROM app_files WHERE user_id = ? AND upload_key = ?', identity.userId, uploadKey))!;
       if (
         existing.name !== name ||
-        existing.mime_type !== mimeType ||
+        (existing.mime_type === 'audio/x-m4a' ? 'audio/mp4' : existing.mime_type) !== mimeType ||
+        existing.duration_ms !== (durationMs ?? null) ||
         existing.size !== size ||
         existing.sha256 !== sha256
       )
@@ -356,6 +376,8 @@ export function createFileService(deps: FileDeps) {
         refuse(400, 'bad_body', 'The request body does not match its signature.');
       await handle.close();
       await live();
+      const metadata = fileMetadata(await readHead(temporary), row.name, row.duration_ms !== null);
+      if (row.duration_ms !== null && metadata.kind !== 'audio') refuse(400, 'bad_body', 'Expected an M4A audio file.');
       try {
         await fs.link(temporary, target);
         published = true;
@@ -367,7 +389,6 @@ export function createFileService(deps: FileDeps) {
           refuse(409, 'conflict', 'Different bytes were already uploaded for this file.');
       }
       await live();
-      const metadata = fileMetadata(await readHead(target), row.name);
       const result = await deps
         .db()
         .run(
@@ -405,7 +426,12 @@ export function createFileService(deps: FileDeps) {
     const handle = await fs.open(row.storage_path, 'r');
     try {
       ctx.res.writeHead(200, {
-        'Content-Type': SERVED_TYPES.has(row.mime_type) ? row.mime_type : 'application/octet-stream',
+        'Content-Type':
+          row.kind === 'audio'
+            ? 'audio/mp4'
+            : SERVED_TYPES.has(row.mime_type)
+              ? row.mime_type
+              : 'application/octet-stream',
         'X-Content-Type-Options': 'nosniff',
         'Content-Security-Policy': 'sandbox',
         'Content-Length': row.size,
@@ -444,7 +470,7 @@ export function createFileService(deps: FileDeps) {
       );
     return { ok: true, files: rows.map(reference) };
   }
-  async function stageFiles(messageId: string) {
+  async function stageFiles(messageId: string, files: FileAttachment[] = []) {
     const rows = await deps.db().all<StoredFile>('SELECT * FROM app_files WHERE message_id = ?', messageId);
     const result = [];
     for (const row of rows) {
@@ -452,7 +478,18 @@ export function createFileService(deps: FileDeps) {
       await fs.mkdir(directory, { recursive: true });
       const stagedPath = path.join(directory, cleanName(row.name));
       await fs.copyFile(row.storage_path!, stagedPath);
-      result.push({ name: row.name, mimeType: row.mime_type, size: row.size, stagedPath });
+      const file = reference(row);
+      const transcript = files.find((f) => f.id === row.id)?.transcript;
+      result.push({
+        name: file.name,
+        mimeType: file.mimeType,
+        size: file.size,
+        stagedPath,
+        ...(file.kind === 'audio'
+          ? { type: 'voice', durationSeconds: row.duration_ms === null ? null : row.duration_ms / 1000 }
+          : {}),
+        ...(transcript?.state === 'done' ? { transcript: transcript.text } : {}),
+      });
     }
     return result;
   }
@@ -549,7 +586,7 @@ export function configureFiles(deps: Partial<FileDeps> = {}) {
 configureFiles();
 setAppHooks({
   claimFiles: (db, claim) => service.claimFiles(db, claim),
-  stageFiles: (messageId) => service.stageFiles(messageId),
+  stageFiles: (messageId, files) => service.stageFiles(messageId, files),
   storeOutboundFiles: (input) => service.storeOutboundFiles(input),
 });
 let stopCleanup: (() => void) | undefined;

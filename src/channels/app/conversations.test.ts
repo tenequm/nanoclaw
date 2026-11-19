@@ -948,7 +948,7 @@ it('notifies another device of the committed badge when a conversation is read',
   try {
     const read = await request(markRead, { order: (await message(id)).order });
     expect(read.status).toBe(200);
-    expect(listener).toHaveBeenCalledExactlyOnceWith('telegram:owner');
+    expect(listener).toHaveBeenCalledExactlyOnceWith('telegram:owner', 'ag_taylor');
     expect(await Promise.all(updates)).toEqual([{ kind: 'badge', rev: before.rev + 1, unreadTotal: 0 }]);
     expect(read.body.badge).toEqual(await updates[0]);
     await request(markRead, { order: 0 });

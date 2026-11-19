@@ -75,6 +75,7 @@ export interface Conversation {
   kind: Kind;
   id: string;
   seq: number;
+  hidden?: boolean;
   agent: Agent;
   lastMessage: LastMessage | null;
   unread: number;
@@ -84,14 +85,39 @@ export interface Conversation {
   createdAt: number;
 }
 
+export interface AgentCandidate extends Agent {
+  chat: string | null;
+  shown: boolean;
+}
+export interface AgentsResponse {
+  agents: AgentCandidate[];
+}
+export interface SetAgentRequest {
+  shown: boolean;
+}
+export interface SetAgentResponse {
+  agent: AgentCandidate;
+}
+export type UnreadResponse = ReadResponse;
+export interface FileInitRequest {
+  uploadKey: string;
+  name: string;
+  mimeType: string;
+  size: number;
+  sha256: string;
+  durationMs?: number;
+}
+
 export interface FileAttachment {
   id: string;
   name: string;
   mimeType: string;
   size: number;
-  kind: Kind;
+  kind: 'image' | 'file' | 'audio' | (string & {});
   width: number | null;
   height: number | null;
+  durationMs?: number;
+  transcript?: { state: 'pending' | 'failed' } | { state: 'done'; text: string };
 }
 
 export interface Reaction {

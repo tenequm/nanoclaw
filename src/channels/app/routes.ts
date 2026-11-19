@@ -1,13 +1,12 @@
-import type { IncomingMessage, ServerResponse } from 'node:http';
 import { appPeerAllowed } from '../../modules/device-auth/gate.js';
 import { AuthError, verifyRequest } from '../../modules/device-auth/verify.js';
 import { log } from '../../log.js';
-import type { DeviceIdentity } from '../../modules/device-auth/verify.js';
 import { handlePair, handleRevoke } from '../../modules/device-auth/pairing.js';
+import { json, type AppHandler } from './http.js';
 import { appFeatures } from './config.js';
 import { APP_PROTOCOL, type HelloResponse } from './contract.js';
 import { LIVEKIT_PROTOCOL_VERSION } from '../voice-mode-protocol.js';
-import { listConversations, history, markRead } from './conversations.js';
+import { listConversations, history, markRead, markUnread, listAgents, setAgentShown } from './conversations.js';
 import { sendMessage } from './send.js';
 import { answerQuestion } from './questions.js';
 import { streamEvents } from './stream.js';
@@ -16,22 +15,12 @@ import { registerPushToken } from './push.js';
 import { startCall, endCall, cancelCallAttempt } from './calls.js';
 import { getVoice, patchVoice, listVoices } from './voice.js';
 
-export interface AppRequest {
-  req: IncomingMessage;
-  res: ServerResponse;
-  params: Record<string, string>;
-  identity?: DeviceIdentity;
-}
-export type AppHandler = (context: AppRequest) => Promise<void>;
+export { json, type AppHandler, type AppRequest } from './http.js';
 export interface AppRoute {
   method: string;
   path: string;
   signed: boolean;
   handler: AppHandler;
-}
-export function json(res: ServerResponse, status: number, body: unknown): void {
-  res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
-  res.end(JSON.stringify(body));
 }
 export const hello: AppHandler = async ({ res }) => {
   const body: HelloResponse = {
@@ -46,6 +35,9 @@ export const hello: AppHandler = async ({ res }) => {
 export const routes: readonly AppRoute[] = [
   { method: 'GET', path: '/app/hello', signed: false, handler: hello },
   { method: 'POST', path: '/app/pair', signed: false, handler: handlePair },
+  { method: 'GET', path: '/app/agents', signed: true, handler: listAgents },
+  { method: 'PUT', path: '/app/agents/:id', signed: true, handler: setAgentShown },
+  { method: 'POST', path: '/app/conversations/:id/unread', signed: true, handler: markUnread },
   { method: 'GET', path: '/app/conversations', signed: true, handler: listConversations },
   { method: 'GET', path: '/app/conversations/:id/messages', signed: true, handler: history },
   { method: 'POST', path: '/app/conversations/:id/messages', signed: true, handler: sendMessage },

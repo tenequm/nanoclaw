@@ -13,7 +13,10 @@ import type { AppHandler } from './routes.js';
 import './db.js';
 import { configureFiles, createFileService, fileMetadata } from './files.js';
 import { ensureConversation, history } from './conversations.js';
-import { sendMessage, drainRoutingJobs } from './send.js';
+import { sendMessage, drainRoutingJobs, drainTranscriptions, recoverRoutingJobs, stopTranscriptions } from './send.js';
+import { log } from '../../log.js';
+import { transcribeAudio } from '../../transcription.js';
+import { onEventAppended } from './log.js';
 import { deliver } from './deliver.js';
 import { readTicket } from './contract.js';
 import { getHostStartCallbacks, getHostShutdownCallbacks } from '../../host-lifecycle.js';
@@ -258,14 +261,21 @@ it('parses GIF, JPEG and WebP dimensions and tolerates truncated headers', () =>
   for (let i = 0; i < 30; i++) expect(() => fileMetadata(webp.subarray(0, i), 'x')).not.toThrow();
 });
 
-it('another device of the same user downloads with safe response headers', async () => {
-  const [file] = await service.storeOutboundFiles({
-    userId: 'user',
-    conversationId: 'conv',
-    messageId: 'msg',
-    files: [{ filename: "a'b.txt", data: content }],
+it.each([
+  { bytes: content, mime: 'application/octet-stream' },
+  { bytes: Buffer.from(fixtures.voiceMessages.headerHex, 'hex'), mime: 'audio/mp4' },
+])('another device downloads $mime with safe response headers', async ({ bytes, mime }) => {
+  const { body } = await mint({
+    name: "a'b.txt",
+    size: bytes.length,
+    sha256: createHash('sha256').update(bytes).digest('hex'),
+    ...(mime === 'audio/mp4' ? { mimeType: mime, durationMs: 0 } : { mimeType: 'text/html' }),
   });
-  await db.run('UPDATE app_files SET mime_type=? WHERE id=?', 'text/html', file.id);
+  const file = { id: body.fileId };
+  expect((await request(service.uploadFile, bytes, { id: file.id, ticket: body.ticket })).status).toBe(204);
+  expect(
+    (await service.claimFiles(db, { userId: 'user', conversationId: 'conv', messageId: 'msg', fileIds: [file.id] })).ok,
+  ).toBe(true);
   const server = createServer((req, res) => {
     void service
       .downloadFile({
@@ -286,13 +296,13 @@ it('another device of the same user downloads with safe response headers', async
       headers: { Authorization: auth },
     });
     expect(response.status).toBe(200);
-    expect(response.headers.get('content-type')).toBe('application/octet-stream');
+    expect(response.headers.get('content-type')).toBe(mime);
     expect(response.headers.get('x-content-type-options')).toBe('nosniff');
     expect(response.headers.get('content-security-policy')).toBe('sandbox');
-    expect(response.headers.get('content-length')).toBe(String(content.length));
+    expect(response.headers.get('content-length')).toBe(String(bytes.length));
     expect(response.headers.get('content-disposition')).toBe("attachment; filename*=UTF-8''a%27b.txt");
     expect(response.headers.get('cache-control')).toBe('private, no-store');
-    expect(Buffer.from(await response.arrayBuffer())).toEqual(content);
+    expect(Buffer.from(await response.arrayBuffer())).toEqual(bytes);
   } finally {
     server.closeAllConnections();
     await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
@@ -509,4 +519,261 @@ it('refuses an upload whose device was revoked before it started', async () => {
     uploaded_at: null,
     storage_path: null,
   });
+});
+
+const voice = fixtures.voiceMessages;
+const audioBytes = Buffer.from(voice.headerHex, 'hex');
+
+async function voiceConversation() {
+  configureFiles({ root: path.join(directory, 'files'), stagingRoot: path.join(directory, 'staging') });
+  await db.run("INSERT INTO agent_groups (id,name,folder,created_at) VALUES ('agent','Taylor','taylor','2026-11-17')");
+  return ensureConversation('user', 'agent');
+}
+async function sendAudio(conversationId: string, bytes = audioBytes, extra = {}) {
+  const { body } = await mint({
+    ...voice.fileInitRequest,
+    uploadKey: randomUUID(),
+    sha256: createHash('sha256').update(bytes).digest('hex'),
+    size: bytes.length,
+    ...extra,
+  });
+  expect((await request(service.uploadFile, bytes, { id: body.fileId, ticket: body.ticket })).status).toBe(204);
+  const message = await request(
+    sendMessage,
+    Buffer.from(
+      JSON.stringify({
+        clientId: randomUUID(),
+        text: '',
+        fileIds: [body.fileId],
+      }),
+    ),
+    { id: conversationId },
+  );
+  expect(message.status).toBe(200);
+  return message.body.message;
+}
+
+it.each([
+  ['audio/mp4', 'isom'],
+  ['audio/x-m4a', 'M4A '],
+])('routes a picked %s file branded %s without transcription', async (mimeType, brand) => {
+  const c = await voiceConversation();
+  const bytes = Buffer.from(audioBytes);
+  bytes.write(brand, 8);
+  const message = await sendAudio(c.id, bytes, { mimeType, durationMs: undefined });
+  expect(message.files[0].kind).toBe('file');
+  expect(message.files[0]).not.toHaveProperty('transcript');
+  const transcribe = vi.fn();
+  await drainTranscriptions(transcribe);
+  expect(transcribe).not.toHaveBeenCalled();
+  const route = vi.fn<NonNullable<Parameters<typeof drainRoutingJobs>[0]>>();
+  await drainRoutingJobs(route);
+  expect(route).toHaveBeenCalledOnce();
+  const [attachment] = JSON.parse(route.mock.calls[0][0].message.content).attachments;
+  expect(attachment).not.toHaveProperty('type');
+});
+
+it('lets a new note use the second slot and bounds shutdown for a stalled provider', async () => {
+  const c = await voiceConversation();
+  const signals: AbortSignal[] = [];
+  let finish!: () => void;
+  const stalled = new Promise<null>((resolve) => {
+    finish = () => resolve(null);
+  });
+  const transcribe = vi.fn(async (_path: string, _name?: string, signal?: AbortSignal) => {
+    signals.push(signal!);
+    return stalled;
+  });
+  await sendAudio(c.id);
+  const first = drainTranscriptions(transcribe);
+  try {
+    await vi.waitFor(() => expect(signals).toHaveLength(1));
+    await sendAudio(c.id);
+    await sendAudio(c.id);
+    void drainTranscriptions(transcribe);
+    await vi.waitFor(() => expect(signals).toHaveLength(2));
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    const stopping = stopTranscriptions();
+    expect(signals.every((signal) => signal.aborted)).toBe(true);
+    await vi.advanceTimersByTimeAsync(2000);
+    await stopping;
+    expect(await db.all('SELECT state, attempts FROM app_routing_jobs ORDER BY rowid')).toEqual([
+      { state: 'transcribing', attempts: 1 },
+      { state: 'transcribing', attempts: 1 },
+      { state: 'transcribe', attempts: 0 },
+    ]);
+  } finally {
+    vi.useRealTimers();
+    finish();
+    await first;
+    await stopTranscriptions();
+  }
+  await recoverRoutingJobs();
+  const retry = vi.fn(async () => null);
+  await drainTranscriptions(retry);
+  expect(retry).toHaveBeenCalledTimes(3);
+});
+
+it('sends the recorder filename through the SDK and logs only bounded transcription diagnostics', async () => {
+  const c = await voiceConversation();
+  const privateText = 'private-test-sentinel';
+  let response = Response.json({ text: privateText });
+  const names: string[] = [];
+  const transport: typeof fetch = async (_input, init) => {
+    if (_input === 'data:,') return new Response();
+    const form = await new Response(init?.body, { headers: init?.headers }).formData();
+    names.push((form.get('file') as File).name);
+    return response.clone();
+  };
+  vi.stubEnv('OPENAI_API_KEY', 'fixture-only');
+  vi.stubGlobal('fetch', transport);
+  const logs = (['info', 'warn', 'error', 'debug', 'fatal'] as const).map((level) =>
+    vi.spyOn(log, level).mockImplementation(() => {}),
+  );
+  try {
+    const message = await sendAudio(c.id);
+    await drainTranscriptions();
+    const row = await db.get<{ files_json: string }>('SELECT files_json FROM app_messages WHERE id=?', message.id);
+    expect(JSON.parse(row!.files_json)[0].transcript).toEqual({ state: 'done', text: privateText });
+    const telegramFile = path.join(directory, 'telegram.ogg');
+    await writeFile(telegramFile, audioBytes);
+    await transcribeAudio(telegramFile);
+    expect(names).toEqual(['voice.m4a', 'telegram.ogg']);
+    for (const [status, reason, code] of [
+      [401, 'auth', privateText],
+      [408, 'timeout', privateText],
+      [429, 'quota', 'insufficient_quota'],
+      [400, 'http', privateText],
+    ] as const) {
+      response = Response.json(
+        { error: { message: privateText, code } },
+        { status, headers: { 'x-should-retry': 'false' } },
+      );
+      expect(await transcribeAudio(telegramFile)).toBeNull();
+      expect(log.error).toHaveBeenLastCalledWith('OpenAI transcription failed', { reason, status });
+    }
+    const entries = JSON.stringify(logs.map((spy) => spy.mock.calls));
+    expect(entries.includes(privateText)).toBe(false);
+    expect(entries.includes(directory)).toBe(false);
+  } finally {
+    logs.forEach((spy) => spy.mockRestore());
+    vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
+  }
+});
+
+it('recognizes major and compatible M4A brands only inside a complete ftyp box', () => {
+  expect(fileMetadata(audioBytes, 'recording.bin', true)).toMatchObject({ kind: 'audio', mimeType: 'audio/mp4' });
+  const compatible = Buffer.from(audioBytes);
+  compatible.write('isom', 8);
+  compatible.write('M4A ', 20);
+  expect(fileMetadata(compatible, 'recording.bin', true).kind).toBe('audio');
+  compatible.write('mp42', 20);
+  compatible.write('M4A ', 12);
+  for (const data of [compatible, audioBytes.subarray(0, 20), Buffer.concat([compatible, Buffer.from('M4A ')])])
+    expect(fileMetadata(data, 'voice.m4a', true).kind).toBe('file');
+});
+
+it('checks audio duration, canonicalizes the alias on mint retries and rejects mislabeled bytes', async () => {
+  for (const durationMs of [-1, 0.5, '1000', null]) {
+    expect((await mint({ ...voice.fileInitRequest, durationMs })).status).toBe(400);
+  }
+  const options = { mimeType: 'audio/x-m4a', durationMs: 0, uploadKey: randomUUID() };
+  const { body } = await mint(options);
+  expect((await mint({ ...options, mimeType: 'audio/mp4' })).body.fileId).toBe(body.fileId);
+  expect((await mint({ ...options, durationMs: 1 })).body.error).toBe('upload_key_conflict');
+  expect((await request(service.uploadFile, content, { id: body.fileId, ticket: body.ticket })).body.error).toBe(
+    'bad_body',
+  );
+  expect(await readdir(path.join(directory, 'files'))).toEqual(['tmp']);
+});
+
+it.each([
+  { outcome: 'done', interrupted: 0 },
+  { outcome: 'failed', interrupted: 0 },
+  { outcome: 'done', interrupted: 1 },
+  { outcome: 'failed', interrupted: 1 },
+  { outcome: 'failed', interrupted: 2 },
+])('publishes and routes audio as $outcome after $interrupted interruptions', async ({ outcome, interrupted }) => {
+  const c = await voiceConversation();
+  const { body: upload } = await mint({ ...voice.fileInitRequest, mimeType: 'audio/x-m4a' });
+  expect((await request(service.uploadFile, audioBytes, { id: upload.fileId, ticket: upload.ticket })).status).toBe(
+    204,
+  );
+  const body = Buffer.from(JSON.stringify({ clientId: randomUUID(), text: '', fileIds: [upload.fileId] }));
+  const send = () => request(sendMessage, body, { id: c.id });
+  const events: string[] = [];
+  const off = onEventAppended((e) => {
+    if (e.user_id === 'user' && e.agent_group_id === 'agent' && e.kind === 'message')
+      events.push(JSON.parse(e.entity_json).files[0].transcript.state);
+  });
+  const preview = async () =>
+    JSON.parse(
+      (await db.get<{ last_message_json: string }>('SELECT last_message_json FROM app_conversations WHERE id=?', c.id))!
+        .last_message_json,
+    ).preview;
+  try {
+    const sent = await send();
+    expect(sent.status).toBe(200);
+    const pending = sent.body.message;
+    expect(pending.files).toEqual([{ ...voice.pendingFile, id: upload.fileId }]);
+    expect(await preview()).toBe('Voice message');
+    if (interrupted) {
+      await db.run('UPDATE app_routing_jobs SET attempts=? WHERE message_id=?', interrupted, pending.id);
+      await closeDb();
+      db = await initDb(path.join(directory, 'test.db'), { role: 'test' });
+      await recoverRoutingJobs();
+    }
+    let finish!: (result: string | null) => void;
+    const waiting = new Promise<string | null>((resolve) => {
+      finish = resolve;
+    });
+    const transcribe = vi.fn(() => waiting);
+    const route = vi.fn(async (input) => {
+      input.onStored();
+    });
+    const drain = drainTranscriptions(transcribe);
+    if (interrupted < 2) {
+      try {
+        await vi.waitFor(() => expect(transcribe).toHaveBeenCalledOnce());
+        await drainRoutingJobs(route);
+        expect(route).not.toHaveBeenCalled();
+        expect(events).toEqual(['pending']);
+        expect(await send()).toEqual(sent);
+      } finally {
+        finish(outcome === 'done' ? voice.done.text : null);
+      }
+    }
+    await drain;
+    expect(transcribe).toHaveBeenCalledTimes(interrupted < 2 ? 1 : 0);
+    expect(events).toEqual(['pending', outcome]);
+    expect(await preview()).toBe(outcome === 'done' ? voice.done.text : 'Voice message');
+    const updated = (await send()).body.message;
+    expect(updated).toMatchObject({
+      id: pending.id,
+      order: pending.order,
+      text: '',
+      files: [{ transcript: outcome === 'done' ? voice.done : voice.failed }],
+    });
+    expect(updated.seq).toBeGreaterThan(pending.seq);
+    await drainRoutingJobs(route);
+    expect(route).toHaveBeenCalledOnce();
+    const payload = JSON.parse(route.mock.calls[0][0].message.content);
+    expect(payload.text).toBe('');
+    expect(payload.attachments).toEqual([
+      {
+        name: voice.pendingFile.name,
+        mimeType: 'audio/mp4',
+        size: audioBytes.length,
+        type: 'voice',
+        durationSeconds: 1.25,
+        stagedPath: expect.any(String),
+        ...(outcome === 'done' ? { transcript: voice.done.text } : {}),
+      },
+    ]);
+    expect(await readFile(payload.attachments[0].stagedPath)).toEqual(audioBytes);
+    expect((await send()).body.message.delivery).toBe('reached');
+  } finally {
+    off();
+  }
 });
