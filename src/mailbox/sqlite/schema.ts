@@ -1,4 +1,13 @@
 /** Host-owned SQLite mailbox schema. */
+export const MESH_PEERS_SCHEMA = `CREATE TABLE IF NOT EXISTS mesh_peers (
+  address TEXT PRIMARY KEY,
+  kind TEXT NOT NULL,
+  machine TEXT,
+  project TEXT,
+  status TEXT NOT NULL,
+  agentGroupId TEXT
+);`;
+
 export const INBOUND_SCHEMA = `
 CREATE TABLE IF NOT EXISTS messages_in (
   id             TEXT PRIMARY KEY,
@@ -27,6 +36,8 @@ CREATE TABLE IF NOT EXISTS delivered (
   delivered_at        TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_delivered_platform_message ON delivered(platform_message_id);
+
+${MESH_PEERS_SCHEMA}
 
 CREATE TABLE IF NOT EXISTS destinations (
   name            TEXT PRIMARY KEY,

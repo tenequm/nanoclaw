@@ -14,6 +14,7 @@ import {
   sqliteFindSeqByPlatformMessageId,
   sqliteFindQuestionResponse,
   sqliteGetAllDestinations,
+  sqliteGetMeshPeers,
   sqliteGetDeliveryStatus,
   sqliteGetMessageIn,
   sqliteGetMessageIdBySeq,
@@ -211,6 +212,9 @@ export class SqliteAgentMailbox implements AgentMailbox {
     return sqliteGetSessionRouting();
   }
 
+  getMeshPeers() {
+    return sqliteGetMeshPeers();
+  }
   getDestinations() {
     return sqliteGetAllDestinations();
   }

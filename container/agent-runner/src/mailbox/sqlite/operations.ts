@@ -6,6 +6,7 @@ import type { MessageOutRow } from '../../db/messages-out.js';
 import {
   createOutboundRecord,
   parseDestinationRecord,
+  parseMeshPeerRecord,
   parseSessionRoutingRecord,
   parseStateRecord,
 } from '../model.generated.js';
@@ -314,6 +315,14 @@ function destination(row: DestinationRow): Destination {
     platformId: row.platform_id,
     agentGroupId: row.agent_group_id,
   });
+}
+
+export function sqliteGetMeshPeers() {
+  return readInbound((db) =>
+    db.query("SELECT 1 FROM sqlite_master WHERE type='table' AND name='mesh_peers'").get()
+      ? db.query('SELECT * FROM mesh_peers ORDER BY address').all().map(parseMeshPeerRecord)
+      : [],
+  );
 }
 
 export function sqliteGetAllDestinations(): Destination[] {

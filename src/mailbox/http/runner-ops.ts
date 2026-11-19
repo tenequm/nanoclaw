@@ -13,6 +13,8 @@ import { log } from '../../log.js';
 import {
   createOutboundRecord,
   parseDestinationRecord,
+  parseMeshPeerRecord,
+  type MeshPeerRecord,
   parseInboundRecord,
   parseOutboundRecord,
   parseOutboundWrite,
@@ -71,6 +73,7 @@ export interface RunnerSnapshot {
   latestRoutes: Array<{ channelType: string; platformId: string; threadId: string | null; inReplyTo: string }>;
   /** findSeqByPlatformMessageId answered for every pending row's `replyTo.id`, so the formatter is exact. */
   replySeqs: Array<{ channelType: string; platformId: string; platformMessageId: string; sequence: number | null }>;
+  meshPeers: MeshPeerRecord[];
   destinations: DestinationRecord[];
   routing: SessionRoutingRecord;
   state: StateRecord[];
@@ -317,6 +320,13 @@ function snapshot(session: RunnerSession, cursor: SnapshotCursor | null): Runner
     })),
     latestRoutes,
     replySeqs,
+    meshPeers: tableExists(inbound, 'mesh_peers')
+      ? inbound
+          .prepare('SELECT * FROM mesh_peers ORDER BY address')
+          .all()
+          .map((row) => contained('mesh peer', () => parseMeshPeerRecord(row)))
+          .filter(defined)
+      : [],
     destinations: (inbound.prepare('SELECT * FROM destinations ORDER BY name').all() as Row[])
       .map((row) =>
         contained('destination', () =>
