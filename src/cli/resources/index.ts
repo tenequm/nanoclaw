@@ -19,3 +19,4 @@ import './templates.js';
 import './jev-gate.js';
 
 import './devices.js';
+import './peers.js';

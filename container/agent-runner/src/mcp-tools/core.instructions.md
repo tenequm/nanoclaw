@@ -2,6 +2,8 @@
 
 The runtime system prompt lists your destinations and explains how final output is handled in this session. Every `send_message`, `send_file`, and `send_media_group` call must pass an explicit `to` destination.
 
+Use `list_peers` for the live mesh directory. To start a conversation, pass its agent name or session address to `send_message`. Include the machine in `session@project:machine` when a short address matches several sessions. Offline sessions can receive queued text.
+
 ### Replies and mentions
 
 Every `<message>` id, and its `reply_to`, uses the same `#N` numbering the tools take. `send_message` answers the current message by default and shows a reply box only when newer messages arrived after it; pass `reply_to: N` to answer a specific earlier message, and `quote` (copied verbatim from that message's text) to highlight the part you answer.

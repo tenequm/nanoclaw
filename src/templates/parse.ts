@@ -28,6 +28,7 @@ export interface Template {
   name: string;
   /** Display name from extensions["ai.nanoco.nanoclaw"].agentName, when given. */
   agentName?: string;
+  mesh?: boolean;
   mcpServers: Record<string, McpServerConfig>; // mcp.json — name -> validated launch config
   instructions?: string; // ai.nanoco.nanoclaw/context/instructions.md (optional persona)
   contextExtras: { name: string; content: string }[]; // other extension-dir context/**/*.md
@@ -75,6 +76,7 @@ export function parseTemplate(dir: string): Template {
 
   return {
     name: manifest.name,
+    ...(extension.mesh ? { mesh: true } : {}),
     ...(extension.agentName === undefined ? {} : { agentName: extension.agentName }),
     mcpServers: servers,
     ...(extension.instructions === undefined ? {} : { instructions: extension.instructions }),

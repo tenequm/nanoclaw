@@ -223,6 +223,14 @@ export function initTestSessionDb(): { inbound: Database; outbound: Database } {
       status              TEXT NOT NULL DEFAULT 'delivered',
       delivered_at        TEXT NOT NULL
     );
+CREATE TABLE IF NOT EXISTS mesh_peers (
+  address TEXT PRIMARY KEY,
+  kind TEXT NOT NULL,
+  machine TEXT,
+  project TEXT,
+  status TEXT NOT NULL,
+  agentGroupId TEXT
+);
     CREATE TABLE destinations (
       name            TEXT PRIMARY KEY,
       display_name    TEXT,

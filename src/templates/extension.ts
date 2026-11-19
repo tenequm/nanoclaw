@@ -21,6 +21,7 @@ export const NANOCLAW_EXTENSION_NS = 'ai.nanoco.nanoclaw';
 export interface NanoclawExtension {
   /** Display name for the stamped agent group; folder-leaf fallback applies when absent. */
   agentName?: string;
+  mesh?: boolean;
   /** Persona from <ns>/context/instructions.md — optional by decision; registries may require it by policy. */
   instructions?: string;
   /** Other <ns>/context/**\/*.md, names relative to context/ so references resolve unchanged. */
@@ -53,8 +54,11 @@ export function readNanoclawExtension(
             `plugin.json: extensions["${NANOCLAW_EXTENSION_NS}"].agentName must be a nonempty string; ignored`,
           );
       }
+      if (ours.mesh !== undefined && typeof ours.mesh !== 'boolean') {
+        report.push(`plugin.json: extensions["${NANOCLAW_EXTENSION_NS}"].mesh must be a boolean; ignored`);
+      }
       for (const key of Object.keys(ours)) {
-        if (key !== 'agentName') {
+        if (key !== 'agentName' && key !== 'mesh') {
           report.push(`plugin.json: extensions["${NANOCLAW_EXTENSION_NS}"].${key} is not recognized; ignored`);
         }
       }
@@ -73,6 +77,7 @@ export function readNanoclawExtension(
   }
 
   return {
+    ...(isPlainObject(ours) && ours.mesh === true ? { mesh: true } : {}),
     ...(agentName === undefined ? {} : { agentName }),
     ...(instructions === undefined ? {} : { instructions }),
     contextExtras: readContextExtras(contextDir),

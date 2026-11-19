@@ -283,7 +283,10 @@ function formatSingleChat(msg: MessageInRow): string {
   const attachmentsSuffix = formatAttachments(content.attachments);
   const appContextSuffix = formatAppContext(content.app_context);
 
-  const fromAttr = originAttr(msg);
+  const peerAddress = msg.channel_type === 'peer' && typeof content.sender === 'string'
+    ? /^([a-z0-9][a-z0-9._-]*@[a-z0-9][a-z0-9._-]*:[a-z0-9-]+) \(Claude Code session\)$/.exec(content.sender)?.[1]
+    : undefined;
+  const fromAttr = peerAddress ? ` from="${escapeXml(peerAddress)}"` : originAttr(msg);
   const userAttr = senderAttrs(msg, content);
 
   return `<message${idAttr}${fromAttr} sender="${escapeXml(sender)}"${userAttr} time="${escapeXml(time)}"${replyAttr}>${replyPrefix}${escapeXml(text)}${linksSuffix}${attachmentsSuffix}${appContextSuffix}</message>`;

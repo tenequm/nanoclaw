@@ -1,6 +1,7 @@
 import type {
   ContainerRecord,
   DestinationRecord,
+  MeshPeerRecord,
   DirectOutboundWrite,
   InboundWrite,
   OutboundDelivery,
@@ -93,6 +94,7 @@ export interface MailboxTimelineMessage {
 /** Host-visible inbound mailbox behavior. Storage layout and lifecycle are implementation-private. */
 export interface InboundMailbox {
   setRouting(routing: SessionRouting): void;
+  replaceMeshPeers(entries: MeshPeerRecord[]): void;
   replaceDestinations(entries: Destination[]): void;
   insertMessage(message: InboundMessage): Promise<void>;
   countDueMessages(): number;

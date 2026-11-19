@@ -2,6 +2,8 @@ import { randomUUID } from 'crypto';
 import fs from 'fs';
 import path from 'path';
 
+import { setMeshMembership } from '../channels/peer/store.js';
+import { getDb } from '../db/connection.js';
 import { CONTAINER_PLUGINS_DIR } from '../container-config.js';
 import { DATA_DIR, GROUPS_DIR, TIMEZONE } from '../config.js';
 import { createAgentGroup, getAgentGroupByFolder } from '../db/agent-groups.js';
@@ -121,7 +123,14 @@ export async function createAgentFromTemplate(ref: string, opts?: CreateAgentOpt
   const folder = await templateFolder(name);
 
   const group: AgentGroup = { id, name, folder, agent_provider: null, created_at: new Date().toISOString() };
-  await createAgentGroup(group);
+  if (tpl.mesh) {
+    await getDb().transaction(async () => {
+      await createAgentGroup(group);
+      await setMeshMembership(id, true);
+    });
+  } else {
+    await createAgentGroup(group);
+  }
   await ensureContainerConfig(id, opts?.provider);
   if (timezone) await updateContainerConfigScalars(id, { timezone });
 

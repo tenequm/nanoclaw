@@ -1,6 +1,7 @@
 import fs from 'fs';
 import type Database from 'better-sqlite3';
 
+import { MESH_PEERS_SCHEMA } from './schema.js';
 import { log } from '../../log.js';
 import { sessionMailboxDir, sessionMailboxPath } from './paths.js';
 export { inboundDbPath, outboundDbPath, sessionMailboxDir, sessionMailboxPath } from './paths.js';
@@ -181,6 +182,15 @@ export function wrapSqliteInbound(db: Database.Database, nextSequence = () => ne
         platform_id: record.platformId,
         thread_id: record.threadId,
       });
+    },
+    replaceMeshPeers: (entries) => {
+      db.transaction(() => {
+        db.prepare('DELETE FROM mesh_peers').run();
+        const insert = db.prepare(
+          'INSERT INTO mesh_peers (address, kind, machine, project, status, agentGroupId) VALUES (@address, @kind, @machine, @project, @status, @agentGroupId)',
+        );
+        for (const entry of entries) insert.run(entry);
+      })();
     },
     replaceDestinations: (entries) =>
       replaceDestinations(
@@ -473,6 +483,7 @@ export class SqliteAgentMailbox implements AgentMailbox {
     const writableOutbound = () => (outboundWriter ??= openOutboundDbRw(sessionMailboxPath(key, 'outbound')));
     try {
       if (!this.migrated.has(inboundPath)) {
+        inbound.exec(MESH_PEERS_SCHEMA);
         migrateMessagesInTable(inbound);
         const deliveredColumns = inbound.prepare("PRAGMA table_info('delivered')").all();
         if (deliveredColumns.length > 0) migrateDeliveredTable(inbound);

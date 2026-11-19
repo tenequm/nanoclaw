@@ -148,6 +148,34 @@ export type DestinationRecord =
       agentGroupId: string;
     });
 
+export interface MeshPeerRecord {
+  address: string;
+  kind: 'agent' | 'session';
+  machine: string | null;
+  project: string | null;
+  status: 'idle' | 'busy' | 'offline';
+  agentGroupId: string | null;
+}
+
+export function parseMeshPeerRecord(value: unknown): MeshPeerRecord {
+  const row = strictRecord(value, 'MeshPeerRecord', [
+    'address',
+    'kind',
+    'machine',
+    'project',
+    'status',
+    'agentGroupId',
+  ]);
+  return {
+    address: text(row, 'address'),
+    kind: oneOf(row, 'kind', ['agent', 'session']),
+    machine: nullableText(row, 'machine'),
+    project: nullableText(row, 'project'),
+    status: oneOf(row, 'status', ['idle', 'busy', 'offline']),
+    agentGroupId: nullableText(row, 'agentGroupId'),
+  };
+}
+
 export interface SessionRoutingRecord {
   channelType: string | null;
   platformId: string | null;

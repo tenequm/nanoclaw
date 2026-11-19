@@ -21,6 +21,7 @@ vi.mock('../log.js', () => ({
 
 import { closeDb, getAllAgentGroups, initTestDb, runMigrations } from '../db/index.js';
 import { createAgentGroup } from '../db/agent-groups.js';
+import { isMeshMember } from '../channels/peer/store.js';
 import { getContainerConfig } from '../db/container-configs.js';
 import { findTaskSessions } from '../db/sessions.js';
 import { PERSONA_PREPEND_FILE } from '../group-persona.js';
@@ -93,6 +94,14 @@ describe('createAgentFromTemplate', () => {
     // Every creation path prefixes ids with ag-; ag- consumers (uninstaller
     // classification, dashboard session filters) rely on it.
     expect(g.id).toMatch(/^ag-/);
+  });
+
+  it('sets mesh membership on a new group only when its template opts in', async () => {
+    const plain = await createAgentFromTemplate('sales/sdr', { name: 'Separate test' });
+    writeTemplate({ extensions: { [NANOCLAW_EXTENSION_NS]: { mesh: true } } });
+    const member = await createAgentFromTemplate('sales/sdr', { name: 'Mesh test' });
+    expect(await isMeshMember(plain.group.id)).toBe(false);
+    expect(await isMeshMember(member.group.id)).toBe(true);
   });
 
   it('copies template skills into the group-private Claude-plane skills dir', async () => {
