@@ -105,6 +105,19 @@ registerMigration({
   },
 });
 
+registerMigration({
+  version: 5,
+  name: 'module:peer:lookup-indexes',
+  async up(db) {
+    await db.exec(`
+      CREATE INDEX peer_parties_session ON peer_parties(session_id);
+      CREATE INDEX peer_endpoints_actor ON peer_endpoints(actor);
+      CREATE INDEX peer_conversations_party_b ON peer_conversations(party_b);
+      CREATE INDEX peer_messages_recipient_id ON peer_messages(recipient,id);
+    `);
+  },
+});
+
 export class PeerError extends Error {
   constructor(
     readonly status: number,
