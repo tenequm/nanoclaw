@@ -1,9 +1,10 @@
 /**
- * The jev call loop's judge: the Choice `action` about the call window, and the answer-ready Choice
- * `still_wanted`, asked through a `DecisionModel` whose one implementation is the Jev client (JSON state,
- * the pinned `JEV_MODEL`). Any error, timeout or malformed answer is a null verdict: silence for `action`
+ * The jev call loop's judge: the Choice `action` about the call window, the answer-ready Choice
+ * `still_wanted`, and on a voice call the Choice `barge_in` about the caller's words over the agent's line,
+ * asked through a `DecisionModel` whose one implementation is the Jev client (JSON state, the pinned
+ * `JEV_MODEL`). Any error, timeout or malformed answer is a null verdict: silence for `action`
  * (fail-silent like the chat gate) unless the agent was called by name, which still wakes it; speech for
- * `still_wanted` (the answer was wanted a moment ago).
+ * `still_wanted` (the answer was wanted a moment ago); the worker's word list for `barge_in`.
  */
 import { log } from '../../log.js';
 import { postSystemOne, type JevFailure } from '../jev-gate/jev.js';
@@ -166,10 +167,11 @@ function stillWantedDecision(agent: string): ChoiceDecision {
 const OVERLAP_YIELD_P = 0.6;
 const OVERLAP_KEEP_TALKING_P = 0.7;
 
-function bargeInDecision(agent: string): ChoiceDecision {
+function bargeInDecision(agent: string, ducked = false): ChoiceDecision {
+  const meanwhile = ducked ? 'plays on more quietly' : 'is paused';
   return {
     kind: 'choice',
-    prompt: `A live voice call. ${agent} is speaking the \`partial\` agent line in \`window\`, and the caller said \`latest\` over it; ${agent}'s line is paused while you decide. Should ${agent} go on with the line or yield the turn to the caller?`,
+    prompt: `A live voice call. ${agent} is speaking the \`partial\` agent line in \`window\`, and the caller said \`latest\` over it; ${agent}'s line ${meanwhile} while you decide. Should ${agent} go on with the line or yield the turn to the caller?`,
     options: {
       keep_talking: {
         what: `\`latest\` only shows the caller is listening, following or agreeing (a backchannel: a hum, "yeah", "okay", "right", in any language), or invites ${agent} to go on, and asks for nothing new.`,
@@ -189,13 +191,13 @@ const toJevQuestion = (decision: Decision) =>
     ? { type: 'choice', instructions: decision.prompt, criteria: decision.options }
     : { type: 'noul', instructions: decision.prompt, criteria: decision.criteria };
 
-export const judgeQuestions = (agent: string, overlap = false) =>
+export const judgeQuestions = (agent: string, overlap?: 'paused' | 'ducked') =>
   Object.fromEntries(
     Object.entries({
       action: actionDecision(agent),
       ...shadowDecisions(agent),
       still_wanted: stillWantedDecision(agent),
-      ...(overlap ? { barge_in: bargeInDecision(agent) } : {}),
+      ...(overlap ? { barge_in: bargeInDecision(agent, overlap === 'ducked') } : {}),
     }).map(([name, decision]) => [name, toJevQuestion(decision)]),
   );
 
@@ -355,19 +357,22 @@ export const askAction = (state: JevState, opts: JudgeOptions = {}): Promise<{ v
     opts,
   );
 
+/** Ask Jev about the caller's words over the agent's line. Never throws; with no verdict, `reason` says why. */
 export async function askOverlap(
   state: JevState,
   opts: JudgeOptions = {},
-): Promise<{ verdict: OverlapAction | null; ms: number }> {
+  ducked = false,
+): Promise<{ verdict: OverlapAction | null; ms: number; reason?: 'error' | 'mid_band' }> {
   const { verdict, ms } = await ask(
     state,
-    { barge_in: bargeInDecision(state.agent_name) },
+    { barge_in: bargeInDecision(state.agent_name, ducked) },
     verdictOf<OverlapAction>,
     opts,
   );
-  if (verdict && verdict.probabilities.yield >= OVERLAP_YIELD_P) return { verdict: 'yield', ms };
-  if (verdict && verdict.probabilities.keep_talking >= OVERLAP_KEEP_TALKING_P) return { verdict: 'keep_talking', ms };
-  return { verdict: null, ms };
+  if (!verdict) return { verdict: null, ms, reason: 'error' };
+  if (verdict.probabilities.yield >= OVERLAP_YIELD_P) return { verdict: 'yield', ms };
+  if (verdict.probabilities.keep_talking >= OVERLAP_KEEP_TALKING_P) return { verdict: 'keep_talking', ms };
+  return { verdict: null, ms, reason: 'mid_band' };
 }
 
 /** Ask Jev whether a landed answer is still wanted. Never throws; null on any failure. */

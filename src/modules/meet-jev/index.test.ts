@@ -19,7 +19,7 @@ vi.mock('../../log.js', () => ({
 import type { LiveKitHostEvent } from '../../channels/voice-mode-protocol.js';
 import { log } from '../../log.js';
 import type { CallCore, CallEvent, CallPolicy, RecheckState } from './core/types.js';
-import { createJevCall, MAX_JUDGES_PER_MINUTE } from './index.js';
+import { createJevCall, MAX_JUDGES_PER_MINUTE, MAX_OVERLAPS_PER_MINUTE } from './index.js';
 
 function jevCall() {
   const clock = { now: 1_000_000 };
@@ -124,6 +124,7 @@ describe('createJevCall', () => {
           ]),
         }),
         expect.anything(),
+        false,
       );
       expect(push).toHaveBeenCalledWith({ type: 'overlap', requestId: 'request', verdict: 'keep_talking' });
       expect(judge).not.toHaveBeenCalled();
@@ -131,6 +132,75 @@ describe('createJevCall', () => {
       await flush();
       expect(judge).toHaveBeenCalledOnce();
     }
+    call.end('done');
+  });
+
+  function overlapCall(jevDuck?: boolean) {
+    const push = vi.fn();
+    const overlap = vi.fn(async () => ({ verdict: null, ms: 1, reason: 'mid_band' as const }));
+    const judge = vi.fn(async () => ({ verdict: null, ms: 1 }));
+    const call = createJevCall(
+      {
+        callId: 'call',
+        callerName: 'Caller',
+        agentName: 'Agent',
+        agentAliases: [],
+        ...(jevDuck ? { jevDuck } : {}),
+        now: () => 1000,
+        submitTurn: async () => ({ ok: true, turnId: 'turn' }),
+        maxTextBytes: 4096,
+        push,
+      },
+      { overlap, judge },
+    );
+    call.workerEvents([{ type: 'utterance', uttId: 'wake', text: 'Agent', final: true, at: 980 }]);
+    const ask = (n: number, replyId = 'r1') =>
+      call.workerEvents([
+        { type: 'overlap', requestId: `q${n}`, replyId, played: 'First', text: `remark ${n}`, at: 999 },
+      ]);
+    return { call, push, overlap, judge, ask };
+  }
+  const overlapAnswers = (push: ReturnType<typeof vi.fn>) =>
+    push.mock.calls.map(([event]) => event as LiveKitHostEvent).filter((event) => event.type === 'overlap');
+
+  it('answers an overlap for a line the host does not hold as playing at once, without asking Jev', async () => {
+    const { call, push, overlap, ask } = overlapCall();
+    ask(1, 'r9');
+    expect(overlap).not.toHaveBeenCalled();
+    expect(overlapAnswers(push)).toEqual([{ type: 'overlap', requestId: 'q1', verdict: null, reason: 'not_playing' }]);
+    call.end('done');
+  });
+
+  it("caps overlaps in their own bucket, logs it, and leaves the judges' budget alone", async () => {
+    const { call, push, overlap, judge, ask } = overlapCall(true);
+    await flush();
+    call.reply('First words then more.', 'turn');
+    call.workerEvents([{ type: 'playback', replyId: 'r1', state: 'started', at: 995 }]);
+    vi.mocked(log.warn).mockClear();
+    for (let n = 0; n <= MAX_OVERLAPS_PER_MINUTE; n++) ask(n);
+    await flush();
+    expect(overlap).toHaveBeenCalledTimes(MAX_OVERLAPS_PER_MINUTE);
+    expect(overlap.mock.calls[0]).toEqual([expect.anything(), expect.anything(), true]);
+    const answers = overlapAnswers(push);
+    expect(answers).toHaveLength(MAX_OVERLAPS_PER_MINUTE + 1);
+    expect(answers).toContainEqual({
+      type: 'overlap',
+      requestId: `q${MAX_OVERLAPS_PER_MINUTE}`,
+      verdict: null,
+      reason: 'cap',
+    });
+    expect(answers).toContainEqual({ type: 'overlap', requestId: 'q0', verdict: null, reason: 'mid_band' });
+    expect(log.warn).toHaveBeenCalledWith(
+      'meet-jev: Jev barge-in rate cap reached, the worker decides with its word list',
+      expect.anything(),
+    );
+    const judged = judge.mock.calls.length;
+    call.workerEvents([
+      { type: 'playback', replyId: 'r1', state: 'completed', at: 1000 },
+      { type: 'utterance', uttId: 'next', text: 'What about tomorrow?', final: true, at: 1000 },
+    ]);
+    await flush();
+    expect(judge.mock.calls.length).toBe(judged + 1);
     call.end('done');
   });
 

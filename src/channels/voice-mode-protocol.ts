@@ -537,12 +537,16 @@ export type CallEndReason = (typeof CALL_END_REASONS)[number];
  * worker has no transcript of its own. A jev voice call also gets the loop's
  * `status` and the agent's `thinking` ticks, which its worker plays its cues and typing sound from.
  */
+/** Why the host answers an overlap request without a verdict. */
+export type OverlapFallback = 'cap' | 'error' | 'mid_band' | 'not_playing' | 'off';
+
 export type LiveKitHostEvent =
   | { type: 'reply'; text: string; turn?: string | null; replyId?: string }
   | { type: 'stop' }
   | { type: 'revoke'; replyId: string }
   | { type: 'words' }
-  | { type: 'overlap'; requestId: string; verdict: 'yield' | 'keep_talking' | null }
+  /** Jev's answer to the worker's `overlap` request; with no verdict, `reason` says why (the worker logs it). */
+  | { type: 'overlap'; requestId: string; verdict: 'yield' | 'keep_talking' | null; reason?: OverlapFallback }
   | { type: 'thinking' }
   | { type: 'working' }
   /** A jev voice call's state as the host's loop sees it: the worker plays its cues from it. */

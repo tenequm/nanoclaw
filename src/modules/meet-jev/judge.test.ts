@@ -367,6 +367,19 @@ describe('askOverlap', () => {
       },
     });
   });
+  it('says why there is no verdict, and tells Jev a ducked line plays on', async () => {
+    respond({
+      answers: {
+        barge_in: { choice: 'yield', confidence: 0.1, probabilities: { yield: 0.5, keep_talking: 0.5 } },
+      },
+    });
+    expect(await askOverlap(state)).toMatchObject({ verdict: null, reason: 'mid_band' });
+    const fetch = respond({ answers: { barge_in: { choice: 'stop', confidence: 1, probabilities: { stop: 1 } } } });
+    expect(await askOverlap(state, {}, true)).toMatchObject({ verdict: null, reason: 'error' });
+    const body = JSON.parse((fetch.mock.calls[0] as [string, { body: string }])[1].body);
+    expect(body.questions.barge_in.instructions).toContain("Dan's line plays on more quietly while you decide.");
+    expect(body.questions.barge_in.instructions).not.toContain('paused');
+  });
   it('rejects an unknown choice or an incomplete distribution', async () => {
     for (const answer of [
       { choice: 'stop', probabilities: { yield: 1, keep_talking: 0 } },

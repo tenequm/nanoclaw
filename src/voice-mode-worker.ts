@@ -5018,6 +5018,12 @@ export function deliveredText(text: string, share: number): string {
   return out;
 }
 
+/** Letters and digits only, lower case: "Yeah." and "yeah" are the same words. */
+const spokenKey = (text: string): string => (text.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? []).join(' ');
+
+const startsWithWords = (text: string, prefix: string): boolean =>
+  !!prefix && (text === prefix || text.startsWith(`${prefix} `));
+
 function playedPrefix(text: string, playedMs: number, audioMs: number, complete: boolean): string {
   const totalMs = complete ? audioMs : Math.max(audioMs, (text.length * 1000) / JEV_SPEECH_CHARS_PER_SECOND);
   return totalMs > 0 ? deliveredText(text, Math.min(playedMs, audioMs) / totalMs) : '';
@@ -5194,8 +5200,13 @@ export interface JevLoopDeps {
 }
 
 interface JevUtterance {
+  /** Words over a paused line, held from the host's turn decisions while the pause judges them. */
   contextOnly?: boolean;
   final?: boolean;
+  /** The words (`spokenKey`) a pause decided not to cut on: a final that says only these stays context. */
+  keptText?: string;
+  /** Cut for these words: the pump releases them once the line's cut is reported. */
+  releasing?: boolean;
   phoneWords?: string;
   needsPhoneFinal?: boolean;
   uttId: string;
@@ -5248,6 +5259,7 @@ export class JevLoop {
   };
   /** The line the reflex paused, until words cut it or quiet (or JEV_MAX_PAUSE_MS) resumes it. */
   private pause?: { line: JevPlayout; since: number };
+  /** The paused line's judgement of one utterance: its requests by id, the latest, and the shared deadline. */
   private overlap?: {
     utterance: JevUtterance;
     pending: Map<string, string>;
@@ -5255,6 +5267,9 @@ export class JevLoop {
     retryAfter?: string;
     keepTalking?: boolean;
     timer?: ReturnType<typeof setTimeout>;
+    askedAt?: number;
+    /** The last decision short of a cut: for which words, and whether it lets the line go on. */
+    kept?: { text: string; keepTalking: boolean };
   };
   private resumeTimer?: ReturnType<typeof setTimeout>;
   private maxPauseTimer?: ReturnType<typeof setTimeout>;
@@ -5325,10 +5340,12 @@ export class JevLoop {
       ...(this.speechOver ? { over: this.speechOver } : {}),
     };
     const pause = this.pause;
-    if (this.overlap?.keepTalking) this.resume('backchannel');
-    else if (pause && !pause.line.abort.signal.aborted) {
+    this.resumeIfKept();
+    if (pause && pause === this.pause && !pause.line.abort.signal.aborted) {
       this.resumeTimer = setTimeout(() => {
-        if (pause === this.pause && !this.speaking) this.resume('quiet');
+        if (pause !== this.pause || this.speaking) return;
+        this.decideNow('quiet');
+        if (pause === this.pause) this.resume('quiet');
       }, JEV_FALSE_INTERRUPTION_TIMEOUT_MS);
       this.resumeTimer.unref?.();
     }
@@ -5371,6 +5388,11 @@ export class JevLoop {
         this.deps.log.warn('voice-mode worker: an utterance has no final', { err });
         if (audio) this.deps.recorded?.(utterance.segment, audio, utterance.text, 'stt');
         utterance.needsPhoneFinal = true;
+        // No final will come: a keep on its partial is its last word.
+        if (utterance.contextOnly) {
+          utterance.final = true;
+          this.resumeIfKept();
+        }
         if (utterance.phoneWords) this.finishUtterance(utterance, utterance.text || utterance.phoneWords);
       },
     );
@@ -5574,11 +5596,17 @@ export class JevLoop {
     if (this.pauseSpent) return;
     if (!this.pause) {
       this.pause = { line, since: this.now() };
-      this.maxPauseTimer = setTimeout(() => this.resume('max_pause'), JEV_MAX_PAUSE_MS);
+      this.maxPauseTimer = setTimeout(() => {
+        this.decideNow('max_pause');
+        this.resume('max_pause');
+      }, JEV_MAX_PAUSE_MS);
       this.maxPauseTimer.unref?.();
       this.holdSpeech(true);
     }
     if (judging && this.overlap?.utterance !== utt) {
+      // The earlier speech's undecided words get the word list's answer, not none.
+      this.decideNow('replaced');
+      if (line.abort.signal.aborted) return;
       this.dropOverlap();
       this.overlap = { utterance: utt, pending: new Map() };
       utt.contextOnly = true;
@@ -5602,6 +5630,17 @@ export class JevLoop {
       reason,
     });
     this.holdSpeech(false);
+  }
+
+  /** A keep resumes the line once the caller is quiet and the final it covers is in. */
+  private resumeIfKept(): void {
+    const overlap = this.overlap;
+    if (overlap?.keepTalking && overlap.utterance.final && !this.speaking) this.resume('backchannel');
+  }
+
+  /** A pause that ends gives words still awaiting a verdict the word list's answer first. */
+  private decideNow(reason: string): void {
+    if (this.overlap?.timer) this.applyOverlap(null, reason);
   }
 
   private holdSpeech(on: boolean): void {
@@ -5632,6 +5671,9 @@ export class JevLoop {
       text ||= utterance.text;
       utterance.text = text;
       utterance.final = true;
+      // No pause judges it any more: words beyond those it kept are an ordinary turn.
+      if (this.overlap?.utterance !== utterance && !utterance.releasing && utterance.keptText !== spokenKey(text))
+        utterance.contextOnly = false;
     }
     this.reportTranscript(utterance, text, true);
     this.checkOverlap(utterance);
@@ -5654,6 +5696,13 @@ export class JevLoop {
     const line = this.pause?.line;
     if (!overlap || overlap.utterance !== utt || !line || line.abort.signal.aborted) return;
     const text = utt.text.trim();
+    // The final says only what the pause already decided on: that decision stands.
+    if (utt.final && overlap.kept?.text === spokenKey(text)) {
+      clearTimeout(overlap.timer);
+      overlap.timer = overlap.latestId = overlap.retryAfter = undefined;
+      overlap.keepTalking = overlap.kept.keepTalking;
+      return this.resumeIfKept();
+    }
     const current = overlap.latestId;
     if (current && overlap.pending.get(current) === text) return;
     overlap.keepTalking = false;
@@ -5666,7 +5715,8 @@ export class JevLoop {
     }
     // Revisions share one deadline, so a stream of partials cannot postpone the fallback.
     if (!overlap.timer) {
-      overlap.timer = setTimeout(() => this.applyOverlap(null), JEV_OVERLAP_VERDICT_TIMEOUT_MS);
+      overlap.askedAt = this.now();
+      overlap.timer = setTimeout(() => this.applyOverlap(null, 'deadline'), JEV_OVERLAP_VERDICT_TIMEOUT_MS);
       overlap.timer.unref?.();
     }
     for (const [id, pendingText] of overlap.pending) {
@@ -5688,18 +5738,24 @@ export class JevLoop {
     });
   }
 
-  onOverlap(requestId: string, verdict: 'yield' | 'keep_talking' | null): void {
+  /** The host's answer to an overlap request; `reason` says why it has no verdict. */
+  onOverlap(requestId: string, verdict: 'yield' | 'keep_talking' | null, reason?: string): void {
     const overlap = this.overlap;
-    if (!overlap) return;
-    if (!overlap.pending.delete(requestId)) return;
-    if (requestId === overlap.latestId) this.applyOverlap(verdict);
+    const judged = overlap?.pending.get(requestId);
+    if (!overlap || judged === undefined) return;
+    overlap.pending.delete(requestId);
+    if (requestId === overlap.latestId) this.applyOverlap(verdict, verdict ? undefined : (reason ?? 'error'));
+    // Words that still begin with the ones judged a yield take the turn: no need to wait for the latest.
+    else if (verdict === 'yield' && startsWithWords(spokenKey(overlap.utterance.text), spokenKey(judged)))
+      this.applyOverlap(verdict);
     else if (requestId === overlap.retryAfter) {
       // STT revised away from this text and back while the first request was in flight.
       this.checkOverlap(overlap.utterance);
     }
   }
 
-  private applyOverlap(verdict: 'yield' | 'keep_talking' | null): void {
+  /** `fallback`: why the word list decides instead of a Jev verdict. */
+  private applyOverlap(verdict: 'yield' | 'keep_talking' | null, fallback?: string): void {
     const overlap = this.overlap;
     const line = this.pause?.line;
     if (!overlap || !line || this.playing !== line || line.abort.signal.aborted) return;
@@ -5708,15 +5764,27 @@ export class JevLoop {
     if (overlap.latestId) overlap.pending.delete(overlap.latestId);
     overlap.latestId = undefined;
     overlap.retryAfter = undefined;
-    if (verdict === 'yield' || (verdict === null && takesTurn(overlap.utterance.text))) {
+    const utt = overlap.utterance;
+    const cut = verdict === 'yield' || (verdict === null && takesTurn(utt.text));
+    this.deps.log.info('voice-mode worker: the overlap is decided', {
+      replyId: line.replyId,
+      outcome: cut ? 'yield' : 'keep',
+      source: verdict ? 'jev' : (fallback ?? 'error'),
+      ms: overlap.askedAt === undefined ? null : this.now() - overlap.askedAt,
+      chars: utt.text.length,
+    });
+    if (cut) {
       // The turn judge needs the cut playback report in its window before it decides on these words.
-      line.releaseTurn = overlap.utterance;
+      line.releaseTurn = utt;
+      utt.releasing = true;
       this.cutSpeech(line);
       return;
     }
-    // A ducked line is restored on anything short of a cut, but only at speech end, so later words are judged.
+    utt.keptText = spokenKey(utt.text);
+    // A ducked line is restored on anything short of a cut; either way only once the speech is over.
     overlap.keepTalking = verdict === 'keep_talking' || !!this.deps.setSpeechDucked;
-    if (overlap.keepTalking && !this.speaking) this.resume('backchannel');
+    overlap.kept = { text: utt.keptText, keepTalking: overlap.keepTalking };
+    this.resumeIfKept();
   }
 
   private cutSpeech(line: JevPlayout): void {
@@ -5735,7 +5803,7 @@ export class JevLoop {
           await this.play(line);
           const utt = line.releaseTurn;
           if (utt && !this.closed) {
-            utt.contextOnly = false;
+            utt.contextOnly = utt.releasing = false;
             this.reportTranscript(utt, utt.text, !!utt.final);
           }
         }
@@ -5757,6 +5825,12 @@ export class JevLoop {
       outcome = { heard: false, failed: true, cut: false, audioMs: 0, playedMs: 0, complete: false };
     } finally {
       const paused = !!this.pause;
+      const words = this.overlap?.utterance;
+      // A line that ended (stop, revoke, failure) before its pause decided leaves the words an ordinary turn.
+      if (words && spokenKey(words.text) && words.keptText === undefined && !line.releaseTurn) {
+        line.releaseTurn = words;
+        words.releasing = true;
+      }
       this.endPause();
       this.playing = undefined;
       // The speech output lets go of its hold as the line ends; a hold that outlived it would stall the next line.
@@ -5887,7 +5961,7 @@ async function runJevCall(s: JevCallSetup): Promise<void> {
       return response;
     } finally {
       if (!ok) {
-        for (const event of events) if (event.type === 'overlap') loop.onOverlap(event.requestId, null);
+        for (const event of events) if (event.type === 'overlap') loop.onOverlap(event.requestId, null, 'host_error');
       }
     }
   }, callLog);
@@ -6106,7 +6180,7 @@ async function runJevCall(s: JevCallSetup): Promise<void> {
         refreshThinking();
       } else if (event.type === 'stop') loop.onStop();
       else if (event.type === 'words') loop.onWords();
-      else if (event.type === 'overlap') loop.onOverlap(event.requestId, event.verdict);
+      else if (event.type === 'overlap') loop.onOverlap(event.requestId, event.verdict, event.reason);
       else if (event.type === 'revoke') loop.onRevoke(event.replyId);
       else if (!voiceCall) return;
       else if (event.type === 'thinking') {

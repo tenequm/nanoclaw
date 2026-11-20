@@ -1273,6 +1273,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
         },
         kind,
         jevOverlapVerdict: config.jevOverlapVerdict,
+        jevDuck: config.jevDuck,
         callerName: call.line.caller.name,
         agentName: config.wakeName ?? call.line.agent.name,
         agentAliases: [call.line.agent.name, ...(call.line.agent.wakeNames ?? [])].filter(

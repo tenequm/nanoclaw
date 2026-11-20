@@ -333,21 +333,30 @@ heard, and the caller's latest words. Only a verdict for the current text
 and pause can affect playback.
 
 At `p(yield) >= 0.6` the line is cut and the caller's words go to ordinary
-turn handling. At `p(keep_talking) >= 0.7` the line resumes where it stopped
-as soon as the caller's speech ends. The acknowledgement stays in the
-transcript. Between those thresholds, on a host error or rate cap, or after
-1500 ms without a verdict, `takesTurn` checks the current text. A word
-besides acknowledgements and hums cuts the line. Without a keep verdict,
-two seconds of quiet resume playback. A pause lasts at most ten seconds.
+turn handling. A yield for words the current ones still begin with acts at
+once. At `p(keep_talking) >= 0.7` the line resumes where it stopped once
+the caller's speech ends and its final is in: a final with the same letters
+and digits resumes at once, a final with more words is asked about again.
+The acknowledgement stays in the transcript. Between those thresholds, on a
+host error, after 1500 ms without a verdict, or when the quiet timer, the
+maximum pause or a new speech ends the wait, `takesTurn` checks the current
+text. A word besides acknowledgements and hums cuts the line. Without a keep
+verdict, two seconds of quiet resume playback. A pause lasts at most ten
+seconds. Words still undecided when the line ends another way (a host stop,
+a revoke, a failure) go to ordinary turn handling. Barge-in requests have
+their own per-call cap of 30 a minute, so they never use up the turn
+judges'; past it the word list decides. The worker logs each decision
+(`the overlap is decided`, with its outcome and source).
 
 Set `VOICE_MODE_JEV_OVERLAP_VERDICT=0` to use the word list directly.
 Set `VOICE_MODE_JEV_DUCK=1` to try the independent ducking switch. At the
 same 300 ms trigger the audio keeps playing, with gain ramped to -12 dB
-over 50 ms. Unless the line is cut, full gain returns over 400 ms once the
-caller's speech ends. Each gain change takes back the speech queued in the
-track's one-second buffer and sends it again at the new gain, so it is heard
-at once and no audio repeats. On app calls with either switch enabled, the
-worker handles interruptions locally.
+over 50 ms, and Jev is told the line plays on more quietly. Unless the
+line is cut, full gain returns over 400 ms once the caller's speech ends
+and its final is in. Each gain change takes back the speech queued in the
+track's one-second buffer and sends it again at the new gain, so it is
+heard at once and no audio repeats. On app calls with either switch
+enabled, the worker handles interruptions locally.
 Meetings use their existing pause and host word detection.
 
 A jev voice call plays three cues, by the plain call's `cues` and `typing`
