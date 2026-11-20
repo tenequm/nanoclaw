@@ -3,7 +3,7 @@
  * the judge in flight), so `reduce` makes it and records its commands in the state; `decide`
  * returns them. Replaying the event log through `reduce` reproduces every decision.
  */
-import type { Action, CallEvent, Command, RecheckVerdict, Verdict } from './types.js';
+import type { Action, CallEvent, Command, RecheckVerdict, SessionStamp, Verdict } from './types.js';
 import {
   agentSpeaking,
   applyWindow,
@@ -18,6 +18,7 @@ import {
   normalize,
   openTurn,
   pendingAnswer,
+  recordShown,
   refreshVersion,
   renderWindow,
   takesTurn,
@@ -141,7 +142,10 @@ export function reduce(prev: CallState, event: CallEvent): CallState {
       break;
     case 'turn': {
       const wake = state.wakes.find((w) => w.key === event.key);
-      if (wake) wake.turnId = event.turnId;
+      if (wake) {
+        wake.turnId = event.turnId;
+        wake.stored = event.stored;
+      }
       break;
     }
     case 'turn_failed': {
@@ -152,7 +156,7 @@ export function reduce(prev: CallState, event: CallEvent): CallState {
       break;
     }
     case 'reply':
-      onReply(state, event.replyId, event.turnId, event.text);
+      onReply(state, event.replyId, event.turnId, event.text, event.produced);
       break;
     case 'playback': {
       const playing = prev.playout[event.replyId] ?? prev.stoppedPlayout[event.replyId];
@@ -669,29 +673,45 @@ function wake(state: CallState, speakerId: string, uttId: string, message: strin
   state.commands.push({ kind: 'turn', key, message, note, ...(supersedes ? { supersedes } : {}) });
 }
 
-function onReply(state: CallState, replyId: string, turnId: string | null, raw: string): void {
+function onReply(state: CallState, replyId: string, turnId: string | null, raw: string, produced?: SessionStamp): void {
   const text = raw.trim();
-  const wake = turnId === null ? undefined : state.wakes.find((w) => w.turnId === turnId);
+  const tagged = turnId === null ? undefined : state.wakes.find((w) => w.turnId === turnId);
+  const latest = latestWake(state);
+  let wake = tagged;
+  // The runner can keep the first turn's tag while writing an answer with both requests in its session.
+  if (
+    tagged &&
+    !tagged.dropped &&
+    tagged !== latest &&
+    latest?.stored &&
+    awaitingAgent(state) &&
+    produced &&
+    produced.sessionId === latest.stored.sessionId &&
+    tagged.stored?.sessionId === produced.sessionId &&
+    produced.at > latest.stored.at
+  ) {
+    wake = latest;
+    tagged.replied = true;
+  }
   if (wake) wake.replied = true;
-  const fields = { replyId, turnId };
+  const fields = { replyId, turnId, ...(wake !== tagged ? { answeringTurnId: wake?.turnId } : {}) };
 
   if (text.toLowerCase() === '[silent]') {
-    if (wake && wake === latestWake(state)) state.commands.push({ kind: 'status', status: 'idle' });
+    if (wake && wake === latest) state.commands.push({ kind: 'status', status: 'idle' });
     state.commands.push({ kind: 'drop', replyId });
     log(state, 'reply', { ...fields, outcome: 'dropped', reason: 'silent' });
     return;
   }
-  const latest = latestWake(state);
   const reason =
     turnId === null
       ? 'unprompted'
-      : !latest || latest.turnId !== turnId
+      : !latest || wake !== latest
         ? 'replaced'
         : state.stoppedSeq !== null && state.stoppedSeq > latest.seq
           ? 'stopped'
           : null;
   if (reason || !latest) {
-    state.commands.push({ kind: 'show', replyId, text });
+    showReply(state, replyId, text);
     log(state, 'reply', { ...fields, outcome: 'shown', reason });
     return;
   }
@@ -726,16 +746,21 @@ function onReply(state: CallState, replyId: string, turnId: string | null, raw: 
     return;
   }
   if (since > 0 && latest.rechecked?.outcome === 'show') {
-    state.commands.push({ kind: 'show', replyId, text });
+    showReply(state, replyId, text);
     log(state, 'reply', { ...fields, outcome: 'shown', reason: 'not_wanted' });
     return;
   }
   speak(state, replyId, text, latest);
 }
 
+function showReply(state: CallState, replyId: string, text: string): void {
+  recordShown(state, replyId, text);
+  state.commands.push({ kind: 'show', replyId, text });
+}
+
 function speak(state: CallState, replyId: string, text: string, wake: Wake): void {
   state.playout[replyId] = { text, wakeKey: wake.key };
-  state.commands.push({ kind: 'speak', replyId, text });
+  state.commands.push({ kind: 'speak', replyId, text, turnId: wake.turnId });
   log(state, 'reply', { replyId, turnId: wake.turnId, outcome: 'speak' });
 }
 
@@ -763,7 +788,7 @@ function onRecheck(state: CallState, wakeKey: string, verdict: RecheckVerdict | 
   });
   if (show) state.commands.push({ kind: 'status', status: 'idle' });
   for (const { replyId, text } of recheck.replies) {
-    if (show || !wake) state.commands.push({ kind: 'show', replyId, text });
+    if (show || !wake) showReply(state, replyId, text);
     else speak(state, replyId, text, wake);
   }
 }
@@ -773,7 +798,10 @@ function endRecheck(state: CallState, reason: 'stopped' | 'replaced'): void {
   const wake = latestWake(state);
   if (wake?.continuation) {
     for (const { replyId, text } of wake.continuation.replies) {
-      state.commands.push(reason === 'stopped' ? { kind: 'drop', replyId } : { kind: 'show', replyId, text });
+      if (reason === 'stopped') {
+        recordShown(state, replyId, text);
+        state.commands.push({ kind: 'drop', replyId });
+      } else showReply(state, replyId, text);
     }
     delete wake.continuation;
   }
@@ -781,7 +809,7 @@ function endRecheck(state: CallState, reason: 'stopped' | 'replaced'): void {
   if (!recheck) return;
   state.recheck = null;
   log(state, 'recheck', { replyIds: recheck.replies.map((r) => r.replyId), outcome: 'shown', reason });
-  for (const { replyId, text } of recheck.replies) state.commands.push({ kind: 'show', replyId, text });
+  for (const { replyId, text } of recheck.replies) showReply(state, replyId, text);
 }
 
 function logPlayback(state: CallState, event: Extract<CallEvent, { kind: 'playback' }>, wakeKey: string | null): void {

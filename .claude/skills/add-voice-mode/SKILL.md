@@ -320,15 +320,15 @@ The agent waits until an utterance ends with `прийом`, `зулу` or `ов
 (`zulu`, `over` and common transcription variants also work). It receives
 one message with the marker removed. A marker alone releases a pending draft
 and is silent when the draft is empty. Switching the mode off sends the draft.
-Hanging up posts unfinished words to the call chat as the caller, without
-waking the agent. Replies are spoken and the caller can interrupt them or say
+At call end, unfinished words are posted to the caller's thread unless access
+was revoked. A marker finalized during hangup grace still sends the turn.
+Replies are spoken and the caller can interrupt them or say
 `stop`. Typing, the working indicator and the end-of-turn cue stay silent.
 The mode starts off on each call. Meetings use their usual Jev policy.
 
-On supported app calls the worker advertises commands version `4`. The
-settings RPC accepts an optional boolean `listenUntilOver` and echoes the
-current value and the display list `overWords`. Omitting the switch keeps its
-value. Set `VOICE_MODE_OVER_WORDS` on the host to a comma-separated list of
+Jev app calls advertise commands version `3`. The app sends `listenUntilOver`
+with its settings and shows the toggle when the reply contains both the current
+boolean and the display list `overWords`. Omitting the switch keeps its value. Set `VOICE_MODE_OVER_WORDS` on the host to a comma-separated list of
 release words or phrases to replace the defaults.
 
 If the speaker who prompted an answer continues before playback, the host holds
@@ -337,6 +337,14 @@ the continuation together. An answer replaces the pending turn, silence holds
 it for the next boundary, and a stop drops it. An acknowledgement alone keeps
 the original answer. Before its first audio, each queued line waits for the
 host to confirm it can play. Fresh caller speech invalidates that confirmation.
+
+An agent processing two wakes in the same session can answer both under the
+earlier turn's tag. If its reply was written after the session stored the
+latest wake, that first reply answers the still-open request and goes through
+the usual speech check. Once the latest wake has an answer, further replies
+tagged to the older turn stay in chat. An earlier reply delayed in chat
+delivery stays there too. The agent's call window labels chat-only replies
+`[shown, not spoken]`.
 
 With one human in the room (a jev voice call, or a meeting down to one
 person) the loop answers more readily, by the `oneCaller` block in

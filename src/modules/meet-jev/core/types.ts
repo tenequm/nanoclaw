@@ -37,6 +37,12 @@ export type RecheckAction = 'speak' | 'show';
 export const RECHECK_ACTIONS: readonly RecheckAction[] = ['speak', 'show'];
 export type RecheckVerdict = Choice<RecheckAction>;
 
+/** A host/runner epoch timestamp at the session mailbox, independent of chat delivery. */
+export interface SessionStamp {
+  sessionId: string;
+  at: number;
+}
+
 export type CallEvent =
   /** Change explicit release mode on a voice call. */
   | { kind: 'listen'; on: boolean; at: number }
@@ -57,11 +63,11 @@ export type CallEvent =
   /** A `wait` command's timer fired. */
   | { kind: 'timer'; key: string; at: number }
   /** A `turn` command reached the agent's session; `turnId` is the host's utterance id for it. */
-  | { kind: 'turn'; key: string; turnId: string; at: number }
+  | { kind: 'turn'; key: string; turnId: string; stored?: SessionStamp; at: number }
   /** A `turn` command was refused (limits, access) or replaced before delivery. */
   | { kind: 'turn_failed'; key: string; reason: string; at: number }
   /** An agent message for this call; `turnId` is the turn it answers, null when unprompted. */
-  | { kind: 'reply'; replyId: string; turnId: string | null; text: string; at: number }
+  | { kind: 'reply'; replyId: string; turnId: string | null; text: string; produced?: SessionStamp; at: number }
   /**
    * What became of a `speak` command in the room. `delivered` on `cut_off` is the approximate
    * text that got out before the abort.
@@ -92,7 +98,7 @@ export type Command =
    */
   | { kind: 'turn'; key: string; message: string; note: string; supersedes?: string }
   /** Speak a reply into the room. */
-  | { kind: 'speak'; replyId: string; text: string }
+  | { kind: 'speak'; replyId: string; text: string; turnId: string | null }
   | { kind: 'allow_play'; replyId: string; requestId: string }
   /** Show a reply in the call chat without speaking it (a replaced turn, after a stop). */
   | { kind: 'show'; replyId: string; text: string }
@@ -113,8 +119,9 @@ export interface JevLine {
   t: number;
   speaker: string;
   text: string;
-  /** Said by the agent (from playback reports, not from the reply text). */
+  /** An agent line, with playback status or an explicit chat-only marker. */
   agent?: true;
+  shown_only?: true;
   /** The agent was cut off here; `text` is what got out. */
   cut_off?: true;
   /** Still being spoken (a partial). */

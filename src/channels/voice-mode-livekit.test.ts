@@ -297,6 +297,7 @@ async function openHarness(
         );
       }
       if (routing.mode === 'throw') throw new Error('router exploded');
+      if (routing.mode === 'store') event.onStored?.(session);
       return routing.mode === 'store';
     },
     ...overrides,
@@ -2259,7 +2260,9 @@ describe("/meet <link> jev: the loop on each participant's own audio", () => {
       if (event.kind === 'utterance' && event.final) {
         return [{ kind: 'turn', key: event.uttId, message: event.text, note: `WINDOW [${event.speaker.name}]` }];
       }
-      return event.kind === 'reply' ? [{ kind: 'speak', replyId: event.replyId, text: event.text }] : [];
+      return event.kind === 'reply'
+        ? [{ kind: 'speak', replyId: event.replyId, turnId: event.turnId, text: event.text }]
+        : [];
     },
   };
 
@@ -2530,7 +2533,7 @@ describe('/voice jev on the call core', () => {
       if (event.kind !== 'reply') return [];
       if (event.text === '[silent]') return [{ kind: 'drop', replyId: event.replyId }];
       if (event.text.startsWith('show:')) return [{ kind: 'show', replyId: event.replyId, text: event.text }];
-      return [{ kind: 'speak', replyId: event.replyId, text: event.text }];
+      return [{ kind: 'speak', replyId: event.replyId, turnId: event.turnId, text: event.text }];
     },
   };
 
@@ -2965,6 +2968,44 @@ describe('/voice jev with the real core', () => {
     await worker.post('jev', { events: [utt('b', 'Now, finished here.')] });
     await vi.waitFor(() => expect(chat.posts.map((p) => p.text)).toEqual(['🎙 Come over Now']));
     await worker.post('ended');
+    worker.close();
+  });
+
+  it('plays an older-tagged reply as the latest stored turn using its production time', async () => {
+    expect((await post(`${h.base}/livekit/token?v=6&t=tok123&jev=1`)).status).toBe(200);
+    const worker = await attachWorker(h, h.lk.dispatches.at(-1)!.metadata);
+    expect((await worker.post('joined')).status).toBe(200);
+    const t = h.clock.now;
+    const say = async (uttId: string, text: string) =>
+      worker.post('jev', { events: [{ type: 'utterance', uttId, text, final: true, at: h.clock.now }] });
+    await say('long', 'Andy, tell me about the routes.');
+    await vi.waitFor(() => expect(chat.posts).toHaveLength(1));
+    h.clock.now += 2400;
+    await say('more', 'Які ще є варіанти?');
+    await vi.waitFor(() => expect(chat.posts).toHaveLength(2));
+    h.clock.now = t + 6500;
+    const deliver = (id: string, text: string, writtenAt: number) =>
+      liveKitChatDelivered(
+        {
+          id,
+          kind: 'chat',
+          content: JSON.stringify({ text }),
+          timestamp: new Date(writtenAt).toISOString(),
+          channelType: 'telegram',
+          platformId: 'telegram:100',
+          threadId: null,
+          inReplyTo: `${h.inbound[0].id}:ag-andy`,
+        },
+        'ag-andy',
+        'sess-andy',
+      );
+    deliver('delayed', 'Earlier answer.', t + 2000);
+    deliver('current', 'Take the train.', t + 6500);
+    expect(await worker.waitFor((e) => e.type === 'reply')).toMatchObject({ text: 'Take the train.', turn: '2' });
+    h.clock.now += 1000;
+    await say('next', 'How long does it take?');
+    await vi.waitFor(() => expect(h.inbound).toHaveLength(3));
+    expect((h.inbound[2].content as { text: string }).text).toContain('Earlier answer. [shown, not spoken]');
     worker.close();
   });
 

@@ -108,6 +108,8 @@ export interface OutboundRecord {
 
 export interface OutboundDelivery {
   id: string;
+  /** When the runner wrote the reply, before any delivery delay or retry. */
+  timestamp?: IsoTimestamp;
   kind: string;
   platformId: string | null;
   channelType: string | null;
@@ -479,6 +481,7 @@ export function parseOutboundRecord(value: unknown): OutboundRecord {
 export function parseOutboundDelivery(value: unknown): OutboundDelivery {
   const record = strictRecord(value, 'OutboundDelivery', [
     'id',
+    'timestamp',
     'kind',
     'platformId',
     'channelType',
@@ -488,6 +491,7 @@ export function parseOutboundDelivery(value: unknown): OutboundDelivery {
   ]);
   return {
     id: text(record, 'id'),
+    ...('timestamp' in record ? { timestamp: timestamp(record, 'timestamp') } : {}),
     kind: text(record, 'kind'),
     platformId: nullableText(record, 'platformId'),
     channelType: nullableText(record, 'channelType'),
@@ -686,6 +690,7 @@ export function outboundDelivery(record: OutboundRecord): OutboundDelivery {
   const input = parseOutboundRecord(record);
   return parseOutboundDelivery({
     id: input.id,
+    timestamp: input.timestamp,
     kind: input.kind,
     platformId: input.platformId,
     channelType: input.channelType,
