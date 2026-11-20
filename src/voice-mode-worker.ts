@@ -5471,6 +5471,10 @@ async function runJevCall(s: JevCallSetup): Promise<void> {
   let agentSpeaking = false;
   /** The line being spoken, for its recording's telemetry. */
   let speakingReplyId: string | undefined;
+  /**
+   * The agent works on an answer while either holds, as on a plain call: the host's loop woke it
+   * (AWAIT_REPLY_MS, until its reply or the loop's `idle`), or its typing ticks say so (THINKING_HOLD_MS each).
+   */
   let awaitingUntil = 0;
   let typingUntil = 0;
   let thinking = false;
@@ -5710,6 +5714,7 @@ async function runJevCall(s: JevCallSetup): Promise<void> {
           callLog.warn('voice-mode worker: a jev reply names no replyId; not spoken');
           return;
         }
+        // The answer came: what the agent types from here on is new work.
         awaitingUntil = typingUntil = 0;
         loop.onReply(event.replyId, event.text);
         refreshThinking();
@@ -5718,16 +5723,11 @@ async function runJevCall(s: JevCallSetup): Promise<void> {
       else if (event.type === 'revoke') loop.onRevoke(event.replyId);
       else if (!voiceCall) return;
       else if (event.type === 'thinking') {
-        const now = Date.now();
-        if (awaitingUntil <= now) return;
-        // A turn that works past AWAIT_REPLY_MS keeps its wait open while the ticks go on.
-        typingUntil = now + THINKING_HOLD_MS;
-        awaitingUntil = Math.max(awaitingUntil, typingUntil);
+        typingUntil = Date.now() + THINKING_HOLD_MS;
         refreshThinking();
       } else if (event.type === 'status' && (event.status === 'thinking' || event.status === 'idle')) {
         // `heard` and `speaking` say nothing about the agent: it may still work on the turn before.
-        if (event.status === 'thinking') awaitingUntil = Date.now() + AWAIT_REPLY_MS;
-        else awaitingUntil = typingUntil = 0;
+        awaitingUntil = event.status === 'thinking' ? Date.now() + AWAIT_REPLY_MS : 0;
         refreshThinking();
       }
     }, hostLink.signal)

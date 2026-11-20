@@ -234,6 +234,20 @@ describe('typing follows the runner turn state', () => {
     expect(clears).toHaveLength(0);
   });
 
+  it('a host-written delivery pauses typing but keeps the wake grace', async () => {
+    const { sets, clears } = captureSetAndClear();
+    startTypingRefresh(SESS, AG, 'slack', 'C1', 'T1');
+    await vi.advanceTimersByTimeAsync(2_000);
+    pauseTypingRefreshAfterDelivery(SESS, true);
+    await vi.advanceTimersByTimeAsync(9_000);
+    expect(sets).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(sets).toHaveLength(2);
+    expect(clears).toHaveLength(0);
+    await vi.advanceTimersByTimeAsync(4_000);
+    expect(clears).toHaveLength(1);
+  });
+
   it('starts a new wake grace when another inbound arrives during the delivery pause', async () => {
     const { sets } = captureSetAndClear();
     startTypingRefresh(SESS, AG, 'slack', 'C1', 'T1');
