@@ -315,6 +315,22 @@ line to the wake phrase and send word until the caller sends `/voice` (or
 returns the line to jev. A client's `?jev=0` on `livekit/token` makes one call
 plain, and `?jev=1` one jev call. Without the key every call is plain.
 
+On a Jev voice call, enable **Listen until over** to dictate across pauses.
+The agent waits until an utterance ends with `прийом`, `зулу` or `овер`
+(`zulu`, `over` and common transcription variants also work). It receives
+one message with the marker removed. A marker alone releases a pending draft
+and is silent when the draft is empty. Switching the mode off sends the draft.
+Hanging up posts unfinished words to the call chat as the caller, without
+waking the agent. Replies are spoken and the caller can interrupt them or say
+`stop`. Typing, the working indicator and the end-of-turn cue stay silent.
+The mode starts off on each call. Meetings use their usual Jev policy.
+
+On supported app calls the worker advertises commands version `4`. The
+settings RPC accepts an optional boolean `listenUntilOver` and echoes the
+current value and the display list `overWords`. Omitting the switch keeps its
+value. Set `VOICE_MODE_OVER_WORDS` on the host to a comma-separated list of
+release words or phrases to replace the defaults.
+
 If the speaker who prompted an answer continues before playback, the host holds
 the reply through their final transcript. Jev judges the original request and
 the continuation together. An answer replaces the pending turn, silence holds

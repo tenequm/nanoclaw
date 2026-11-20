@@ -6923,11 +6923,13 @@ function jevLoop({ transcribed = true, app = false }: { transcribed?: boolean; a
     /** The events so far, one word each. */
     kinds: () =>
       events.map((e) =>
-        e.type === 'playback'
-          ? `${e.replyId}:${e.state}`
-          : e.type === 'speech'
-            ? `speech:${e.on ? 'on' : 'off'}`
-            : `${e.final ? 'final' : 'partial'}:${e.text}`,
+        e.type === 'hangup'
+          ? 'hangup'
+          : e.type === 'playback'
+            ? `${e.replyId}:${e.state}`
+            : e.type === 'speech' || e.type === 'listen'
+              ? `${e.type}:${e.on ? 'on' : 'off'}`
+              : `${e.final ? 'final' : 'partial'}:${e.text}`,
       ),
     /** The line's first audio plays. */
     start: (line: Line) => {
@@ -7648,11 +7650,13 @@ describe('jev calls', () => {
       .filter((c) => c.url.endsWith('/jev'))
       .map((c) => (c.body!.events as JevWorkerEvent[]).filter((e) => e.type !== 'play_ready'));
   const summary = (e: Exclude<JevWorkerEvent, { type: 'play_ready' }>) =>
-    e.type === 'playback'
-      ? `${e.replyId}:${e.state}`
-      : e.type === 'speech'
-        ? `speech:${e.on ? 'on' : 'off'}`
-        : `${e.final ? 'final' : 'partial'}:${e.text}`;
+    e.type === 'hangup'
+      ? 'hangup'
+      : e.type === 'playback'
+        ? `${e.replyId}:${e.state}`
+        : e.type === 'speech' || e.type === 'listen'
+          ? `${e.type}:${e.on ? 'on' : 'off'}`
+          : `${e.final ? 'final' : 'partial'}:${e.text}`;
 
   it.each([
     { client: 'plain app', meta: { appCall: true }, trigger: 'settings-after-subscribe' },
@@ -7759,6 +7763,45 @@ describe('jev calls', () => {
     await vi.waitFor(() => expect(job.shutdown).toHaveBeenCalledWith('host: done'));
     expect(v.voice.close).toHaveBeenCalled();
     expect(host.calls.some((c) => c.url.endsWith('/ended'))).toBe(false);
+  });
+
+  it('echoes the listen setting, silences thinking and turn cues, and still speaks the reply', async () => {
+    vi.useFakeTimers();
+    const overWords = ['прийом', 'зулу', 'овер'];
+    const meta = { ...JEV_META, appCall: true, overWords };
+    expect(callControlAttributes(meta)[CALL_COMMANDS_ATTRIBUTE]).toBe('4');
+    const { ctx } = fakeJob(meta);
+    const host = fakeHostFetch();
+    const v = fakeVoice();
+    const setTyping = vi.fn();
+    Object.assign(v.voice, { setTyping });
+    await runCall(ctx, callDeps(host.fetchImpl, v));
+    expect(await v.rpc('settings')).toMatchObject({ listenUntilOver: false, overWords });
+    host.emit({ type: 'thinking' });
+    await vi.advanceTimersByTimeAsync(10);
+    expect(setTyping).toHaveBeenLastCalledWith(true);
+    expect(await v.rpc('settings', { listenUntilOver: true })).toMatchObject({ listenUntilOver: true, overWords });
+    expect(v.voice.setThinking).toHaveBeenLastCalledWith(false);
+    expect(setTyping).toHaveBeenLastCalledWith(false);
+    setTyping.mockClear();
+    v.voice.setThinking.mockClear();
+    expect(await v.rpc('settings', { cues: true })).toMatchObject({ listenUntilOver: true });
+    host.emit({ type: 'status', status: 'thinking' });
+    host.emit({ type: 'reply', text: 'Spoken.', replyId: 'r1' });
+    host.emit({ type: 'thinking' });
+    await vi.advanceTimersByTimeAsync(TURN_CUE_DELAY_MS + 100);
+    expect(v.voice.speak).toHaveBeenCalledTimes(1);
+    expect(v.voice.setThinking).not.toHaveBeenCalled();
+    expect(setTyping).not.toHaveBeenCalled();
+    expect(v.voice.playCue.mock.calls.map(([kind]) => kind)).not.toContain('turn');
+    expect(await v.rpc('settings', { listenUntilOver: false })).toMatchObject({ listenUntilOver: false });
+    expect(
+      jevEvents(host)
+        .flat()
+        .filter((e) => e.type === 'listen')
+        .map((e) => e.on),
+    ).toEqual([true, false]);
+    host.endStream();
   });
 
   it("a voice call plays its cues from the host's status: listening, typing while the agent works, your turn after a line", async () => {
@@ -8249,52 +8292,56 @@ describe('jev calls', () => {
     );
   });
 
-  it('clears the speech sink in the app interrupt callback and posts the cut to the host', async () => {
-    const host = fakeHostFetch();
-    const { ctx, job } = fakeJob({ ...JEV_META, appCall: true });
-    const sink = {
-      captureFrame: vi.fn(async () => undefined),
-      queuedDuration: 50,
-      waitForPlayout: vi.fn(() => new Promise<void>(() => {})),
-      clearQueue: vi.fn(),
-    };
-    const v = fakeVoice((meta, settings, events) =>
-      speechOutput({
-        meta,
-        settings,
-        sink,
-        log: silentLog,
-        started: () => events.onAgentSpeaking(true),
-        stopped: () => events.onAgentSpeaking(false),
-        changed: () => undefined,
-        build: () => fakeTts(() => ({ chunks: 3, samples: 2400 })).instance,
-      }),
-    );
-    await runCall(ctx, callDeps(host.fetchImpl, v));
-    try {
-      host.emit({ type: 'reply', replyId: 'first', text: 'One two three.' });
-      await vi.waitFor(() => expect(sink.waitForPlayout).toHaveBeenCalledOnce());
-      const frames = sink.captureFrame.mock.calls.length;
-      expect(
-        v.events.onInterrupt!({ heard: 'Wait', cutAtMs: 100, micMs: 150, playedMs: 100 }, { sid: 'mic', from: 0 }),
-      ).toEqual({ ok: true });
-      expect(sink.clearQueue).toHaveBeenCalledOnce();
-      await vi.waitFor(() =>
-        expect(jevEvents(host).flat()).toContainEqual(
-          expect.objectContaining({
-            type: 'playback',
-            state: 'cut_off',
-            replyId: 'first',
-            delivered: 'One',
-          }),
-        ),
+  it.each([false, true])(
+    'clears the speech sink in the app interrupt callback with listenUntilOver=%s',
+    async (listenUntilOver) => {
+      const host = fakeHostFetch();
+      const { ctx, job } = fakeJob({ ...JEV_META, appCall: true, overWords: ['over'] });
+      const sink = {
+        captureFrame: vi.fn(async () => undefined),
+        queuedDuration: 50,
+        waitForPlayout: vi.fn(() => new Promise<void>(() => {})),
+        clearQueue: vi.fn(),
+      };
+      const v = fakeVoice((meta, settings, events) =>
+        speechOutput({
+          meta,
+          settings,
+          sink,
+          log: silentLog,
+          started: () => events.onAgentSpeaking(true),
+          stopped: () => events.onAgentSpeaking(false),
+          changed: () => undefined,
+          build: () => fakeTts(() => ({ chunks: 3, samples: 2400 })).instance,
+        }),
       );
-      expect(sink.captureFrame).toHaveBeenCalledTimes(frames);
-    } finally {
-      host.emit({ type: 'end', reason: 'done' });
-      await vi.waitFor(() => expect(job.shutdown).toHaveBeenCalled());
-    }
-  });
+      await runCall(ctx, callDeps(host.fetchImpl, v));
+      try {
+        expect(await v.rpc('settings', { listenUntilOver })).toMatchObject({ listenUntilOver });
+        host.emit({ type: 'reply', replyId: 'first', text: 'One two three.' });
+        await vi.waitFor(() => expect(sink.waitForPlayout).toHaveBeenCalledOnce());
+        const frames = sink.captureFrame.mock.calls.length;
+        expect(
+          v.events.onInterrupt!({ heard: 'Wait', cutAtMs: 100, micMs: 150, playedMs: 100 }, { sid: 'mic', from: 0 }),
+        ).toEqual({ ok: true });
+        expect(sink.clearQueue).toHaveBeenCalledOnce();
+        await vi.waitFor(() =>
+          expect(jevEvents(host).flat()).toContainEqual(
+            expect.objectContaining({
+              type: 'playback',
+              state: 'cut_off',
+              replyId: 'first',
+              delivered: 'One',
+            }),
+          ),
+        );
+        expect(sink.captureFrame).toHaveBeenCalledTimes(frames);
+      } finally {
+        host.emit({ type: 'end', reason: 'done' });
+        await vi.waitFor(() => expect(job.shutdown).toHaveBeenCalled());
+      }
+    },
+  );
 
   it("a jev meeting transcribes nothing: VAD marks and playback go to agent/jev, and the host's words cut a line", async () => {
     const { ctx, job, room } = fakeJob({

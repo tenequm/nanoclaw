@@ -4,6 +4,7 @@
  */
 import { describe, expect, it } from 'vitest';
 
+import { overWordForms, parseOverWords } from '../../channels/voice-mode-protocol.js';
 import { vocativeOf } from './core/decide.js';
 import { callCore, type CallState } from './core/index.js';
 import type { Action, CallEvent, CallKind, Command, Speaker } from './core/types.js';
@@ -97,6 +98,56 @@ function wakeAndSpeak(call: Call, text: string, answer: string, n: number): stri
   call.feed({ kind: 'playback', replyId, state: 'started' });
   return replyId;
 }
+
+describe('listen until over', () => {
+  const caller: Speaker = { id: 'caller', name: 'Caller' };
+  function listening(markers?: string) {
+    const call = new Call();
+    call.state.policy.overWords = overWordForms(parseOverWords(markers));
+    call.feed({ kind: 'listen', on: true });
+    return call;
+  }
+
+  it.each(['прийом.', 'Прийом!', 'Zulu', 'зулу?', 'OVER!', 'овер', 'оувер…', 'приём'])(
+    'strips a final %s and ignores a marker alone',
+    (marker) => {
+      const call = listening();
+      expect(call.say(caller, 'empty', marker)).toEqual([]);
+      expect(call.say(caller, 'one', 'Go over the handover')).toEqual([]);
+      const commands = call.say(caller, 'two', 'Next, ' + marker);
+      expect(commands).toEqual([expect.objectContaining({ kind: 'turn', message: 'Go over the handover Next' })]);
+      expect(call.statuses).not.toContainEqual({ kind: 'status', status: 'thinking' });
+    },
+  );
+
+  it('waits for an earlier final before releasing a later marker; each new draft remains separate', () => {
+    const call = listening('end message');
+    const speech = (uttId: string, on: boolean) => call.feed({ kind: 'speech', speaker: caller, uttId, on });
+    const final = (uttId: string, text: string) =>
+      call.feed({ kind: 'utterance', speaker: caller, uttId, text, final: true });
+    speech('a', true);
+    speech('a', false);
+    speech('b', true);
+    speech('b', false);
+    expect(final('b', 'Plan, END MESSAGE.')).toEqual([]);
+    expect(final('a', 'Look over')).toEqual([expect.objectContaining({ kind: 'turn', message: 'Look over Plan' })]);
+    call.feed({ kind: 'turn', key: 'w1', turnId: 't1' });
+    expect(final('c', 'Next draft')).toEqual([]);
+    expect(call.feed({ kind: 'reply', replyId: 'r1', turnId: 't1', text: 'Confirmed.' })).toEqual([
+      { kind: 'speak', replyId: 'r1', text: 'Confirmed.' },
+    ]);
+    call.feed({ kind: 'playback', replyId: 'r1', state: 'started' });
+    expect(final('stop', 'стоп')).toContainEqual({ kind: 'stop_playback' });
+    expect(call.feed({ kind: 'hangup' })).toEqual([{ kind: 'post_caller', text: 'Next draft' }]);
+  });
+
+  it('ignores a judge verdict already in flight when listening starts', () => {
+    const call = new Call();
+    const [judge] = only(call.say(caller, 'a', 'What time is it?'), 'judge');
+    call.feed({ kind: 'listen', on: true });
+    expect(call.verdict(judge.windowVersion, 'answer')).toEqual([]);
+  });
+});
 
 describe('follow-up exchanges', () => {
   it('has no exchange before a reply finishes', () => {

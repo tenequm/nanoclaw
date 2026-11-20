@@ -68,6 +68,7 @@ import {
   settleWithin,
   baseLanguage,
   DEFAULT_VOICE_LANGUAGES,
+  parseOverWords,
   MAX_JEV_EVENTS_PER_POST,
   MAX_JEV_POST_BYTES,
   WORKER_REQUEST_TIMEOUT_MS,
@@ -233,6 +234,7 @@ export interface SpeechSettings {
 export interface LiveKitVoiceConfig {
   /** The wake phrase's name (wakePhraseName): what a jev call's people call the agent, over the line's agent name. */
   wakeName?: string;
+  overWords?: string[];
   /** VOICE_MODE_LANGUAGES as parseVoiceLanguages read it; DEFAULT_VOICE_LANGUAGES when unset. */
   languages?: readonly string[];
   /** Signaling URL the caller's browser connects to (LIVEKIT_URL). */
@@ -615,6 +617,7 @@ export async function readJsonObject(
 export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost): LiveKitVoice {
   const api = config.api ?? defaultApi(config);
   const agentName = config.agentName || DEFAULT_LIVEKIT_AGENT_NAME;
+  const overWords = config.overWords ?? parseOverWords();
   const languages = config.languages?.length ? [...config.languages] : [...DEFAULT_VOICE_LANGUAGES];
   // What every turn tells the agent about the caller's language; the same for the engine's life.
   const languageNote = callLanguageNote(languages);
@@ -628,7 +631,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
   const endHookTimeoutMs = config.endHookTimeoutMs ?? END_HOOK_TIMEOUT_MS;
   const calls = new Map<string, LiveKitCall>();
   /** Calls the caller's page hung up, by call id, while their worker may still post a turn (HANGUP_GRACE_MS). */
-  const hungUp = new Map<string, { call: LiveKitCall; timer: ReturnType<typeof setTimeout> }>();
+  const hungUp = new Map<string, { call: LiveKitCall; timer: ReturnType<typeof setTimeout>; drainingDraft: boolean }>();
   const cleanups = new Set<Promise<void>>();
   const staleRoomChecks = new Set<ReturnType<typeof setTimeout>>();
   /** Per line, so transcripts land in the order they were spoken. */
@@ -639,8 +642,10 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
   const findCall = (callId: unknown): LiveKitCall | undefined =>
     typeof callId === 'string' ? [...calls.values()].find((c) => c.callId === callId) : undefined;
 
-  const endGrace = (callId: string): void => {
-    clearTimeout(hungUp.get(callId)?.timer);
+  const endGrace = (callId: string, saveDraft = true): void => {
+    const late = hungUp.get(callId);
+    if (late?.drainingDraft) late.call.jev?.end('hangup', saveDraft);
+    clearTimeout(late?.timer);
     hungUp.delete(callId);
   };
 
@@ -781,9 +786,17 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
   };
 
   /** Best effort and off the caller's path; ordered per line. */
-  const mirror = (platformId: string, chat: CallChat, text: string, voice?: 'caller'): void => {
+  const mirror = (
+    platformId: string,
+    chat: CallChat,
+    text: string,
+    voice?: 'caller',
+    canPost?: () => Promise<boolean>,
+  ): void => {
     const next = (mirrorChains.get(platformId) ?? Promise.resolve())
-      .then(() => postToChat(chat, text, voice))
+      .then(async () => {
+        if (!canPost || (await canPost())) await postToChat(chat, text, voice);
+      })
       .catch((err: unknown) =>
         log.warn('livekit-voice-mode: transcript post failed', { platformId, chat: chat.group.id, err }),
       );
@@ -866,7 +879,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
   const endCall = (call: LiveKitCall, reason: string, end?: CallEndReason): void => {
     if (call.ended) return;
     call.ended = true;
-    call.jev?.end(reason);
+    if (!hungUp.get(call.callId)?.drainingDraft) call.jev?.end(reason, end === 'worker_gone' || reason === 'hangup');
     clearTimeout(call.joinTimer);
     clearTimeout(call.streamTimer);
     clearTimeout(call.expires);
@@ -916,7 +929,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
       log.warn('livekit-voice-mode: call access check failed', { platformId: call.platformId, err });
     }
     endCall(call, 'caller access revoked or line changed', 'revoked');
-    endGrace(call.callId);
+    endGrace(call.callId, false);
     return false;
   };
 
@@ -973,6 +986,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     const metadata: LiveKitJobMetadata = {
       v: LIVEKIT_PROTOCOL_VERSION,
       ...(job.jev ? { confirmPlayout: true } : {}),
+      ...(job.jev && !job.meeting ? { overWords } : {}),
       callId,
       lineId: platformId,
       agentName: line.agent.name,
@@ -1183,7 +1197,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
         endCall(call, 'no chat to talk in');
         return { status: 409, body: 'The call has no chat to talk in' };
       }
-      if (jev?.signal.aborted) return { status: 409, body: 'The turn was superseded' };
+      if (jev && (call.ended || jev.signal.aborted)) return { status: 409, body: 'The turn was superseded' };
       const utteranceId = String(++call.utterances);
       const sender = call.kind.sender(call.line);
       const message: InboundEvent['message'] = {
@@ -1275,6 +1289,15 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
           (name) => name !== (config.wakeName ?? call.line.agent.name),
         ),
         maxTextBytes: MAX_UTTERANCE_TEXT_BYTES,
+        overWords,
+        postCaller: (text) => {
+          const chat = call.chat;
+          if (chat)
+            mirror(call.platformId, chat, `${CALLER_MARK}${text}`, 'caller', async () => {
+              const line = await host.resolveLine(call.platformId);
+              return !!line && sameCallerAndAgent(call.line, line) && sameChat(chat, await probeChat(call));
+            });
+        },
         submitTurn: (message, note, signal) => submitTurn(call, message, note, signal),
         push: (event) => {
           if (!call.ended) push(call, event);
@@ -1324,6 +1347,9 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     if (late && secret && sameSecret(secret, late.secret)) {
       // The page hung up: the worker's turns still land within the grace; its `ended` closes it.
       if (route === 'livekit/agent/utterance') return onUtterance(res, late, body);
+      if (route === 'livekit/agent/jev' && hungUp.get(late.callId)?.drainingDraft && (await checkAccess(late))) {
+        return onJev(res, late, body);
+      }
       if (route === 'livekit/agent/ended') {
         endGrace(late.callId);
         return reply(res, 204, '');
@@ -1354,12 +1380,13 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     async endCall(platformId, callId, reason, { grace = false } = {}) {
       const call = calls.get(platformId);
       if (!call || call.callId !== callId) return;
-      endCall(call, reason);
       if (grace) {
-        const timer = setTimeout(() => hungUp.delete(call.callId), hangupGraceMs);
+        const drainingDraft = call.jev?.drainDraft() ?? false;
+        const timer = setTimeout(() => endGrace(call.callId), hangupGraceMs);
         timer.unref();
-        hungUp.set(call.callId, { call, timer });
+        hungUp.set(call.callId, { call, timer, drainingDraft });
       }
+      endCall(call, reason);
       await call.cleanup;
     },
 

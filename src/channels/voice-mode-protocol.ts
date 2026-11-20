@@ -96,6 +96,8 @@ export interface LiveKitJobMetadata {
   callerIdentity: string;
   /** The host confirms each Jev reply immediately before its first audio. */
   confirmPlayout?: true;
+  /** Jev voice calls supporting explicit turn release, in display order. */
+  overWords?: string[];
   /** A call started through the app API. */
   appCall?: boolean;
   /** Spelling hints for the transcription: VOICE_MODE_VOCABULARY plus the agent's voice.vocabulary.txt. */
@@ -130,6 +132,8 @@ export interface LiveKitJobMetadata {
  * on `/voice jev` everything heard is the caller.
  */
 export type JevWorkerEvent =
+  | { type: 'hangup'; at: number }
+  | { type: 'listen'; on: boolean; at: number }
   /** Words heard: partials of one `uttId` update it, its final replaces it. */
   | { type: 'utterance'; uttId: string; text: string; final: boolean; at: number }
   /** VAD start or end of speech on the call's input. */
@@ -296,6 +300,27 @@ export const CALL_COMMANDS_ATTRIBUTE = 'nanoclaw.voice-mode.commands';
  * which then stays wake-gated until that page is reloaded.
  */
 export const CALL_COMMANDS_VERSION = '3';
+export const JEV_LISTEN_COMMANDS_VERSION = '4';
+
+const PRIYOM = 'прийом';
+const ZULU = 'zulu';
+const OVER_MARKERS = [
+  [PRIYOM, 'приём', 'прием'],
+  ['зулу', ZULU],
+  ['овер', 'over', 'оувер'],
+];
+
+export function parseOverWords(raw?: string): string[] {
+  const configured = raw
+    ?.split(',')
+    .map((word) => word.trim())
+    .filter(Boolean);
+  return configured?.length ? [...new Set(configured)] : OVER_MARKERS.map(([display]) => display);
+}
+
+export function overWordForms(display: readonly string[]): string[] {
+  return display.flatMap((word) => OVER_MARKERS.find((group) => group.includes(word.toLowerCase())) ?? [word]);
+}
 
 export type CallCommand = 'send' | 'discard';
 /**
@@ -321,10 +346,10 @@ export interface CallCommandWords {
 export const CALL_COMMAND_WORDS: CallCommandWords = {
   v: 1,
   send: [
-    { say: 'zulu', hint: true },
+    { say: ZULU, hint: true },
     { say: 'copy', ownSentence: true, hint: true },
     { say: 'copy that', ownSentence: true },
-    { say: 'прийом' },
+    { say: PRIYOM },
   ],
   discard: [{ say: 'scratch that', hint: true }, { say: 'discard turn' }, { say: 'discard this turn' }],
 };
@@ -406,6 +431,7 @@ export interface CallReviewState {
 
 /** `gen` is the page's own operation counter, echoed back; `draft` names the draft an operation is for. */
 export interface ReviewRequest {
+  listenUntilOver?: boolean;
   gen: number;
   draft?: number;
   /** For `mode`: the mode to switch to; absent, the worker only sends its state again. */
@@ -428,6 +454,10 @@ export interface ReviewRequest {
  * to review, a turn auto mode had already sent after `afterTurn`. `error`: why nothing happened.
  */
 export interface ReviewReply {
+  listenUntilOver?: boolean;
+  overWords?: string[];
+  cues?: boolean;
+  typing?: boolean;
   gen: number;
   ok: boolean;
   seq: number;

@@ -97,7 +97,19 @@ export interface Judging {
   retried: boolean;
 }
 
+export interface ListenPiece {
+  speakerId: string;
+  uttId: string;
+  text: string;
+  final: boolean;
+  interrupted: boolean;
+  releases?: boolean;
+}
+
 export interface CallState {
+  /** Speech-start order, including activities whose final has yet to arrive. Null in automatic mode. */
+  listenDraft: ListenPiece[] | null;
+  hangingUp?: true;
   policy: CallPolicy;
   /** The newest event's time; `t` in the Jev window counts back from it. */
   now: number;
@@ -136,6 +148,7 @@ export interface CallState {
 export function initial(policy: CallPolicy, at: number): CallState {
   const state: CallState = {
     policy,
+    listenDraft: null,
     now: at,
     seq: 0,
     windowVersion: 0,
@@ -311,7 +324,12 @@ export function applyWindow(state: CallState, event: CallEvent): void {
     case 'speech': {
       const speaker = touchSpeaker(state, event.speaker.id, event.speaker.name);
       if (event.on && !speaker.speaking) speaker.speeches += 1;
-      if (event.on && event.uttId && event.uttId !== speaker.lastUttId && unstartedWake(state, event.speaker.id)) {
+      if (
+        event.on &&
+        event.uttId &&
+        event.uttId !== speaker.lastUttId &&
+        (state.listenDraft || unstartedWake(state, event.speaker.id))
+      ) {
         // Identify this activity before any final from an earlier transcription can arrive.
         state.utterances.push({
           speakerId: event.speaker.id,

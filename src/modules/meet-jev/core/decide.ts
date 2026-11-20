@@ -28,6 +28,7 @@ import {
   unstartedWake,
   utterancesSince,
   type CallState,
+  type ListenPiece,
   type Wake,
 } from './window.js';
 
@@ -47,8 +48,9 @@ const STOP_WORDS = new Set([
 
 export function reduce(prev: CallState, event: CallEvent): CallState {
   const state = structuredClone<CallState>({ ...prev, commands: [] });
+  if (state.hangingUp && event.kind !== 'speech' && event.kind !== 'utterance' && event.kind !== 'hangup') return state;
   applyWindow(state, event);
-  if (event.kind === 'speech' || event.kind === 'utterance') holdContinuation(state, event);
+  if (!state.listenDraft && (event.kind === 'speech' || event.kind === 'utterance')) holdContinuation(state, event);
   if (event.kind === 'utterance' && event.final && continuationFor(state, event.speaker.id)) {
     const previous = latestUtterance(prev, event.speaker.id);
     if (previous?.uttId === event.uttId && previous.final && previous.text !== event.text.trim())
@@ -56,7 +58,18 @@ export function reduce(prev: CallState, event: CallEvent): CallState {
   }
   const out = state.commands;
   switch (event.kind) {
+    case 'listen':
+      if (state.policy.kind === 'voice') setListening(state, event.on);
+      break;
+    case 'hangup':
+      if (event.draining) state.hangingUp = true;
+      else if (state.listenDraft) flushDraft(state, state.listenDraft.splice(0), true);
+      break;
     case 'utterance':
+      if (state.listenDraft) {
+        capturePiece(state, event.speaker.id, event.uttId, event);
+        break;
+      }
       if (event.final && hasWords(event.text)) out.push({ kind: 'status', status: 'heard' });
       // An older final can settle the last open piece of a pending turn.
       if (
@@ -67,6 +80,10 @@ export function reduce(prev: CallState, event: CallEvent): CallState {
         boundary(state, event.speaker.id);
       break;
     case 'speech':
+      if (state.listenDraft) {
+        if (event.on && event.uttId) capturePiece(state, event.speaker.id, event.uttId);
+        break;
+      }
       if (event.on) break;
       if (!latestUtterance(state, event.speaker.id)?.final) {
         // The timer decides on the partial only when the final never comes.
@@ -80,7 +97,7 @@ export function reduce(prev: CallState, event: CallEvent): CallState {
       }
       break;
     case 'timer':
-      if (event.key.startsWith(BOUNDARY_TIMER)) {
+      if (!state.listenDraft && event.key.startsWith(BOUNDARY_TIMER)) {
         const speakerId = event.key.slice(BOUNDARY_TIMER.length);
         if (!stillSpeaking(state, speakerId)) boundary(state, speakerId);
       }
@@ -115,7 +132,7 @@ export function reduce(prev: CallState, event: CallEvent): CallState {
       const playing = prev.playout[event.replyId] ?? prev.stoppedPlayout[event.replyId];
       // An older line that ends, or was revoked, says nothing about the turn the agent still works on.
       if (playing) {
-        const over = awaitingAgent(state) ? 'thinking' : 'idle';
+        const over = !state.listenDraft && awaitingAgent(state) ? 'thinking' : 'idle';
         out.push({ kind: 'status', status: event.state === 'started' ? 'speaking' : over });
       }
       if (playing && event.state !== 'started') logPlayback(state, event, playing.wakeKey);
@@ -144,6 +161,101 @@ export function reduce(prev: CallState, event: CallEvent): CallState {
 
 export function decide(state: CallState, _event: CallEvent): Command[] {
   return state.commands;
+}
+
+function isStop(rest: string): boolean {
+  return (
+    rest === 'please stop' ||
+    rest === 'stop please' ||
+    (rest.length > 0 &&
+      rest
+        .replace(/\bhold on\b/g, 'wait')
+        .split(' ')
+        .every((word) => STOP_WORDS.has(word)))
+  );
+}
+
+function setListening(state: CallState, on: boolean): void {
+  if (on === !!state.listenDraft) return;
+  if (!on) {
+    flushDraft(state, state.listenDraft!, false);
+    state.listenDraft = null;
+    if (awaitingAgent(state)) state.commands.push({ kind: 'status', status: 'thinking' });
+    return;
+  }
+  state.listenDraft = [];
+  state.commands.push({ kind: 'status', status: agentSpeaking(state) ? 'speaking' : 'idle' });
+  state.judging = null;
+  state.deferred = null;
+  const wake = latestWake(state);
+  if (wake) {
+    const held = [...(state.recheck?.replies ?? []), ...(wake.continuation?.replies ?? [])];
+    state.recheck = null;
+    delete wake.continuation;
+    for (const reply of held) onReply(state, reply.replyId, wake.turnId, reply.text);
+  }
+}
+
+function flushDraft(state: CallState, pieces: ListenPiece[], hangup: boolean): void {
+  const last = pieces.at(-1);
+  if (!last) return;
+  const text = pieces
+    .map((piece) => piece.text)
+    .filter(hasWords)
+    .join(' ');
+  for (const piece of pieces) {
+    if (piece.final || piece.text) markHandled(state.speakers[piece.speakerId], piece.uttId);
+  }
+  if (!text) return;
+  if (hangup) state.commands.push({ kind: 'post_caller', text });
+  else wake(state, last.speakerId, last.uttId, text);
+}
+
+function capturePiece(
+  state: CallState,
+  speakerId: string,
+  uttId: string,
+  transcript?: { text: string; final: boolean },
+): void {
+  const draft = state.listenDraft!;
+  if (isHandled(state.speakers[speakerId], uttId)) return;
+  let piece = draft.find((item) => item.uttId === uttId);
+  if (!piece) {
+    piece = { speakerId, uttId, text: '', final: false, interrupted: agentSpeaking(state) };
+    draft.push(piece);
+  }
+  if (!transcript) return;
+  piece.text = transcript.text.trim();
+  piece.final = transcript.final;
+  if (!piece.final) return;
+  if (
+    (piece.interrupted || agentSpeaking(state) || pendingAnswer(state)) &&
+    isStop(vocativeOf(piece.text, [state.policy.agentName, ...state.policy.agentAliases]).rest)
+  ) {
+    if (!state.hangingUp) stop(state);
+    markHandled(state.speakers[speakerId], uttId);
+    draft.splice(draft.indexOf(piece), 1);
+  } else {
+    const rest = beforeMarker(piece.text, state.policy.overWords ?? []);
+    piece.releases = rest !== null;
+    if (rest !== null) piece.text = rest;
+  }
+  if (state.hangingUp) return;
+  // A later activity can finalize first. A marker only releases through its own position.
+  for (let i = 0; i < draft.length && draft[i].final; i++) {
+    if (!draft[i].releases) continue;
+    flushDraft(state, draft.splice(0, i + 1), false);
+    i = -1;
+  }
+}
+
+function beforeMarker(text: string, markers: string[]): string | null {
+  const end = text.replace(/[\s\p{P}]+$/gu, '');
+  for (const marker of markers) {
+    const match = new RegExp(`(?:^|[\\s\\p{P}])${escapeRegExp(marker)}$`, 'iu').exec(end);
+    if (match) return end.slice(0, end.length - marker.length).replace(/[\s,;:–—-]+$/gu, '');
+  }
+  return null;
 }
 
 function continuationFor(state: CallState, speakerId: string): Wake | undefined {
@@ -227,15 +339,7 @@ function decideLatest(state: CallState, speakerId: string): boolean {
   const names = [state.policy.agentName, ...state.policy.agentAliases];
   const piece = { trigger: utt.text, speaker: speaker.name };
   const { vocative, rest } = vocativeOf(utt.text, names);
-  if (
-    rest === 'please stop' ||
-    rest === 'stop please' ||
-    (rest.length > 0 &&
-      rest
-        .replace(/\bhold on\b/g, 'wait')
-        .split(' ')
-        .every((word) => STOP_WORDS.has(word)))
-  ) {
+  if (isStop(rest)) {
     if (agentSpeaking(state) || pendingAnswer(state)) {
       speaker.closedAt = utt.startedAt;
       stop(state);
@@ -442,12 +546,16 @@ function wake(state: CallState, speakerId: string, uttId: string, message: strin
     log(state, 'reply', { replyId, outcome: 'revoked', reason: 'replaced' });
   }
   const prev = latestWake(state);
-  const supersedes = prev && prev.turnId === null && !prev.dropped ? prev.key : undefined;
+  const supersedes = !state.listenDraft && prev && prev.turnId === null && !prev.dropped ? prev.key : undefined;
   if (prev && supersedes) prev.dropped = true;
   const key = `w${++state.wakeCount}`;
   const note = [
-    `You are on a live ${state.policy.kind === 'voice' ? 'voice call' : 'meeting call'}. What was said, oldest first, each line labelled with its speaker:`,
-    renderWindow(state),
+    ...(state.listenDraft
+      ? ['You are on a live voice call.']
+      : [
+          `You are on a live ${state.policy.kind === 'voice' ? 'voice call' : 'meeting call'}. What was said, oldest first, each line labelled with its speaker:`,
+          renderWindow(state),
+        ]),
     ...(extra ? [extra] : []),
     'Reply in one or two short spoken sentences; your reply is read aloud. If nothing needs saying, reply exactly [silent].',
   ].join('\n\n');
@@ -471,7 +579,7 @@ function wake(state: CallState, speakerId: string, uttId: string, message: strin
     },
   ].slice(-WAKES_KEPT);
   state.cutOffAfter = null;
-  state.commands.push({ kind: 'status', status: 'thinking' });
+  if (!state.listenDraft) state.commands.push({ kind: 'status', status: 'thinking' });
   state.commands.push({ kind: 'turn', key, message, note, ...(supersedes ? { supersedes } : {}) });
 }
 
@@ -503,6 +611,10 @@ function onReply(state: CallState, replyId: string, turnId: string | null, raw: 
   }
   // People spoke after the trigger: the answer may no longer be wanted. Ask Jev once before speaking (held
   // meanwhile; a stop or a newer wake shows it); nobody spoke, or the same people since the last check: no call.
+  if (state.listenDraft) {
+    speak(state, replyId, text, latest);
+    return;
+  }
   if (latest.continuation) {
     latest.continuation.replies.push({ replyId, text });
     log(state, 'reply', { ...fields, outcome: 'held', reason: 'continuation' });

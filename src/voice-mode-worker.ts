@@ -80,6 +80,7 @@ import {
   CALL_INTERRUPT,
   CALL_COMMANDS_ATTRIBUTE,
   CALL_COMMANDS_VERSION,
+  JEV_LISTEN_COMMANDS_VERSION,
   CALL_CUE_TRACK,
   CALL_PENDING_ATTRIBUTE,
   CALL_REPLY_TOPIC,
@@ -3784,6 +3785,7 @@ export function readReviewRequest(payload: string): ReviewRequest | null {
       ...(typeof req.wake === 'boolean' ? { wake: req.wake } : {}),
       ...(typeof req.pauseSends === 'boolean' ? { pauseSends: req.pauseSends } : {}),
       ...(typeof req.cues === 'boolean' ? { cues: req.cues } : {}),
+      ...(typeof req.listenUntilOver === 'boolean' ? { listenUntilOver: req.listenUntilOver } : {}),
       ...(typeof req.typing === 'boolean' ? { typing: req.typing } : {}),
       ...(req.tts !== undefined ? { tts: readTtsRequest(req.tts) } : {}),
     };
@@ -4503,8 +4505,10 @@ async function publishRoomTracks(local: LocalParticipant, log: WorkerLog) {
 
 export function callControlAttributes(meta: LiveKitJobMetadata) {
   // The app uses the commands version to negotiate settings even on a host-directed call.
+  const settings = !meta.jev || (meta.appCall && !meta.meeting);
+  const version = meta.jev && meta.overWords ? JEV_LISTEN_COMMANDS_VERSION : CALL_COMMANDS_VERSION;
   return {
-    [CALL_COMMANDS_ATTRIBUTE]: !meta.jev || (meta.appCall && !meta.meeting) ? CALL_COMMANDS_VERSION : '',
+    [CALL_COMMANDS_ATTRIBUTE]: settings ? version : '',
     [CALL_COMMAND_WORDS_ATTRIBUTE]: meta.jev ? '' : COMMAND_WORDS_JSON,
     [CALL_REVIEW_ATTRIBUTE]: meta.jev ? '' : '1',
   };
@@ -4958,6 +4962,7 @@ const isPartial = (e: JevWorkerEvent): e is Extract<JevWorkerEvent, { type: 'utt
 export class JevReporter {
   private readonly queue: JevWorkerEvent[] = [];
   private inFlight?: Promise<void>;
+  private readonly settingsAcks = new Map<JevWorkerEvent, (accepted: boolean) => void>();
   private shed = 0;
   private overBacklog = 0;
 
@@ -4968,6 +4973,14 @@ export class JevReporter {
     private readonly backlog = JEV_REPORT_BACKLOG,
     private readonly maxBytes = MAX_JEV_POST_BYTES,
   ) {}
+
+  setListening(on: boolean): Promise<boolean> {
+    const event: JevWorkerEvent = { type: 'listen', on, at: Date.now() };
+    return new Promise((resolve) => {
+      this.settingsAcks.set(event, resolve);
+      this.report(event);
+    });
+  }
 
   report(event: JevWorkerEvent): void {
     if (isPartial(event)) {
@@ -5029,8 +5042,10 @@ export class JevReporter {
     while (this.queue.length) {
       const batch = this.nextBatch();
       if (!batch.length) continue;
+      let accepted = false;
       try {
         const res = await this.post(batch);
+        accepted = res.ok;
         void res.body?.cancel().catch(() => undefined);
         if (!res.ok)
           this.log.warn('voice-mode worker: the host refused jev events', { status: res.status, events: batch.length });
@@ -5039,6 +5054,11 @@ export class JevReporter {
           err,
           events: batch.length,
         });
+      } finally {
+        for (const event of batch) {
+          this.settingsAcks.get(event)?.(accepted);
+          this.settingsAcks.delete(event);
+        }
       }
     }
   }
@@ -5096,6 +5116,7 @@ export function serveAppInterrupt(
 }
 
 export interface JevLoopDeps {
+  listening?(): boolean;
   confirmPlayout: boolean;
   /** None on a meeting: the host transcribes each participant, and the reflex has its `words`. */
   transcriber?: Transcription;
@@ -5180,6 +5201,7 @@ export class JevLoop {
   private readonly wakers = new Set<() => void>();
   private readonly capture?: TurnCapture;
   private closed = false;
+  private readonly finalizing = new Set<Promise<void>>();
 
   constructor(private readonly deps: JevLoopDeps) {
     this.now = deps.now ?? (() => Date.now());
@@ -5256,12 +5278,12 @@ export class JevLoop {
     this.wake();
     const audio = this.capture?.take(endedAt - this.speechSince);
     if (!utterance || !transcriber) return;
-    transcriber.end().then(
+    const finalizing = transcriber.end().then(
       (heard) => {
         const text = turnText(heard).text || (utterance.phoneWords ? utterance.text || utterance.phoneWords : '');
         // An empty final releases a reply held through a wordless activity.
         if (!text && !utterance.text) {
-          if (beforePlayback) this.finishUtterance(utterance, '');
+          if (beforePlayback || this.deps.listening?.()) this.finishUtterance(utterance, '');
           utterance.needsPhoneFinal = true;
           if (audio) {
             const reason = heard.failed || audio.speechMs >= MIN_LOST_SPEECH_MS ? 'stt' : 'noise';
@@ -5271,7 +5293,7 @@ export class JevLoop {
         }
         // Recorded even when the call ended first: the last words before a hang-up are worth keeping.
         if (audio) this.deps.recorded?.(utterance.segment, audio, text || utterance.text);
-        this.finishUtterance(utterance, text);
+        this.finishUtterance(utterance, text || (this.deps.listening?.() ? utterance.text : ''));
         if (pausedLine && this.playing === pausedLine && !pausedLine.abort.signal.aborted && takesTurn(text)) {
           this.deps.log.info('voice-mode worker: the words of the speech that paused the line came; it is cut', {
             replyId: pausedLine.replyId,
@@ -5282,11 +5304,14 @@ export class JevLoop {
       (err: unknown) => {
         this.deps.log.warn('voice-mode worker: an utterance has no final', { err });
         if (audio) this.deps.recorded?.(utterance.segment, audio, utterance.text, 'stt');
-        if (beforePlayback && !utterance.phoneWords) this.finishUtterance(utterance, utterance.text);
+        if ((beforePlayback || this.deps.listening?.()) && !utterance.phoneWords)
+          this.finishUtterance(utterance, utterance.text);
         utterance.needsPhoneFinal = true;
         if (utterance.phoneWords) this.finishUtterance(utterance, utterance.text || utterance.phoneWords);
       },
     );
+    this.finalizing.add(finalizing);
+    void finalizing.finally(() => this.finalizing.delete(finalizing));
   }
 
   /** The open activity's whole text so far. */
@@ -5444,6 +5469,12 @@ export class JevLoop {
   /** A line is on its way to the room: queued, or taken with its first audio not out yet. */
   get preparing(): boolean {
     return this.queue.length > 0 || (!!this.playing && !this.playing.started);
+  }
+
+  async finishInput(): Promise<void> {
+    this.onSpeech(false, this.ring.position);
+    this.deps.transcriber?.close();
+    await Promise.all(this.finalizing);
   }
 
   close(): void {
@@ -5650,6 +5681,9 @@ async function runJevCall(s: JevCallSetup): Promise<void> {
   /** A voice call's cues, by the plain call's rules; a meeting gets speech only. */
   const voiceCall = !meta.meeting;
   /** The page's cue and typing switches, through the `settings` RPC. */
+  const overWords = voiceCall ? meta.overWords : undefined;
+  let listenUntilOver = false;
+  let listenChange: Promise<boolean> | undefined;
   let cuesOn = true;
   let typingWanted = true;
   let agentSpeaking = false;
@@ -5674,12 +5708,12 @@ async function runJevCall(s: JevCallSetup): Promise<void> {
     clearTimeout(thinkingTimer);
     if (ending) return;
     const left = Math.max(awaitingUntil, typingUntil) - Date.now();
-    if (left > 0) {
+    if (!listenUntilOver && left > 0) {
       thinkingTimer = setTimeout(refreshThinking, left + 1);
       thinkingTimer.unref?.();
     }
     // A reply on its way to the room is still the agent at work, until its first audio (a plain call's `replyComing`).
-    const on = voiceCall && !loop.paused && (left > 0 || loop.preparing);
+    const on = voiceCall && !listenUntilOver && !loop.paused && (left > 0 || loop.preparing);
     if (on === thinking) return;
     thinking = on;
     callVoice?.setThinking(thinking);
@@ -5690,7 +5724,7 @@ async function runJevCall(s: JevCallSetup): Promise<void> {
   const cues = callCues({
     readyOn: meta.appCall ? 'both' : 'subscribe',
     subscribed: s.tracks.cueSubscribed,
-    play: (kind, started) => callVoice?.playCue(kind, started),
+    play: (kind, started) => (kind === 'turn' && listenUntilOver ? undefined : callVoice?.playCue(kind, started)),
     muted: () => !voiceCall || ending || !cuesOn || agentSpeaking,
     log: callLog,
   });
@@ -5709,6 +5743,7 @@ async function runJevCall(s: JevCallSetup): Promise<void> {
         ...(s.transcriptDebug ? { debug: true } : {}),
       });
   const loop: JevLoop = new JevLoop({
+    listening: () => listenUntilOver,
     confirmPlayout: meta.confirmPlayout === true,
     ...(transcriber ? { transcriber } : {}),
     appCall: !!meta.appCall && voiceCall,
@@ -5722,7 +5757,10 @@ async function runJevCall(s: JevCallSetup): Promise<void> {
       refreshThinking();
     },
     report: (event) => {
-      if (ending) return;
+      if (ending) {
+        if (listenUntilOver && event.type === 'utterance') reporter.report(event);
+        return;
+      }
       reporter.report(event);
       if (event.type === 'playback') refreshThinking();
       // Over to the caller once the queue drained, if any line of it played out (as a plain call's `spokenAll`).
@@ -5731,7 +5769,7 @@ async function runJevCall(s: JevCallSetup): Promise<void> {
       if (!heardLine || loop.busy) return;
       heardLine = false;
       // Not the caller's turn yet while another line follows, the agent still works or the caller talks.
-      cues.turn(() => loop.busy || thinking || loop.callerSpeaking);
+      if (!listenUntilOver) cues.turn(() => loop.busy || thinking || loop.callerSpeaking);
     },
     caption: (segment, text, final) => {
       if (!ending) callVoice?.caption(segment, text, final);
@@ -5761,15 +5799,19 @@ async function runJevCall(s: JevCallSetup): Promise<void> {
     cues.close();
     clearTimeout(thinkingTimer);
     updateTyping();
+    if (listenUntilOver) {
+      reporter.report({ type: 'hangup', at: Date.now() });
+      await loop.finishInput();
+    } else transcriber?.close();
     loop.close();
-    transcriber?.close();
     // What was reported goes out before the host hears the call ended; bounded, like every wait here.
     await atMost(reporter.drain(), WORKER_REQUEST_TIMEOUT_MS);
     const mem = process.memoryUsage();
     const mb = (bytes: number) => Math.round(bytes / 1_048_576);
     telemetry.ended(reason, { jev: true, heapUsedMB: mb(mem.heapUsed), rssMB: mb(mem.rss) });
     await Promise.all([
-      tellHost && host.tell('ended', restart ? { reason, restart } : { reason }),
+      (tellHost || (listenUntilOver && reason === 'host: hangup')) &&
+        host.tell('ended', restart ? { reason, restart } : { reason }),
       callVoice?.close().catch(() => undefined),
       callRecording?.close(),
     ]);
@@ -5843,8 +5885,16 @@ async function runJevCall(s: JevCallSetup): Promise<void> {
       const req = callerIdentity === meta.callerIdentity ? readReviewRequest(payload) : null;
       if (!req) throw new Error('not a review request from the caller');
       let error: ReviewReply['error'];
-      if (op !== 'settings') error = 'not_review';
+      if (ending) error = 'closed';
+      else if (op !== 'settings') error = 'not_review';
       else {
+        if (overWords && req.listenUntilOver !== undefined && req.listenUntilOver !== listenUntilOver) {
+          listenUntilOver = req.listenUntilOver;
+          awaitingUntil = typingUntil = 0;
+          cues.cancelTurn();
+          refreshThinking();
+          listenChange = reporter.setListening(listenUntilOver);
+        }
         if (req.cues !== undefined) cuesOn = req.cues;
         if (req.typing !== undefined) typingWanted = req.typing;
         updateTyping();
@@ -5853,7 +5903,17 @@ async function runJevCall(s: JevCallSetup): Promise<void> {
         if (req.tts) error = voice.selectTts ? voice.selectTts(req.tts, req.gen) : 'tts_unavailable';
       }
       voice.review.publishReview({ seq: ++seq, mode: 'auto', draft: null });
-      const reply: ReviewReply = { gen: req.gen, ok: !error, seq, ...(error ? { error } : {}) };
+      if (listenChange && !(await listenChange)) {
+        void end('host did not confirm call settings', true);
+        throw new Error('host did not confirm call settings');
+      }
+      const reply: ReviewReply = {
+        gen: req.gen,
+        ok: !error,
+        seq,
+        ...(error ? { error } : {}),
+        ...(op === 'settings' && overWords ? { listenUntilOver, overWords, cues: cuesOn, typing: typingWanted } : {}),
+      };
       return JSON.stringify(reply);
     });
   }
@@ -5911,7 +5971,7 @@ async function runJevCall(s: JevCallSetup): Promise<void> {
       else if (event.type === 'words') loop.onWords();
       else if (event.type === 'revoke') loop.onRevoke(event.replyId);
       else if (event.type === 'allow_play') loop.onAllowPlay(event.replyId, event.requestId);
-      else if (!voiceCall) return;
+      else if (!voiceCall || listenUntilOver) return;
       else if (event.type === 'thinking') {
         typingUntil = Date.now() + THINKING_HOLD_MS;
         refreshThinking();

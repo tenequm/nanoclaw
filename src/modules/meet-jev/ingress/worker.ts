@@ -30,6 +30,10 @@ export function parseWorkerEvent(raw: unknown, maxTextBytes: number): JevWorkerE
   if (typeof e.at !== 'number' || !Number.isFinite(e.at) || e.at <= 0) return null;
   const text = (v: unknown): v is string => typeof v === 'string' && Buffer.byteLength(v) <= maxTextBytes;
   switch (e.type) {
+    case 'hangup':
+      return { type: 'hangup', at: e.at };
+    case 'listen':
+      return typeof e.on === 'boolean' ? { type: 'listen', on: e.on, at: e.at } : null;
     case 'utterance':
       if (!isId(e.uttId) || !text(e.text) || typeof e.final !== 'boolean') return null;
       return { type: 'utterance', uttId: e.uttId, text: e.text, final: e.final, at: e.at };
@@ -60,6 +64,10 @@ export function createWorkerIngress(caller: { name: string }, maxTextBytes: numb
 
   const toCallEvent = (e: JevWorkerEvent, at: number): CallEvent => {
     switch (e.type) {
+      case 'hangup':
+        return { kind: 'hangup', draining: true, at };
+      case 'listen':
+        return { kind: 'listen', on: e.on, at };
       case 'utterance':
         return { kind: 'utterance', speaker, uttId: e.uttId, text: e.text, final: e.final, at };
       case 'speech':

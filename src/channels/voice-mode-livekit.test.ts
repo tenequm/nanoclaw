@@ -2831,6 +2831,49 @@ describe('/voice jev with the real core', () => {
     await h.stop();
   });
 
+  it('routes three utterances as one explicit turn and mirrors unfinished words on hangup', async () => {
+    expect((await post(`${h.base}/livekit/token?v=6&t=tok123&jev=1`)).status).toBe(200);
+    const worker = await attachWorker(h, h.lk.dispatches.at(-1)!.metadata);
+    await worker.post('joined');
+    const final = (uttId: string, text: string) => ({ type: 'utterance', uttId, text, final: true, at: Date.now() });
+    const mode = (on: boolean) => ({ type: 'listen', on, at: Date.now() });
+    await worker.post('jev', { events: [mode(true), final('a', 'First.'), final('b', 'Second?')] });
+    expect(h.inbound).toHaveLength(0);
+    await worker.post('jev', { events: [final('c', 'Third, прийом.')] });
+    await vi.waitFor(() => expect(chat.posts.map((p) => p.text)).toEqual(['🎙 First. Second? Third']));
+    expect((h.inbound[0].content as { text: string }).text).not.toContain('прийом');
+    await worker.post('jev', { events: [final('d', 'Another thought'), mode(false), mode(false)] });
+    await vi.waitFor(() => expect(chat.posts[1]?.text).toBe('🎙 Another thought'));
+    await worker.post('jev', { events: [mode(true), final('e', 'Unfinished'), final('f', 'thought.')] });
+    await worker.post('ended', { reason: 'caller left' });
+    await vi.waitFor(() => expect(chat.posts[2]?.text).toBe('🎙 Unfinished thought.'));
+    expect(h.inbound).toHaveLength(2);
+    expect(asked).toEqual([]);
+    worker.close();
+  });
+
+  it("drains a late final into the caller's app thread after hangup without a wake", async () => {
+    const group = { id: 'mg-0', channel_type: 'app', instance: 'app', platform_id: 'room' };
+    chat.state.bound = { group, threadId: 'call-thread' };
+    expect((await post(`${h.base}/livekit/token?v=6&t=tok123&jev=1`)).status).toBe(200);
+    const worker = await attachWorker(h, h.lk.dispatches.at(-1)!.metadata);
+    await worker.post('joined');
+    const utt = (text: string, final: boolean) => ({ type: 'utterance', uttId: 'a', text, final, at: Date.now() });
+    await worker.post('jev', { events: [{ type: 'listen', on: true, at: Date.now() }, utt('The early', false)] });
+    expect((await post(`${h.base}/livekit/end?t=tok123`, { callId: worker.meta.callId })).status).toBe(204);
+    expect((await worker.post('jev', { events: [utt('The corrected words, over.', true)] })).status).toBe(200);
+    await worker.post('ended', { reason: 'caller left' });
+    await vi.waitFor(() =>
+      expect(chat.posts).toEqual([
+        { instance: 'app', platformId: 'room', threadId: 'call-thread', text: '🎙 The corrected words' },
+      ]),
+    );
+    expect(chat.contents[0].voice).toBe('caller');
+    expect(h.inbound).toEqual([]);
+    expect(asked).toEqual([]);
+    worker.close();
+  });
+
   it('judges the vocative, speaks the answer, takes the playback into the window, and judges the next words', async () => {
     expect((await post(`${h.base}/livekit/token?v=6&t=tok123&jev=1`)).status).toBe(200);
     const worker = await attachWorker(h, h.lk.dispatches.at(-1)!.metadata);

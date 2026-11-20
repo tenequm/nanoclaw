@@ -38,6 +38,8 @@ export const RECHECK_ACTIONS: readonly RecheckAction[] = ['speak', 'show'];
 export type RecheckVerdict = Choice<RecheckAction>;
 
 export type CallEvent =
+  | { kind: 'listen'; on: boolean; at: number }
+  | { kind: 'hangup'; draining?: boolean; at: number }
   | { kind: 'presence'; speaker: Speaker; joined: boolean; at: number }
   /** A participant's words: partials update the utterance, the final replaces it. */
   | { kind: 'utterance'; speaker: Speaker; uttId: string; text: string; final: boolean; at: number }
@@ -71,6 +73,7 @@ export type CallEvent =
     };
 
 export type Command =
+  | { kind: 'post_caller'; text: string }
   | { kind: 'status'; status: CallStatus }
   /** Ask Jev about the window as of `windowVersion`; the answer comes back as a `verdict`. */
   | { kind: 'judge'; windowVersion: number; state: JevState }
@@ -160,6 +163,7 @@ export interface ActionThreshold {
 
 /** Everything that differs between the two kinds; the core knows nothing else about them. */
 export interface CallPolicy {
+  overWords?: string[];
   kind: CallKind;
   /** The agent's name as people say it, for the vocative fact, the stop rule and the state. */
   agentName: string;

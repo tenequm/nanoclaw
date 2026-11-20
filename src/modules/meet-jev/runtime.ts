@@ -40,6 +40,7 @@ export interface RuntimePorts {
   drop(replyId: string): void;
   revoke(replyId: string): void;
   stopPlayback(): void;
+  postCaller?(text: string): void;
   status(status: CallStatus): void;
   log(event: string, fields: Record<string, unknown>): void;
   /** Every event as it is processed, numbered from 1: the call's replayable log. */
@@ -139,6 +140,8 @@ export function createCallRuntime<S>(core: CallCore<S>, policy: CallPolicy, port
         clearTimeout(timers.get(command.key)?.handle);
         timers.delete(command.key);
         return;
+      case 'post_caller':
+        return ports.postCaller?.(command.text);
       case 'turn':
         return turn(command);
       case 'speak':
