@@ -27,7 +27,7 @@ export type Label = string;
  */
 export type MachineName = string;
 /**
- * A peer address as the hub assigns it (D13): an agent "stan", or a session "name@project" or "name@project:machine".
+ * A peer address as the hub assigns it (D13): an agent "atlas", or a session "name@project" or "name@project:machine".
  */
 export type Address = string;
 /**
@@ -445,7 +445,7 @@ export interface SessionRegisterRequest {
 export interface SessionInfo {
   key: SessionKey;
   /**
-   * A peer address as the hub assigns it (D13): an agent "stan", or a session "name@project" or "name@project:machine".
+   * A peer address as the hub assigns it (D13): an agent "atlas", or a session "name@project" or "name@project:machine".
    */
   address: string;
   name: string;
@@ -512,7 +512,7 @@ export interface SessionEndResponse {
 }
 export interface Peer {
   /**
-   * A peer address as the hub assigns it (D13): an agent "stan", or a session "name@project" or "name@project:machine".
+   * A peer address as the hub assigns it (D13): an agent "atlas", or a session "name@project" or "name@project:machine".
    */
   address: string;
   kind: Kind;
@@ -586,7 +586,7 @@ export interface EndpointRef {
    */
   name: string;
   /**
-   * A peer address as the hub assigns it (D13): an agent "stan", or a session "name@project" or "name@project:machine".
+   * A peer address as the hub assigns it (D13): an agent "atlas", or a session "name@project" or "name@project:machine".
    */
   peer: string;
 }
@@ -621,7 +621,7 @@ export interface EndpointRef1 {
    */
   name: string;
   /**
-   * A peer address as the hub assigns it (D13): an agent "stan", or a session "name@project" or "name@project:machine".
+   * A peer address as the hub assigns it (D13): an agent "atlas", or a session "name@project" or "name@project:machine".
    */
   peer: string;
 }
@@ -727,7 +727,7 @@ export interface EndpointRef2 {
    */
   name: string;
   /**
-   * A peer address as the hub assigns it (D13): an agent "stan", or a session "name@project" or "name@project:machine".
+   * A peer address as the hub assigns it (D13): an agent "atlas", or a session "name@project" or "name@project:machine".
    */
   peer: string;
 }
@@ -832,7 +832,16 @@ export interface SupersededEvent {
  * (from a message event), a daemon notice, a lane frame, or a native reply read on a relay
  * socket. `content` is the canonical envelope (contract.md section 15). Only a notice with
  * no conversation relay (a start the hub refused after the tool answered) has no `from`,
- * in the frame and in the envelope.
+ * in the frame and in the envelope. The inbox writer appends two LF characters and one reply
+ * line before the closing tag. For a delivery from the hub it names the peer's address and the
+ * conversation's endpoint id:
+ * (amesh: <name> cannot see what you write here. To answer, call send_message with to="<address>" and reply_to="<endpoint id>".)
+ * For a send between two sessions of one machine it names only the address:
+ * (amesh: <name> cannot see what you write here. To answer, call send_message with to="<address>".)
+ * A sender with no assigned address gets the native line, SendMessage with the frame's exact
+ * from address. send_message with reply_to is sent to that endpoint exactly as a native reply
+ * on its relay socket would be; an unknown reply_to is ignored and the message goes to the
+ * address. Lane and notice rules follow contract.md section 15.
  */
 export interface NativeUserFrame {
   type: 'user';
@@ -1034,13 +1043,17 @@ export interface McpListPeersArguments {
 }
 export interface McpSendMessageArguments {
   /**
-   * Peer address from list_peers, for example "stan" or "review@pond:bl".
+   * Peer address from list_peers or from the reply line of a peer message.
    */
   to: string;
   /**
    * Plain text, at most 32 KiB.
    */
   message: string;
+  /**
+   * Only when answering a peer message: the reply_to value from its final amesh line. Keeps the answer in that conversation.
+   */
+  reply_to?: string;
 }
 export interface McpSendToParentArguments {
   /**
@@ -1049,7 +1062,7 @@ export interface McpSendToParentArguments {
   message: string;
 }
 /**
- * list_peers result, without this machine's own sessions (spec 4.6).
+ * Hub agents and remote sessions from the hub directory, plus other live local mesh members with assigned addresses. The caller is omitted.
  */
 export interface McpListPeersResult {
   you: {
@@ -1059,7 +1072,7 @@ export interface McpListPeersResult {
   };
   peers: {
     /**
-     * A peer address as the hub assigns it (D13): an agent "stan", or a session "name@project" or "name@project:machine".
+     * A peer address as the hub assigns it (D13): an agent "atlas", or a session "name@project" or "name@project:machine".
      */
     name: string;
     kind: Kind;
@@ -1072,7 +1085,7 @@ export interface McpListPeersResult {
     last_seen: string | null;
   }[];
   /**
-   * Present when the hub is unreachable or the daemon halted; peers then come from the cache.
+   * Present when the hub is unreachable or the daemon halted. Hub statuses may be stale. Local sessions come from the registry.
    */
   stale?: string;
 }
