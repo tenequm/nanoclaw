@@ -143,14 +143,45 @@ jobs:
             exit 1
           fi
 
+  # Secrets and private data in the commits this push or pull request adds (scripts/leaks.sh).
+  # BETTERLEAKS_PRIVATE_TOML, when set, adds a private rule set.
+  leaks:
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install Betterleaks
+        run: |
+          curl -fsSLo "$RUNNER_TEMP/betterleaks.tar.gz" https://github.com/betterleaks/betterleaks/releases/download/v1.10.1/betterleaks_1.10.1_linux_x64.tar.gz
+          echo "c174b42d7aa60caf58c0c3e555c0e4bed01fe6b0d99a412bce777b5af4ce913e  $RUNNER_TEMP/betterleaks.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/betterleaks.tar.gz" -C "$RUNNER_TEMP" betterleaks
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+      - name: Scan new commits
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+          PRIVATE_TOML: ${{ secrets.BETTERLEAKS_PRIVATE_TOML }}
+        run: |
+          if [[ -n "$PRIVATE_TOML" ]]; then
+            printf '%s\n' "$PRIVATE_TOML" > "$RUNNER_TEMP/private.toml"
+            export BETTERLEAKS_PRIVATE_CONFIG="$RUNNER_TEMP/private.toml"
+          fi
+          if [[ -z "${BASE//0/}" ]] || ! git cat-file -e "$BASE^{commit}" 2>/dev/null; then BASE=origin/main; fi
+          bash scripts/leaks.sh "$BASE..$HEAD"
+
   # Repository rules require exact `ci`; always run it so matrix failures remain blocking.
   ci:
     if: always()
-    needs: [checks, test, container-test, iron-front, skill-pins]
+    needs: [checks, test, container-test, iron-front, skill-pins, leaks]
     permissions: {}
     runs-on: ubuntu-26.04
     steps:
       - run: |
+          test "${{ needs.leaks.result }}" = success
           test "${{ needs.checks.result }}" = success
           test "${{ needs.test.result }}" = success
           test "${{ needs.container-test.result }}" = success
@@ -164,7 +195,7 @@ jobs:
   gate:
     name: gate
     if: always()
-    needs: [checks, test, container-test, iron-front, skill-pins, ci]
+    needs: [checks, test, container-test, iron-front, skill-pins, leaks, ci]
     permissions: {}
     runs-on: ubuntu-26.04
     timeout-minutes: 5
@@ -174,6 +205,7 @@ jobs:
           test "${{ needs.checks.result }}" = success
           test "${{ needs.test.result }}" = success
           test "${{ needs.container-test.result }}" = success
+          test "${{ needs.leaks.result }}" = success
           test "${{ needs.ci.result }}" = success
           test "${{ needs.iron-front.result }}" = success
           test "${{ needs.skill-pins.result }}" = success
