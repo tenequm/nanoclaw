@@ -38,7 +38,9 @@ export const RECHECK_ACTIONS: readonly RecheckAction[] = ['speak', 'show'];
 export type RecheckVerdict = Choice<RecheckAction>;
 
 export type CallEvent =
+  /** Change explicit release mode on a voice call. */
   | { kind: 'listen'; on: boolean; at: number }
+  /** Drain in-flight transcripts, or finish the draft once input closes. */
   | { kind: 'hangup'; draining?: boolean; at: number }
   | { kind: 'presence'; speaker: Speaker; joined: boolean; at: number }
   /** A participant's words: partials update the utterance, the final replaces it. */
@@ -73,6 +75,7 @@ export type CallEvent =
     };
 
 export type Command =
+  /** Save unsubmitted words to the caller's thread at call end. */
   | { kind: 'post_caller'; text: string }
   | { kind: 'status'; status: CallStatus }
   /** Ask Jev about the window as of `windowVersion`; the answer comes back as a `verdict`. */
@@ -163,6 +166,7 @@ export interface ActionThreshold {
 
 /** Everything that differs between the two kinds; the core knows nothing else about them. */
 export interface CallPolicy {
+  /** Accepted spellings of explicit release markers. */
   overWords?: string[];
   kind: CallKind;
   /** The agent's name as people say it, for the vocative fact, the stop rule and the state. */
@@ -197,6 +201,8 @@ export interface CallPolicy {
  * `core/window.ts` and `core/decide.ts` implement it; the runtime is generic over `S`.
  */
 export interface CallCore<S> {
+  /** Whether the current call needs its input drained before it ends. */
+  hasListenDraft?(state: S): boolean;
   initial(policy: CallPolicy, at: number): S;
   reduce(state: S, event: CallEvent): S;
   decide(state: S, event: CallEvent): Command[];

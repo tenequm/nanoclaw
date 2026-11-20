@@ -51,6 +51,10 @@ export interface CallRuntime {
   feed(event: CallEvent): void;
   /** Stops processing, clears every timer, aborts what is in flight; idempotent. */
   end(reason: string): void;
+  /** The reducer is collecting a draft or settling a toggle-off. */
+  readonly hasListenDraft: boolean;
+  /** Resolves when the last released turn has finished routing. */
+  turnsSettled(): Promise<void> | undefined;
   readonly ended: boolean;
 }
 
@@ -78,6 +82,8 @@ export function createCallRuntime<S>(core: CallCore<S>, policy: CallPolicy, port
   const judges = new Set<AbortController>();
   const rechecks = new Set<AbortController>();
   const turnQueue: PendingTurn[] = [];
+  let notifyTurnsSettled: (() => void) | undefined;
+  let turnsSettled: Promise<void> | undefined;
   let turnInFlight: PendingTurn | null = null;
 
   const enqueue = (item: Queued): void => {
@@ -227,7 +233,12 @@ export function createCallRuntime<S>(core: CallCore<S>, policy: CallPolicy, port
   const pumpTurns = (): void => {
     if (turnInFlight || ended) return;
     const next = turnQueue.shift();
-    if (!next) return;
+    if (!next) {
+      notifyTurnsSettled?.();
+      notifyTurnsSettled = undefined;
+      turnsSettled = undefined;
+      return;
+    }
     turnInFlight = next;
     void Promise.resolve()
       .then(() => ports.turn({ message: next.message, note: next.note }, next.abort.signal))
@@ -246,6 +257,15 @@ export function createCallRuntime<S>(core: CallCore<S>, policy: CallPolicy, port
 
   return {
     feed: (event) => enqueue({ event }),
+    get hasListenDraft() {
+      return !ended && !!core.hasListenDraft?.(state);
+    },
+    turnsSettled() {
+      if (!turnInFlight) return undefined;
+      return (turnsSettled ??= new Promise<void>((resolve) => {
+        notifyTurnsSettled = resolve;
+      }));
+    },
     end(reason) {
       if (ended) return;
       ended = true;
@@ -258,6 +278,7 @@ export function createCallRuntime<S>(core: CallCore<S>, policy: CallPolicy, port
       turnInFlight?.abort.abort();
       for (const pending of turnQueue) pending.abort.abort();
       turnQueue.length = 0;
+      notifyTurnsSettled?.();
       safely('log', () => ports.log('call_end', { reason, events: seq }));
     },
     get ended() {

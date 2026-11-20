@@ -132,7 +132,9 @@ export interface LiveKitJobMetadata {
  * on `/voice jev` everything heard is the caller.
  */
 export type JevWorkerEvent =
+  /** The worker is finishing its outstanding transcriptions. */
   | { type: 'hangup'; at: number }
+  /** Ordered with speech so both ends apply the setting at the same boundary. */
   | { type: 'listen'; on: boolean; at: number }
   /** Words heard: partials of one `uttId` update it, its final replaces it. */
   | { type: 'utterance'; uttId: string; text: string; final: boolean; at: number }
@@ -300,7 +302,6 @@ export const CALL_COMMANDS_ATTRIBUTE = 'nanoclaw.voice-mode.commands';
  * which then stays wake-gated until that page is reloaded.
  */
 export const CALL_COMMANDS_VERSION = '3';
-export const JEV_LISTEN_COMMANDS_VERSION = '4';
 
 const PRIYOM = 'прийом';
 const ZULU = 'zulu';
@@ -315,11 +316,13 @@ export function parseOverWords(raw?: string): string[] {
     ?.split(',')
     .map((word) => word.trim())
     .filter(Boolean);
-  return configured?.length ? [...new Set(configured)] : OVER_MARKERS.map(([display]) => display);
+  return configured?.length ? [...new Set(configured)] : [...OVER_MARKERS.map(([display]) => display), ZULU, 'over'];
 }
 
 export function overWordForms(display: readonly string[]): string[] {
-  return display.flatMap((word) => OVER_MARKERS.find((group) => group.includes(word.toLowerCase())) ?? [word]);
+  return [
+    ...new Set(display.flatMap((word) => OVER_MARKERS.find((group) => group.includes(word.toLowerCase())) ?? [word])),
+  ];
 }
 
 export type CallCommand = 'send' | 'discard';
@@ -431,6 +434,7 @@ export interface CallReviewState {
 
 /** `gen` is the page's own operation counter, echoed back; `draft` names the draft an operation is for. */
 export interface ReviewRequest {
+  /** Jev voice settings only. Omission preserves the current mode. */
   listenUntilOver?: boolean;
   gen: number;
   draft?: number;
@@ -454,9 +458,13 @@ export interface ReviewRequest {
  * to review, a turn auto mode had already sent after `afterTurn`. `error`: why nothing happened.
  */
 export interface ReviewReply {
+  /** Together with overWords, confirms support for explicit release. */
   listenUntilOver?: boolean;
+  /** The call's release markers in display order. */
   overWords?: string[];
+  /** Current sound cue preference. */
   cues?: boolean;
+  /** Current typing sound preference. */
   typing?: boolean;
   gen: number;
   ok: boolean;

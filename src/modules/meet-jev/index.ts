@@ -43,7 +43,9 @@ export interface JevCallHost {
   /** Which call this is; `voice` when left out. */
   kind?: CallKind;
   callerName: string;
+  /** Release markers advertised to the caller. */
   overWords?: string[];
+  /** Save unreleased words to this call's thread. */
   postCaller?(text: string): void;
   agentName: string;
   /** Other names the agent goes by (the vocabulary file's wake names). */
@@ -76,7 +78,9 @@ export interface JevCall {
   reply(text: string, turnId: string | null): void;
   /** Holds the draft for transcripts already in transit when the caller hung up. */
   drainDraft(): boolean;
-  end(reason: string, saveDraft?: boolean): void;
+  /** Close transcript input and wait for explicit turns already released. */
+  finishDraft(): Promise<void> | undefined;
+  end(reason: string): void;
 }
 
 export function createJevCall(host: JevCallHost, deps: Partial<JevDeps> = {}): JevCall {
@@ -89,8 +93,6 @@ export function createJevCall(host: JevCallHost, deps: Partial<JevDeps> = {}): J
   const ingress = createWorkerIngress({ name: host.callerName }, host.maxTextBytes);
   const replyTurns = new Map<string, string | null>();
   let replies = 0;
-  let listening = false;
-  let draining = false;
   const fields = { callId: host.callId };
   log.info('meet-jev: questions', { ...fields, questions: judgeQuestions(host.agentName) });
   const judgedAt: number[] = [];
@@ -213,11 +215,6 @@ export function createJevCall(host: JevCallHost, deps: Partial<JevDeps> = {}): J
           if (event.kind === 'speech') log.info('meet-jev: worker vad', { ...fields, on: event.on, at: event.at });
           continue;
         }
-        if (event.kind === 'listen' && !draining) listening = event.on;
-        if (event.kind === 'hangup') {
-          if (!listening) continue;
-          draining = true;
-        }
         runtime.feed(event);
       }
       return { accepted: events.length, dropped };
@@ -238,13 +235,15 @@ export function createJevCall(host: JevCallHost, deps: Partial<JevDeps> = {}): J
       runtime.feed({ kind: 'reply', replyId, turnId, text, at: host.now() });
     },
     drainDraft() {
-      if (!listening || runtime.ended) return false;
-      draining = true;
+      if (!runtime.hasListenDraft) return false;
       runtime.feed({ kind: 'hangup', draining: true, at: host.now() });
       return true;
     },
-    end(reason, saveDraft) {
-      if (saveDraft && listening) runtime.feed({ kind: 'hangup', at: host.now() });
+    finishDraft() {
+      runtime.feed({ kind: 'hangup', at: host.now() });
+      return runtime.turnsSettled();
+    },
+    end(reason) {
       runtime.end(reason);
     },
   };

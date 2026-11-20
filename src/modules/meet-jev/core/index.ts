@@ -4,4 +4,9 @@ import { initial, type CallState } from './window.js';
 
 export type { CallState };
 
-export const callCore: CallCore<CallState> = { initial, reduce, decide };
+export const callCore: CallCore<CallState> = {
+  initial,
+  reduce,
+  decide,
+  hasListenDraft: (state) => state.listenDraft !== null,
+};

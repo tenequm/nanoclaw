@@ -6861,7 +6861,11 @@ describe('jev: the reporter', () => {
 });
 
 /** A JevLoop over a fake transcription (none: a meeting's) and a speech output the test drives line by line. */
-function jevLoop({ transcribed = true, app = false }: { transcribed?: boolean; app?: boolean } = {}) {
+function jevLoop({
+  transcribed = true,
+  app = false,
+  listening = false,
+}: { transcribed?: boolean; app?: boolean; listening?: boolean } = {}) {
   const transcription = fakeTranscription();
   const events: Exclude<JevWorkerEvent, { type: 'play_ready' }>[] = [];
   const allowPlay = vi.fn((replyId: string, requestId: string) => loop.onAllowPlay(replyId, requestId));
@@ -6900,6 +6904,7 @@ function jevLoop({ transcribed = true, app = false }: { transcribed?: boolean; a
   const loop = new JevLoop({
     ...(transcribed ? { transcriber: transcription } : {}),
     appCall: app,
+    listening: () => listening,
     setSpeechPaused: vi.fn(),
     speak,
     confirmPlayout: true,
@@ -7168,6 +7173,23 @@ describe('app interrupt RPC', () => {
 });
 
 describe('jev: the loop', () => {
+  it.each(['empty', 'partial', 'error'])(
+    'reports a listening final during playback after %s transcription',
+    async (result) => {
+      const h = jevLoop({ listening: true });
+      h.loop.onReply('r', 'Answer.');
+      await vi.waitFor(() => expect(h.lines[0]?.waited).toBe(true));
+      h.start(h.lines[0]);
+      h.loop.onSpeech(true, 0);
+      if (result !== 'empty') h.loop.onInterim('Draft');
+      if (result === 'error') h.transcription.end.mockRejectedValueOnce(new Error('lost final'));
+      h.loop.onSpeech(false, 1600);
+      await flush();
+      expect(h.kinds()).toContain(result === 'empty' ? 'final:' : 'final:Draft');
+      h.loop.close();
+    },
+  );
+
   it("keeps each utterance's audio from its pre-roll to its end with what it was heard as; a noise too, marked", async () => {
     const h = jevLoop();
     h.loop.audio(new Int16Array(16_000));
@@ -7765,11 +7787,67 @@ describe('jev calls', () => {
     expect(host.calls.some((c) => c.url.endsWith('/ended'))).toBe(false);
   });
 
+  it.each([true, false])('waits for a final before acknowledging host hangup with listening=%s', async (on) => {
+    const { ctx, job } = fakeJob({ ...JEV_META, appCall: true, overWords: ['over'] });
+    const host = fakeHostFetch();
+    const v = fakeVoice();
+    await runCall(ctx, callDeps(host.fetchImpl, v));
+    await v.rpc('settings', { listenUntilOver: true });
+    v.events.onSpeech(true, 0);
+    v.interim('Early');
+    v.transcription.results.push(heard('Early', 'Corrected, over.'));
+    v.transcription.hold = true;
+    if (!on) {
+      v.events.onSpeech(false, 1600);
+      await v.rpc('settings', { listenUntilOver: false });
+    }
+    host.emit({ type: 'end', reason: 'hangup' });
+    await vi.waitFor(() => expect(jevEvents(host).flat().map(summary)).toContain('hangup'));
+    expect(v.transcription.close).not.toHaveBeenCalled();
+    v.transcription.release();
+    await vi.waitFor(() => expect(job.shutdown).toHaveBeenCalledWith('host: hangup'));
+    expect(jevEvents(host).flat().map(summary).slice(-2)).toEqual(['hangup', 'final:Corrected, over.']);
+    expect(host.calls.at(-1)?.url).toMatch(/\/ended$/);
+  });
+
+  it.each([false, true])(
+    'retries the settings POST with bounded backoff, persistent failure=%s',
+    async (persistent) => {
+      vi.useFakeTimers();
+      const { ctx, job } = fakeJob({ ...JEV_META, appCall: true, overWords: ['over'] });
+      const host = fakeHostFetch();
+      const v = fakeVoice();
+      await runCall(ctx, callDeps(host.fetchImpl, v));
+      host.fetchImpl.mockRejectedValueOnce(new Error('lost acknowledgement'));
+      if (persistent)
+        host.fetchImpl
+          .mockResolvedValueOnce(new Response(null, { status: 503 }))
+          .mockResolvedValueOnce(new Response(null, { status: 503 }));
+      const rpc = v.rpc('settings', { listenUntilOver: true });
+      const outcome = persistent
+        ? expect(rpc).rejects.toThrow('host did not confirm')
+        : expect(rpc).resolves.toMatchObject({ listenUntilOver: true });
+      const attempts = () =>
+        host.fetchImpl.mock.calls.filter(
+          ([url, init]) => String(url).endsWith('/jev') && String(init?.body).includes('"type":"listen"'),
+        ).length;
+      await vi.advanceTimersByTimeAsync(99);
+      expect(attempts()).toBe(1);
+      await vi.advanceTimersByTimeAsync(200);
+      expect(attempts()).toBe(2);
+      expect(job.shutdown).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      await outcome;
+      expect(attempts()).toBe(persistent ? 3 : 2);
+      host.endStream();
+    },
+  );
+
   it('echoes the listen setting, silences thinking and turn cues, and still speaks the reply', async () => {
     vi.useFakeTimers();
     const overWords = ['прийом', 'зулу', 'овер'];
     const meta = { ...JEV_META, appCall: true, overWords };
-    expect(callControlAttributes(meta)[CALL_COMMANDS_ATTRIBUTE]).toBe('4');
+    expect(callControlAttributes(meta)[CALL_COMMANDS_ATTRIBUTE]).toBe('3');
     const { ctx } = fakeJob(meta);
     const host = fakeHostFetch();
     const v = fakeVoice();

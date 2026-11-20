@@ -630,8 +630,18 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
   const hangupGraceMs = config.hangupGraceMs ?? HANGUP_GRACE_MS;
   const endHookTimeoutMs = config.endHookTimeoutMs ?? END_HOOK_TIMEOUT_MS;
   const calls = new Map<string, LiveKitCall>();
-  /** Calls the caller's page hung up, by call id, while their worker may still post a turn (HANGUP_GRACE_MS). */
-  const hungUp = new Map<string, { call: LiveKitCall; timer: ReturnType<typeof setTimeout>; drainingDraft: boolean }>();
+  /** Ended calls still accepting in-flight input from their own worker. */
+  const hungUp = new Map<
+    string,
+    {
+      call: LiveKitCall;
+      timer: ReturnType<typeof setTimeout>;
+      drainingDraft: boolean;
+      allowTurns: boolean;
+      inputClosed: boolean;
+      done(): void;
+    }
+  >();
   const cleanups = new Set<Promise<void>>();
   const staleRoomChecks = new Set<ReturnType<typeof setTimeout>>();
   /** Per line, so transcripts land in the order they were spoken. */
@@ -644,14 +654,33 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
 
   const endGrace = (callId: string, saveDraft = true): void => {
     const late = hungUp.get(callId);
-    if (late?.drainingDraft) late.call.jev?.end('hangup', saveDraft);
-    clearTimeout(late?.timer);
-    hungUp.delete(callId);
+    if (!late || (late.inputClosed && saveDraft)) return;
+    late.inputClosed = true;
+    clearTimeout(late.timer);
+    const finish = () => {
+      late.call.jev?.end('hangup');
+      hungUp.delete(callId);
+      late.done();
+    };
+    const turns = saveDraft && late.drainingDraft && late.call.jev?.finishDraft();
+    if (turns) void settleWithin(turns, routeTimeoutMs, undefined).finally(finish);
+    else finish();
   };
 
-  /** A turn of `call` may still reach the agent: it is the line's live call, or its page hung up and the grace runs, with no newer call on the line. */
   const takesTurns = (call: LiveKitCall): boolean =>
-    call.ended ? hungUp.has(call.callId) && !calls.has(call.platformId) : calls.get(call.platformId) === call;
+    call.ended
+      ? !!hungUp.get(call.callId)?.allowTurns && !calls.has(call.platformId)
+      : calls.get(call.platformId) === call;
+
+  const startGrace = (call: LiveKitCall, allowTurns: boolean, drainingDraft: boolean): void => {
+    const timer = setTimeout(() => endGrace(call.callId), hangupGraceMs);
+    timer.unref();
+    const done = new Promise<void>((resolve) => {
+      hungUp.set(call.callId, { call, timer, allowTurns, drainingDraft, inputClosed: false, done: resolve });
+    });
+    cleanups.add(done);
+    void done.then(() => cleanups.delete(done));
+  };
 
   const push = (call: LiveKitCall, event: LiveKitHostEvent): void => {
     if (call.stream && !call.stream.writableEnded) {
@@ -728,6 +757,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     const refresh = ++call.chatRefreshes;
     const chat = await probeChat(call);
     // A slower, older refresh (the join's, say) must not undo a newer one.
+    if (call.ended) return sameChat(call.chat, chat) ? chat : null;
     if (refresh !== call.chatRefreshes) return chat;
     if (turn && call.previousChat) {
       if (call.previousChat.active) call.previousChat.active = false;
@@ -876,10 +906,13 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
   };
 
   /** `end`: why, as the page names it; left out for ends no page is there to hear about. */
-  const endCall = (call: LiveKitCall, reason: string, end?: CallEndReason): void => {
+  const endCall = (call: LiveKitCall, reason: string, end?: CallEndReason, grace = false): void => {
     if (call.ended) return;
     call.ended = true;
-    if (!hungUp.get(call.callId)?.drainingDraft) call.jev?.end(reason, end === 'worker_gone' || reason === 'hangup');
+    const drainingDraft = end !== 'revoked' && !!call.jev?.drainDraft();
+    if (drainingDraft || grace)
+      startGrace(call, grace || end === 'worker_gone' || end === 'worker_restart', drainingDraft);
+    if (!drainingDraft) call.jev?.end(reason);
     clearTimeout(call.joinTimer);
     clearTimeout(call.streamTimer);
     clearTimeout(call.expires);
@@ -920,11 +953,13 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     cleanups.add(done);
   };
 
-  const checkAccess = async (call: LiveKitCall): Promise<boolean> => {
-    if (!takesTurns(call)) return false;
+  const checkAccess = async (call: LiveKitCall, draft = false): Promise<boolean> => {
+    const eligible = () =>
+      draft ? !!hungUp.get(call.callId)?.drainingDraft && !hungUp.get(call.callId)?.inputClosed : takesTurns(call);
+    if (!eligible()) return false;
     try {
       const current = await host.resolveLine(call.platformId);
-      if (current && sameCallerAndAgent(call.line, current) && takesTurns(call)) return true;
+      if (current && sameCallerAndAgent(call.line, current)) return eligible();
     } catch (err) {
       log.warn('livekit-voice-mode: call access check failed', { platformId: call.platformId, err });
     }
@@ -954,6 +989,9 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     // Newest wins on the line.
     const previous = calls.get(platformId);
     if (previous) endCall(previous, 'replaced by a new call', 'newer_call');
+    for (const late of hungUp.values()) {
+      if (late.call.platformId === platformId && late.drainingDraft) late.allowTurns = false;
+    }
     const callId = randomUUID();
     const roomName = `${kind.roomPrefix}-${platformId.replace(/^voice(?:-mode)?:/, '')}-${randomBytes(6).toString('hex')}`;
     const job = kind.job({ callId, roomName });
@@ -1197,7 +1235,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
         endCall(call, 'no chat to talk in');
         return { status: 409, body: 'The call has no chat to talk in' };
       }
-      if (jev && (call.ended || jev.signal.aborted)) return { status: 409, body: 'The turn was superseded' };
+      if (jev?.signal.aborted) return { status: 409, body: 'The turn was superseded' };
       const utteranceId = String(++call.utterances);
       const sender = call.kind.sender(call.line);
       const message: InboundEvent['message'] = {
@@ -1265,11 +1303,27 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     note: string,
     signal: AbortSignal,
   ): Promise<JevTurnResult> => {
-    if (call.state !== 'live' || !takesTurns(call)) return { ok: false, reason: 'the call has ended' };
+    const saveIfDraining = () => {
+      if (hungUp.get(call.callId)?.drainingDraft && !signal.aborted) saveCallerDraft(call, message);
+    };
+    if (call.state !== 'live' || !takesTurns(call)) {
+      saveIfDraining();
+      return { ok: false, reason: 'the call has ended' };
+    }
     const admitted = admitTurn(call);
     if (!admitted.ok) return { ok: false, reason: admitted.body };
     const outcome = await takeTurn(call, message, admitted.t, undefined, { note, signal });
+    if (!outcome.id && !takesTurns(call)) saveIfDraining();
     return outcome.id ? { ok: true, turnId: outcome.id } : { ok: false, reason: `${outcome.status}: ${outcome.body}` };
+  };
+
+  const saveCallerDraft = (call: LiveKitCall, text: string): void => {
+    const chat = call.chat;
+    if (chat)
+      mirror(call.platformId, chat, `${CALLER_MARK}${text}`, 'caller', async () => {
+        const line = await host.resolveLine(call.platformId);
+        return !!line && sameCallerAndAgent(call.line, line) && sameChat(chat, await probeChat(call));
+      });
   };
 
   const openJev = (call: LiveKitCall, kind: 'voice' | 'meet'): JevCall =>
@@ -1290,14 +1344,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
         ),
         maxTextBytes: MAX_UTTERANCE_TEXT_BYTES,
         overWords,
-        postCaller: (text) => {
-          const chat = call.chat;
-          if (chat)
-            mirror(call.platformId, chat, `${CALLER_MARK}${text}`, 'caller', async () => {
-              const line = await host.resolveLine(call.platformId);
-              return !!line && sameCallerAndAgent(call.line, line) && sameChat(chat, await probeChat(call));
-            });
-        },
+        postCaller: (text) => saveCallerDraft(call, text),
         submitTurn: (message, note, signal) => submitTurn(call, message, note, signal),
         push: (event) => {
           if (!call.ended) push(call, event);
@@ -1346,8 +1393,10 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     const late = !call && typeof body.callId === 'string' ? hungUp.get(body.callId)?.call : undefined;
     if (late && secret && sameSecret(secret, late.secret)) {
       // The page hung up: the worker's turns still land within the grace; its `ended` closes it.
-      if (route === 'livekit/agent/utterance') return onUtterance(res, late, body);
-      if (route === 'livekit/agent/jev' && hungUp.get(late.callId)?.drainingDraft && (await checkAccess(late))) {
+      if (hungUp.get(late.callId)?.inputClosed) return reply(res, 409, 'No such call');
+      if (route === 'livekit/agent/utterance' && hungUp.get(late.callId)?.allowTurns)
+        return onUtterance(res, late, body);
+      if (route === 'livekit/agent/jev' && hungUp.get(late.callId)?.drainingDraft && (await checkAccess(late, true))) {
         return onJev(res, late, body);
       }
       if (route === 'livekit/agent/ended') {
@@ -1366,6 +1415,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
         typeof body.reason === 'string' ? `worker: ${body.reason.slice(0, 80)}` : 'worker ended',
         body.restart === true ? 'worker_restart' : 'worker_gone',
       );
+      endGrace(call.callId);
       // The worker deletes the room once answered; the page reads the reason off it first.
       await call.announced;
       return reply(res, 204, '');
@@ -1380,13 +1430,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     async endCall(platformId, callId, reason, { grace = false } = {}) {
       const call = calls.get(platformId);
       if (!call || call.callId !== callId) return;
-      if (grace) {
-        const drainingDraft = call.jev?.drainDraft() ?? false;
-        const timer = setTimeout(() => endGrace(call.callId), hangupGraceMs);
-        timer.unref();
-        hungUp.set(call.callId, { call, timer, drainingDraft });
-      }
-      endCall(call, reason);
+      endCall(call, reason, undefined, grace);
       await call.cleanup;
     },
 
@@ -1443,8 +1487,9 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     async teardown() {
       engines.delete(engine);
       for (const call of [...calls.values()]) endCall(call, 'teardown', 'shutdown');
-      for (const callId of [...hungUp.keys()]) endGrace(callId);
-      await Promise.all([...cleanups, ...mirrorChains.values()]);
+      for (const [id, late] of hungUp) if (!late.drainingDraft) endGrace(id);
+      await Promise.all(cleanups);
+      await Promise.all(mirrorChains.values());
       for (const timer of staleRoomChecks) clearTimeout(timer);
       staleRoomChecks.clear();
     },

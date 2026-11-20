@@ -32,6 +32,8 @@ import {
   type Wake,
 } from './window.js';
 
+const PIECE_TIMER = 'listen-piece:';
+const MARKER_OWN_SENTENCE = false;
 const BOUNDARY_TIMER = 'boundary:';
 /** A speaker's STT final comes up to ~3 s after their VAD end; a boundary waits that long for it. */
 const FINAL_MARGIN_MS = 3_000;
@@ -48,7 +50,16 @@ const STOP_WORDS = new Set([
 
 export function reduce(prev: CallState, event: CallEvent): CallState {
   const state = structuredClone<CallState>({ ...prev, commands: [] });
-  if (state.hangingUp && event.kind !== 'speech' && event.kind !== 'utterance' && event.kind !== 'hangup') return state;
+  if (state.hangingUp && !['speech', 'utterance', 'hangup', 'timer'].includes(event.kind)) return state;
+  if (
+    state.afterListen &&
+    (event.kind === 'listen' ||
+      event.kind === 'speech' ||
+      (event.kind === 'utterance' && !state.listenDraft?.some((piece) => piece.uttId === event.uttId)))
+  ) {
+    state.afterListen.push(event);
+    return state;
+  }
   applyWindow(state, event);
   if (!state.listenDraft && (event.kind === 'speech' || event.kind === 'utterance')) holdContinuation(state, event);
   if (event.kind === 'utterance' && event.final && continuationFor(state, event.speaker.id)) {
@@ -62,8 +73,14 @@ export function reduce(prev: CallState, event: CallEvent): CallState {
       if (state.policy.kind === 'voice') setListening(state, event.on);
       break;
     case 'hangup':
-      if (event.draining) state.hangingUp = true;
-      else if (state.listenDraft) flushDraft(state, state.listenDraft.splice(0), true);
+      if (!state.listenDraft) break;
+      if (event.draining) {
+        state.hangingUp = true;
+      } else {
+        for (const piece of state.listenDraft) piece.final = true;
+        releaseMarkers(state);
+        flushDraft(state, state.listenDraft.splice(0), !state.afterListen);
+      }
       break;
     case 'utterance':
       if (state.listenDraft) {
@@ -81,6 +98,8 @@ export function reduce(prev: CallState, event: CallEvent): CallState {
       break;
     case 'speech':
       if (state.listenDraft) {
+        // A new speech also ends any earlier activity whose VAD-off POST was lost.
+        for (const piece of state.listenDraft) armPiece(state, piece);
         if (event.on && event.uttId) capturePiece(state, event.speaker.id, event.uttId);
         break;
       }
@@ -96,12 +115,19 @@ export function reduce(prev: CallState, event: CallEvent): CallState {
         boundary(state, event.speaker.id);
       }
       break;
-    case 'timer':
+    case 'timer': {
+      const piece = event.key.startsWith(PIECE_TIMER)
+        ? state.listenDraft?.find((item) => item.uttId === event.key.slice(PIECE_TIMER.length))
+        : undefined;
+      if (piece && !piece.final) {
+        capturePiece(state, piece.speakerId, piece.uttId, { text: piece.text, final: true });
+      }
       if (!state.listenDraft && event.key.startsWith(BOUNDARY_TIMER)) {
         const speakerId = event.key.slice(BOUNDARY_TIMER.length);
         if (!stillSpeaking(state, speakerId)) boundary(state, speakerId);
       }
       break;
+    }
     case 'verdict':
       onVerdict(state, event.windowVersion, event.verdict, event.ms);
       // A different participant's judge may have taken the floor while the original speaker finished.
@@ -156,6 +182,20 @@ export function reduce(prev: CallState, event: CallEvent): CallState {
     }
   }
   refreshVersion(state);
+  if (state.afterListen && state.listenDraft?.every((piece) => piece.final)) {
+    flushDraft(state, state.listenDraft.splice(0), false);
+    state.listenDraft = null;
+    const queued = state.afterListen;
+    delete state.afterListen;
+    if (!state.hangingUp && awaitingAgent(state)) out.push({ kind: 'status', status: 'thinking' });
+    let nextState = state;
+    for (const next of queued) {
+      nextState = reduce(nextState, next);
+      out.push(...nextState.commands);
+    }
+    nextState.commands = out;
+    return nextState;
+  }
   return state;
 }
 
@@ -178,15 +218,23 @@ function isStop(rest: string): boolean {
 function setListening(state: CallState, on: boolean): void {
   if (on === !!state.listenDraft) return;
   if (!on) {
-    flushDraft(state, state.listenDraft!, false);
-    state.listenDraft = null;
-    if (awaitingAgent(state)) state.commands.push({ kind: 'status', status: 'thinking' });
+    state.afterListen = [];
+    for (const piece of state.listenDraft!) armPiece(state, piece);
     return;
   }
   state.listenDraft = [];
   state.commands.push({ kind: 'status', status: agentSpeaking(state) ? 'speaking' : 'idle' });
+  const judging = state.judging;
   state.judging = null;
   state.deferred = null;
+  if (judging) unmarkHandled(state.speakers[judging.speakerId], judging.uttId);
+  for (const [id, speaker] of Object.entries(state.speakers)) {
+    if (speaker.pendingSpeech) capturePiece(state, id, speaker.pendingSpeech.uttId);
+  }
+  for (const utt of state.utterances) {
+    if (!utt.final || (utt.uttId === judging?.uttId && utt.speakerId === judging.speakerId))
+      capturePiece(state, utt.speakerId, utt.uttId, utt);
+  }
   const wake = latestWake(state);
   if (wake) {
     const held = [...(state.recheck?.replies ?? []), ...(wake.continuation?.replies ?? [])];
@@ -204,7 +252,7 @@ function flushDraft(state: CallState, pieces: ListenPiece[], hangup: boolean): v
     .filter(hasWords)
     .join(' ');
   for (const piece of pieces) {
-    if (piece.final || piece.text) markHandled(state.speakers[piece.speakerId], piece.uttId);
+    markHandled(state.speakers[piece.speakerId], piece.uttId);
   }
   if (!text) return;
   if (hangup) state.commands.push({ kind: 'post_caller', text });
@@ -221,13 +269,26 @@ function capturePiece(
   if (isHandled(state.speakers[speakerId], uttId)) return;
   let piece = draft.find((item) => item.uttId === uttId);
   if (!piece) {
-    piece = { speakerId, uttId, text: '', final: false, interrupted: agentSpeaking(state) };
+    const pending = state.speakers[speakerId].pendingSpeech;
+    const startedAt =
+      pending?.uttId === uttId
+        ? pending.startedAt
+        : (state.utterances.find((u) => u.speakerId === speakerId && u.uttId === uttId)?.startedAt ?? state.now);
+    piece = { speakerId, uttId, startedAt, text: '', final: false, interrupted: agentSpeaking(state) };
     draft.push(piece);
+    draft.sort((a, b) => a.startedAt - b.startedAt);
   }
-  if (!transcript) return;
+  if (!transcript) {
+    if (!stillSpeaking(state, speakerId)) armPiece(state, piece);
+    return;
+  }
+  if (piece.final && !transcript.final) return;
   piece.text = transcript.text.trim();
   piece.final = transcript.final;
-  if (!piece.final) return;
+  if (!piece.final) {
+    if (!stillSpeaking(state, speakerId)) armPiece(state, piece);
+    return;
+  }
   if (
     (piece.interrupted || agentSpeaking(state) || pendingAnswer(state)) &&
     isStop(vocativeOf(piece.text, [state.policy.agentName, ...state.policy.agentAliases]).rest)
@@ -240,7 +301,21 @@ function capturePiece(
     piece.releases = rest !== null;
     if (rest !== null) piece.text = rest;
   }
-  if (state.hangingUp) return;
+  releaseMarkers(state);
+}
+
+function armPiece(state: CallState, piece: ListenPiece): void {
+  if (piece.final || piece.settling) return;
+  piece.settling = true;
+  state.commands.push({
+    kind: 'wait',
+    key: PIECE_TIMER + piece.uttId,
+    ms: state.policy.boundaryFallbackMs + FINAL_MARGIN_MS,
+  });
+}
+
+function releaseMarkers(state: CallState): void {
+  const draft = state.listenDraft!;
   // A later activity can finalize first. A marker only releases through its own position.
   for (let i = 0; i < draft.length && draft[i].final; i++) {
     if (!draft[i].releases) continue;
@@ -249,13 +324,22 @@ function capturePiece(
   }
 }
 
-function beforeMarker(text: string, markers: string[]): string | null {
-  const end = text.replace(/[\s\p{P}]+$/gu, '');
-  for (const marker of markers) {
-    const match = new RegExp(`(?:^|[\\s\\p{P}])${escapeRegExp(marker)}$`, 'iu').exec(end);
-    if (match) return end.slice(0, end.length - marker.length).replace(/[\s,;:–—-]+$/gu, '');
+export function beforeMarker(text: string, markers: string[], ownSentence = MARKER_OWN_SENTENCE): string | null {
+  let rest = text;
+  let matched = false;
+  // Keep sentence punctuation between words until every repeated marker has been examined.
+  for (;;) {
+    const end = rest.replace(/[\s\p{P}]+$/gu, '');
+    const marker = markers.find(
+      (word) => word.length && new RegExp(`(?:^|[^\\p{L}\\p{M}\\p{N}_\\p{Pd}])${escapeRegExp(word)}$`, 'iu').test(end),
+    );
+    if (!marker) break;
+    const before = end.slice(0, -marker.length);
+    if (ownSentence && !/(^|[.!?,;:\u2013\u2014-])\s*$/u.test(before)) break;
+    rest = before;
+    matched = true;
   }
-  return null;
+  return matched ? rest.replace(/[\s,;:\u2013\u2014-]+$/gu, '') : null;
 }
 
 function continuationFor(state: CallState, speakerId: string): Wake | undefined {
@@ -557,7 +641,9 @@ function wake(state: CallState, speakerId: string, uttId: string, message: strin
           renderWindow(state),
         ]),
     ...(extra ? [extra] : []),
-    'Reply in one or two short spoken sentences; your reply is read aloud. If nothing needs saying, reply exactly [silent].',
+    state.listenDraft
+      ? 'Reply in one or two short spoken sentences. Your reply is read aloud.'
+      : 'Reply in one or two short spoken sentences; your reply is read aloud. If nothing needs saying, reply exactly [silent].',
   ].join('\n\n');
   const triggerAt = state.utterances.find((u) => u.speakerId === speakerId && u.uttId === uttId)?.startedAt;
   const speaker = state.speakers[speakerId];

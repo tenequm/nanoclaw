@@ -5,7 +5,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { overWordForms, parseOverWords } from '../../channels/voice-mode-protocol.js';
-import { vocativeOf } from './core/decide.js';
+import { beforeMarker, vocativeOf } from './core/decide.js';
 import { callCore, type CallState } from './core/index.js';
 import type { Action, CallEvent, CallKind, Command, Speaker } from './core/types.js';
 import { toJevState } from './core/window.js';
@@ -141,11 +141,115 @@ describe('listen until over', () => {
     expect(call.feed({ kind: 'hangup' })).toEqual([{ kind: 'post_caller', text: 'Next draft' }]);
   });
 
+  it('settles a lost final with its last partial and unblocks later releases', () => {
+    const call = listening();
+    call.feed(
+      { kind: 'speech', speaker: caller, uttId: 'a', on: true },
+      { kind: 'utterance', speaker: caller, uttId: 'a', text: 'Keep this', final: false },
+    );
+    const [timer] = only(call.feed({ kind: 'speech', speaker: caller, on: false }), 'wait');
+    expect(timer?.ms).toBeGreaterThan(0);
+    expect(only(call.say(caller, 'b', 'and this, over.'), 'turn')).toEqual([]);
+    expect(only(call.feed({ kind: 'timer', key: timer.key }), 'turn')[0]?.message).toBe('Keep this and this');
+    expect(only(call.say(caller, 'c', 'Next, over.'), 'turn')[0]?.message).toBe('Next');
+  });
+
+  it('strips consecutive markers and keeps hyphenated words intact', () => {
+    const call = listening();
+    expect(call.say(caller, 'a', 'Прийом, прийом.')).toEqual([]);
+    expect(call.say(caller, 'b', 'hand-over')).toEqual([]);
+    expect(only(call.say(caller, 'c', 'Прийом, прийом.'), 'turn')[0]?.message).toBe('hand-over');
+  });
+
+  it.each([
+    ['the game is over.', 'the game is', null],
+    ['hand-over', null, null],
+    ['hand‐over', null, null],
+    ['already over there.', null, null],
+    ['say it. Over!', 'say it.', 'say it.'],
+    ['tell me, over, over.', 'tell me', 'tell me'],
+    ['Over!', '', ''],
+  ])('recognizes %s in suffix and own-clause modes', (text, suffix, clause) => {
+    expect(beforeMarker(text!, ['over'], false)).toBe(suffix);
+    expect(beforeMarker(text!, ['over'], true)).toBe(clause);
+  });
+
+  it('shows pending and playing replies accurately at toggle-on and releases a held continuation', () => {
+    const call = new Call();
+    const [turn] = only(call.sayAnswered(caller, 'a', 'What time is it?'), 'turn');
+    call.feed({ kind: 'turn', key: turn.key, turnId: 't' });
+    call.feed({ kind: 'speech', speaker: caller, uttId: 'b', on: true });
+    expect(only(call.feed({ kind: 'reply', replyId: 'r', text: 'Two.', turnId: 't' }), 'speak')).toEqual([]);
+    expect(only(call.feed({ kind: 'listen', on: true }), 'speak')[0]?.text).toBe('Two.');
+    expect(call.statuses.at(-1)?.status).toBe('idle');
+    const playing = new Call();
+    wakeAndSpeak(playing, 'What time is it?', 'Two.', 1);
+    playing.feed({ kind: 'listen', on: true });
+    expect(playing.statuses.at(-1)?.status).toBe('speaking');
+  });
+
+  it('speaks a reply held for recheck when listening starts', () => {
+    const call = new Call();
+    const [turn] = only(call.sayAnswered(caller, 'a', 'What time is it?'), 'turn');
+    call.feed({ kind: 'turn', key: turn.key, turnId: 't' });
+    call.say(olena, 'b', 'One more detail.');
+    expect(only(call.feed({ kind: 'reply', replyId: 'r', text: 'Two.', turnId: 't' }), 'recheck')).toHaveLength(1);
+    expect(only(call.feed({ kind: 'listen', on: true }), 'speak')[0]?.text).toBe('Two.');
+  });
+
+  it('orders an utterance started before toggle-on ahead of a later marker', () => {
+    const call = new Call();
+    call.state.policy.overWords = ['over'];
+    call.feed(
+      { kind: 'speech', speaker: caller, uttId: 'a', on: true },
+      { kind: 'listen', on: true },
+      { kind: 'speech', speaker: caller, on: false },
+    );
+    expect(only(call.say(caller, 'b', 'Second, over.'), 'turn')).toHaveLength(0);
+    expect(
+      only(call.feed({ kind: 'utterance', speaker: caller, uttId: 'a', text: 'First.', final: true }), 'turn')[0]
+        ?.message,
+    ).toBe('First. Second');
+  });
+
+  it('resumes automatic decisions after the toggle-off deadline, even with new speech in flight', () => {
+    const call = listening();
+    call.feed(
+      { kind: 'speech', speaker: caller, uttId: 'a', on: true },
+      { kind: 'utterance', speaker: caller, uttId: 'a', text: 'First', final: false },
+    );
+    const [timer] = only(call.feed({ kind: 'listen', on: false }), 'wait');
+    call.feed({ kind: 'speech', speaker: caller, on: false });
+    expect(only(call.say(caller, 'b', 'What next?'), 'judge')).toHaveLength(0);
+    const commands = call.feed({ kind: 'timer', key: timer.key });
+    expect(only(commands, 'turn')[0]?.message).toBe('First');
+    expect(only(commands, 'judge')).toHaveLength(1);
+  });
+
+  it('turning off waits for the corrected final and resumes thinking', () => {
+    const call = listening();
+    const part = { kind: 'utterance', speaker: caller, uttId: 'a' } as const;
+    call.feed({ ...part, text: 'First', final: false });
+    expect(only(call.feed({ kind: 'listen', on: false }), 'turn')).toEqual([]);
+    const [turn] = only(call.feed({ ...part, text: 'Corrected first.', final: true }), 'turn');
+    expect(turn?.message).toBe('Corrected first.');
+    expect(turn.note).not.toContain('[silent]');
+    expect(call.statuses.at(-1)?.status).toBe('thinking');
+    expect(only(call.say(caller, 'b', 'What next?'), 'judge')).toHaveLength(1);
+  });
+
+  it('ignores listen settings in a meeting', () => {
+    const call = new Call('meet');
+    call.feed({ kind: 'listen', on: true });
+    expect(call.state.listenDraft).toBeNull();
+  });
+
   it('ignores a judge verdict already in flight when listening starts', () => {
     const call = new Call();
     const [judge] = only(call.say(caller, 'a', 'What time is it?'), 'judge');
     call.feed({ kind: 'listen', on: true });
     expect(call.verdict(judge.windowVersion, 'answer')).toEqual([]);
+    expect(only(call.feed({ kind: 'listen', on: false }), 'turn')[0]?.message).toBe('What time is it?');
   });
 });
 

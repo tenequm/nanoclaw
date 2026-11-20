@@ -49,6 +49,7 @@ import {
 } from './voice-mode-livekit.js';
 import type { MessagingGroup, Session } from '../types.js';
 import {
+  parseOverWords,
   LIVEKIT_PROTOCOL_VERSION,
   liveKitCallSecret,
   type LiveKitHostEvent,
@@ -2852,25 +2853,118 @@ describe('/voice jev with the real core', () => {
     worker.close();
   });
 
-  it("drains a late final into the caller's app thread after hangup without a wake", async () => {
-    const group = { id: 'mg-0', channel_type: 'app', instance: 'app', platform_id: 'room' };
-    chat.state.bound = { group, threadId: 'call-thread' };
-    expect((await post(`${h.base}/livekit/token?v=6&t=tok123&jev=1`)).status).toBe(200);
+  it.each([true, false])(
+    'delivers a corrected final in the original app thread during hangup grace, marker=%s',
+    async (marker) => {
+      const group = { id: 'mg-0', channel_type: 'app', instance: 'app', platform_id: 'room' };
+      chat.state.bound = { group, threadId: 'call-thread' };
+      expect((await post(`${h.base}/livekit/token?v=6&t=tok123&jev=1`)).status).toBe(200);
+      const worker = await attachWorker(h, h.lk.dispatches.at(-1)!.metadata);
+      await worker.post('joined');
+      const utt = (text: string, final: boolean) => ({ type: 'utterance', uttId: 'a', text, final, at: Date.now() });
+      await worker.post('jev', { events: [{ type: 'listen', on: true, at: Date.now() }, utt('The early', false)] });
+      expect((await post(`${h.base}/livekit/end?t=tok123`, { callId: worker.meta.callId })).status).toBe(204);
+      expect(
+        (
+          await worker.post('jev', {
+            events: [utt(marker ? 'The corrected words, over.' : 'The corrected words', true)],
+          })
+        ).status,
+      ).toBe(200);
+      await worker.post('ended', { reason: 'caller left' });
+      await vi.waitFor(() =>
+        expect(chat.posts).toEqual([
+          { instance: 'app', platformId: 'room', threadId: 'call-thread', text: '🎙 The corrected words' },
+        ]),
+      );
+      expect(chat.contents[0].voice).toBe('caller');
+      expect(h.inbound).toHaveLength(marker ? 1 : 0);
+      expect(asked).toEqual([]);
+      worker.close();
+    },
+  );
+
+  it.each(['duration', 'daily', 'restart', 'shutdown', 'replacement', 'redial', 'revoked'])(
+    'finishes the old draft on %s with access rechecked',
+    async (reason) => {
+      await h.stop();
+      h = await startHarness(
+        {
+          accessCheckIntervalMs: reason === 'revoked' ? 100 : 60_000,
+          ...(reason === 'duration' ? { maxCallDurationMs: 250 } : {}),
+          ...(reason === 'daily' ? { maxCallMsPerDay: 250 } : {}),
+        },
+        { mirrorApi: chat.api, hangupGraceMs: 1000 },
+      );
+      await post(`${h.base}/livekit/token?v=6&t=tok123&jev=1`);
+      const worker = await attachWorker(h, h.lk.dispatches.at(-1)!.metadata);
+      await worker.post('joined');
+      const utt = (text: string, final: boolean) => ({ type: 'utterance', uttId: 'a', text, final, at: Date.now() });
+      await worker.post('jev', { events: [{ type: 'listen', on: true, at: Date.now() }, utt('Early', false)] });
+      if (reason === 'redial') await post(`${h.base}/livekit/end?t=tok123`, { callId: worker.meta.callId });
+      if (reason === 'replacement' || reason === 'redial') await post(`${h.base}/livekit/token?v=6&t=tok123&jev=1`);
+      if (reason === 'revoked') h.access.enabled = false;
+      const shutdown = reason === 'shutdown' ? h.adapter.teardown() : undefined;
+      if (reason !== 'restart') await worker.streamClosed;
+      const final = await worker.post('jev', { events: [utt('Corrected draft', true)] });
+      expect(final.status).toBe(reason === 'revoked' ? 409 : 200);
+      await worker.post('ended', { reason, restart: reason === 'restart' });
+      await shutdown;
+      if (reason === 'revoked') expect(chat.posts).toEqual([]);
+      else await vi.waitFor(() => expect(chat.posts.map((p) => p.text)).toEqual(['🎙 Corrected draft']));
+      expect(h.inbound).toHaveLength(0);
+      worker.close();
+    },
+  );
+
+  it('finishes routing a release when both hangup and worker end cross its chat lookup', async () => {
+    await post(`${h.base}/livekit/token?v=6&t=tok123&jev=1`);
     const worker = await attachWorker(h, h.lk.dispatches.at(-1)!.metadata);
     await worker.post('joined');
-    const utt = (text: string, final: boolean) => ({ type: 'utterance', uttId: 'a', text, final, at: Date.now() });
-    await worker.post('jev', { events: [{ type: 'listen', on: true, at: Date.now() }, utt('The early', false)] });
-    expect((await post(`${h.base}/livekit/end?t=tok123`, { callId: worker.meta.callId })).status).toBe(204);
-    expect((await worker.post('jev', { events: [utt('The corrected words, over.', true)] })).status).toBe(200);
-    await worker.post('ended', { reason: 'caller left' });
-    await vi.waitFor(() =>
-      expect(chat.posts).toEqual([
-        { instance: 'app', platformId: 'room', threadId: 'call-thread', text: '🎙 The corrected words' },
-      ]),
-    );
-    expect(chat.contents[0].voice).toBe('caller');
-    expect(h.inbound).toEqual([]);
-    expect(asked).toEqual([]);
+    const lookup = chat.api.boundChat;
+    let resume!: () => void;
+    const held = new Promise<void>((resolve) => {
+      resume = resolve;
+    });
+    let started!: () => void;
+    const looking = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    chat.api.boundChat = async (id) => {
+      started();
+      await held;
+      return lookup(id);
+    };
+    await worker.post('jev', {
+      events: [
+        { type: 'listen', on: true, at: Date.now() },
+        { type: 'utterance', uttId: 'a', text: 'Deliver, over.', final: true, at: Date.now() },
+      ],
+    });
+    await looking;
+    await post(`${h.base}/livekit/end?t=tok123`, { callId: worker.meta.callId });
+    await worker.post('ended');
+    expect(h.inbound).toHaveLength(0);
+    resume();
+    await vi.waitFor(() => expect(chat.posts.map((p) => p.text)).toEqual(['🎙 Deliver']));
+    expect(h.inbound).toHaveLength(1);
+    worker.close();
+  });
+
+  it('passes custom host release words through metadata, recognition and delivery', async () => {
+    await h.stop();
+    h = await startHarness({}, { mirrorApi: chat.api, overWords: parseOverWords('  finished here, , ') });
+    await post(`${h.base}/livekit/token?v=6&t=tok123&jev=1`);
+    const meta = h.lk.dispatches.at(-1)!.metadata;
+    expect(meta.overWords).toEqual(['finished here']);
+    const worker = await attachWorker(h, meta);
+    await worker.post('joined');
+    const utt = (id: string, text: string) => ({ type: 'utterance', uttId: id, text, final: true, at: Date.now() });
+    await worker.post('jev', { events: [{ type: 'listen', on: true, at: Date.now() }, utt('a', 'Come over')] });
+    expect(h.inbound).toHaveLength(0);
+    await worker.post('jev', { events: [utt('b', 'Now, finished here.')] });
+    await vi.waitFor(() => expect(chat.posts.map((p) => p.text)).toEqual(['🎙 Come over Now']));
+    await worker.post('ended');
     worker.close();
   });
 

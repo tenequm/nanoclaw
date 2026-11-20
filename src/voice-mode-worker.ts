@@ -80,7 +80,6 @@ import {
   CALL_INTERRUPT,
   CALL_COMMANDS_ATTRIBUTE,
   CALL_COMMANDS_VERSION,
-  JEV_LISTEN_COMMANDS_VERSION,
   CALL_CUE_TRACK,
   CALL_PENDING_ATTRIBUTE,
   CALL_REPLY_TOPIC,
@@ -4506,9 +4505,8 @@ async function publishRoomTracks(local: LocalParticipant, log: WorkerLog) {
 export function callControlAttributes(meta: LiveKitJobMetadata) {
   // The app uses the commands version to negotiate settings even on a host-directed call.
   const settings = !meta.jev || (meta.appCall && !meta.meeting);
-  const version = meta.jev && meta.overWords ? JEV_LISTEN_COMMANDS_VERSION : CALL_COMMANDS_VERSION;
   return {
-    [CALL_COMMANDS_ATTRIBUTE]: settings ? version : '',
+    [CALL_COMMANDS_ATTRIBUTE]: settings ? CALL_COMMANDS_VERSION : '',
     [CALL_COMMAND_WORDS_ATTRIBUTE]: meta.jev ? '' : COMMAND_WORDS_JSON,
     [CALL_REVIEW_ATTRIBUTE]: meta.jev ? '' : '1',
   };
@@ -5022,6 +5020,8 @@ export class JevReporter {
     const batch: JevWorkerEvent[] = [];
     let bytes = JEV_POST_ENVELOPE_BYTES;
     while (this.queue.length && batch.length < this.perPost) {
+      // Retry a settings change on its own so a lost acknowledgement cannot replay speech.
+      if (batch.length && this.queue[0].type === 'listen') break;
       const size = Buffer.byteLength(JSON.stringify(this.queue[0])) + 1;
       if (JEV_POST_ENVELOPE_BYTES + size > this.maxBytes) {
         const event = this.queue.shift()!;
@@ -5033,7 +5033,9 @@ export class JevReporter {
       }
       if (bytes + size > this.maxBytes) break;
       bytes += size;
-      batch.push(this.queue.shift()!);
+      const event = this.queue.shift()!;
+      batch.push(event);
+      if (event.type === 'listen') break;
     }
     return batch;
   }
@@ -5042,23 +5044,26 @@ export class JevReporter {
     while (this.queue.length) {
       const batch = this.nextBatch();
       if (!batch.length) continue;
+      const attempts = batch[0].type === 'listen' ? 3 : 1;
       let accepted = false;
-      try {
-        const res = await this.post(batch);
-        accepted = res.ok;
-        void res.body?.cancel().catch(() => undefined);
-        if (!res.ok)
-          this.log.warn('voice-mode worker: the host refused jev events', { status: res.status, events: batch.length });
-      } catch (err) {
-        this.log.warn('voice-mode worker: could not reach the host with jev events; dropped', {
-          err,
-          events: batch.length,
-        });
-      } finally {
-        for (const event of batch) {
-          this.settingsAcks.get(event)?.(accepted);
-          this.settingsAcks.delete(event);
+      for (let attempt = 0; attempt < attempts && !accepted; attempt++) {
+        if (attempt) await pause(100 * 2 ** (attempt - 1));
+        try {
+          const res = await this.post(batch);
+          accepted = res.ok;
+          void res.body?.cancel().catch(() => undefined);
+          if (!accepted)
+            this.log.warn('voice-mode worker: the host refused jev events', {
+              status: res.status,
+              events: batch.length,
+            });
+        } catch (err) {
+          this.log.warn('voice-mode worker: could not reach the host with jev events', { err, events: batch.length });
         }
+      }
+      for (const event of batch) {
+        this.settingsAcks.get(event)?.(accepted);
+        this.settingsAcks.delete(event);
       }
     }
   }
@@ -5116,6 +5121,7 @@ export function serveAppInterrupt(
 }
 
 export interface JevLoopDeps {
+  /** Explicit release keeps even wordless transcription boundaries in the host draft. */
   listening?(): boolean;
   confirmPlayout: boolean;
   /** None on a meeting: the host transcribes each participant, and the reflex has its `words`. */
@@ -5136,6 +5142,8 @@ export interface JevLoopDeps {
 }
 
 interface JevUtterance {
+  /** This activity belonged to an explicit draft, even if the caller toggled off before its final. */
+  listened?: boolean;
   phoneWords?: string;
   needsPhoneFinal?: boolean;
   uttId: string;
@@ -5201,7 +5209,7 @@ export class JevLoop {
   private readonly wakers = new Set<() => void>();
   private readonly capture?: TurnCapture;
   private closed = false;
-  private readonly finalizing = new Set<Promise<void>>();
+  private readonly finalizing = new Map<JevUtterance, Promise<void>>();
 
   constructor(private readonly deps: JevLoopDeps) {
     this.now = deps.now ?? (() => Date.now());
@@ -5278,12 +5286,14 @@ export class JevLoop {
     this.wake();
     const audio = this.capture?.take(endedAt - this.speechSince);
     if (!utterance || !transcriber) return;
+    utterance.listened ||= this.deps.listening?.();
+    const listening = () => utterance.listened || this.deps.listening?.();
     const finalizing = transcriber.end().then(
       (heard) => {
         const text = turnText(heard).text || (utterance.phoneWords ? utterance.text || utterance.phoneWords : '');
         // An empty final releases a reply held through a wordless activity.
         if (!text && !utterance.text) {
-          if (beforePlayback || this.deps.listening?.()) this.finishUtterance(utterance, '');
+          if (beforePlayback || listening()) this.finishUtterance(utterance, '');
           utterance.needsPhoneFinal = true;
           if (audio) {
             const reason = heard.failed || audio.speechMs >= MIN_LOST_SPEECH_MS ? 'stt' : 'noise';
@@ -5293,7 +5303,7 @@ export class JevLoop {
         }
         // Recorded even when the call ended first: the last words before a hang-up are worth keeping.
         if (audio) this.deps.recorded?.(utterance.segment, audio, text || utterance.text);
-        this.finishUtterance(utterance, text || (this.deps.listening?.() ? utterance.text : ''));
+        this.finishUtterance(utterance, text || (listening() ? utterance.text : ''));
         if (pausedLine && this.playing === pausedLine && !pausedLine.abort.signal.aborted && takesTurn(text)) {
           this.deps.log.info('voice-mode worker: the words of the speech that paused the line came; it is cut', {
             replyId: pausedLine.replyId,
@@ -5304,14 +5314,13 @@ export class JevLoop {
       (err: unknown) => {
         this.deps.log.warn('voice-mode worker: an utterance has no final', { err });
         if (audio) this.deps.recorded?.(utterance.segment, audio, utterance.text, 'stt');
-        if ((beforePlayback || this.deps.listening?.()) && !utterance.phoneWords)
-          this.finishUtterance(utterance, utterance.text);
+        if ((beforePlayback || listening()) && !utterance.phoneWords) this.finishUtterance(utterance, utterance.text);
         utterance.needsPhoneFinal = true;
         if (utterance.phoneWords) this.finishUtterance(utterance, utterance.text || utterance.phoneWords);
       },
     );
-    this.finalizing.add(finalizing);
-    void finalizing.finally(() => this.finalizing.delete(finalizing));
+    this.finalizing.set(utterance, finalizing);
+    void finalizing.finally(() => this.finalizing.delete(utterance));
   }
 
   /** The open activity's whole text so far. */
@@ -5471,10 +5480,21 @@ export class JevLoop {
     return this.queue.length > 0 || (!!this.playing && !this.playing.started);
   }
 
+  /** Keep finals from the old mode eligible through a settings change or immediate hangup. */
+  retainListenInput(): void {
+    if (this.utterance) this.utterance.listened = true;
+    for (const utterance of this.finalizing.keys()) utterance.listened = true;
+  }
+
+  get hasListenInput(): boolean {
+    return !!this.utterance?.listened || [...this.finalizing.keys()].some((utt) => utt.listened);
+  }
+
   async finishInput(): Promise<void> {
     this.onSpeech(false, this.ring.position);
+    await atMost(Promise.all(this.finalizing.values()), FINAL_GRACE_MS);
     this.deps.transcriber?.close();
-    await Promise.all(this.finalizing);
+    await atMost(Promise.all(this.finalizing.values()), FINAL_GRACE_MS);
   }
 
   close(): void {
@@ -5683,6 +5703,7 @@ async function runJevCall(s: JevCallSetup): Promise<void> {
   /** The page's cue and typing switches, through the `settings` RPC. */
   const overWords = voiceCall ? meta.overWords : undefined;
   let listenUntilOver = false;
+  let drainingInput = false;
   let listenChange: Promise<boolean> | undefined;
   let cuesOn = true;
   let typingWanted = true;
@@ -5758,7 +5779,7 @@ async function runJevCall(s: JevCallSetup): Promise<void> {
     },
     report: (event) => {
       if (ending) {
-        if (listenUntilOver && event.type === 'utterance') reporter.report(event);
+        if (drainingInput && event.type === 'utterance') reporter.report(event);
         return;
       }
       reporter.report(event);
@@ -5799,7 +5820,8 @@ async function runJevCall(s: JevCallSetup): Promise<void> {
     cues.close();
     clearTimeout(thinkingTimer);
     updateTyping();
-    if (listenUntilOver) {
+    drainingInput = listenUntilOver || loop.hasListenInput;
+    if (drainingInput) {
       reporter.report({ type: 'hangup', at: Date.now() });
       await loop.finishInput();
     } else transcriber?.close();
@@ -5810,8 +5832,7 @@ async function runJevCall(s: JevCallSetup): Promise<void> {
     const mb = (bytes: number) => Math.round(bytes / 1_048_576);
     telemetry.ended(reason, { jev: true, heapUsedMB: mb(mem.heapUsed), rssMB: mb(mem.rss) });
     await Promise.all([
-      (tellHost || (listenUntilOver && reason === 'host: hangup')) &&
-        host.tell('ended', restart ? { reason, restart } : { reason }),
+      (tellHost || drainingInput) && host.tell('ended', restart ? { reason, restart } : { reason }),
       callVoice?.close().catch(() => undefined),
       callRecording?.close(),
     ]);
@@ -5857,7 +5878,9 @@ async function runJevCall(s: JevCallSetup): Promise<void> {
           callRecording?.push(pcm);
         },
         onVad: () => undefined,
-        onSpeech: (speaking, at) => loop.onSpeech(speaking, at),
+        onSpeech: (speaking, at) => {
+          if (!ending) loop.onSpeech(speaking, at);
+        },
         onAgentSpeaking: (speaking) => {
           agentSpeaking = speaking;
           updateTyping();
@@ -5889,6 +5912,7 @@ async function runJevCall(s: JevCallSetup): Promise<void> {
       else if (op !== 'settings') error = 'not_review';
       else {
         if (overWords && req.listenUntilOver !== undefined && req.listenUntilOver !== listenUntilOver) {
+          loop.retainListenInput();
           listenUntilOver = req.listenUntilOver;
           awaitingUntil = typingUntil = 0;
           cues.cancelTurn();
@@ -5898,7 +5922,7 @@ async function runJevCall(s: JevCallSetup): Promise<void> {
         if (req.cues !== undefined) cuesOn = req.cues;
         if (req.typing !== undefined) typingWanted = req.typing;
         updateTyping();
-        callLog.info('voice-mode worker: settings', { typing: typingWanted, cues: cuesOn });
+        callLog.info('voice-mode worker: settings', { typing: typingWanted, cues: cuesOn, listenUntilOver });
         cues.settings();
         if (req.tts) error = voice.selectTts ? voice.selectTts(req.tts, req.gen) : 'tts_unavailable';
       }
