@@ -79,7 +79,15 @@ export function createWorkerIngress(caller: { name: string }, maxTextBytes: numb
           at,
         };
       case 'overlap':
-        return { kind: 'overlap', requestId: e.requestId, replyId: e.replyId, played: e.played, text: e.text, at };
+        return {
+          kind: 'overlap',
+          speaker,
+          requestId: e.requestId,
+          replyId: e.replyId,
+          played: e.played,
+          text: e.text,
+          at,
+        };
       case 'speech':
         return { kind: 'speech', speaker, on: e.on, at };
       case 'playback':

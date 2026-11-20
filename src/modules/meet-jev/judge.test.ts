@@ -330,38 +330,50 @@ describe('parseAction', () => {
 });
 
 describe('askOverlap', () => {
-  const input = { agent_name: 'Assistant', window: state.window, played: 'The first step', caller: 'wait' };
-  it.each(['interruption', 'backchannel'])('asks a single overlap choice and parses %s', async (choice) => {
+  it.each([
+    [0.6, 0.4, 'yield'],
+    [0.3, 0.7, 'keep_talking'],
+    [0.59, 0.41, null],
+    [0.31, 0.69, null],
+  ] as const)('applies the probability thresholds to %s / %s', async (yieldP, keepP, expected) => {
     const fetch = respond({
       answers: {
-        overlap: {
-          choice,
-          confidence: 1,
-          probabilities: {
-            interruption: Number(choice === 'interruption'),
-            backchannel: Number(choice === 'backchannel'),
-          },
+        barge_in: {
+          choice: yieldP > keepP ? 'yield' : 'keep_talking',
+          confidence: 0.1,
+          probabilities: { yield: yieldP, keep_talking: keepP },
         },
       },
     });
-    expect((await askOverlap(input)).verdict).toBe(choice);
+    expect((await askOverlap(state)).verdict).toBe(expected);
     const body = JSON.parse((fetch.mock.calls[0] as [string, { body: string }])[1].body);
-    expect(body.state).toEqual(input);
+    expect(body.state).toEqual(state);
     expect(body.questions).toEqual({
-      overlap: {
+      barge_in: {
         type: 'choice',
-        instructions: expect.stringContaining('part of its line already heard'),
-        criteria: { interruption: expect.any(Object), backchannel: expect.any(Object) },
+        instructions:
+          "A live voice call. Dan is speaking the `partial` agent line in `window`, and the caller said `latest` over it; Dan's line is paused while you decide. Should Dan go on with the line or yield the turn to the caller?",
+        criteria: {
+          keep_talking: {
+            what: '`latest` only shows the caller is listening, following or agreeing (a backchannel: a hum, "yeah", "okay", "right", in any language), or invites Dan to go on, and asks for nothing new.',
+            not_for:
+              'A stop or wait, a correction, an objection, a question, a new request, or the caller carrying on with their own thought.',
+          },
+          yield: {
+            what: '`latest` takes the turn: it tells Dan to stop or wait, corrects or objects to what Dan says, asks a question, makes a new request, or the caller carries on with their own thought.',
+            not_for: 'A backchannel that only shows the caller is listening or agrees, or an invitation to go on.',
+          },
+        },
       },
     });
   });
   it('rejects an unknown choice or an incomplete distribution', async () => {
     for (const answer of [
-      { choice: 'stop', probabilities: { interruption: 1, backchannel: 0 } },
-      { choice: 'backchannel', probabilities: { backchannel: 1 } },
+      { choice: 'stop', probabilities: { yield: 1, keep_talking: 0 } },
+      { choice: 'keep_talking', probabilities: { keep_talking: 1 } },
     ]) {
-      respond({ answers: { overlap: { ...answer, confidence: 1 } } });
-      expect((await askOverlap(input)).verdict).toBeNull();
+      respond({ answers: { barge_in: { ...answer, confidence: 1 } } });
+      expect((await askOverlap(state)).verdict).toBeNull();
     }
   });
 });

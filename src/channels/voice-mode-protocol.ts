@@ -120,6 +120,7 @@ export interface LiveKitJobMetadata {
    * the host sends.
    */
   jev?: boolean;
+  jevOverlapVerdict?: boolean;
   jevDuck?: boolean;
 }
 
@@ -541,7 +542,7 @@ export type LiveKitHostEvent =
   | { type: 'stop' }
   | { type: 'revoke'; replyId: string }
   | { type: 'words' }
-  | { type: 'overlap'; requestId: string; verdict: 'interruption' | 'backchannel' | null }
+  | { type: 'overlap'; requestId: string; verdict: 'yield' | 'keep_talking' | null }
   | { type: 'thinking' }
   | { type: 'working' }
   /** A jev voice call's state as the host's loop sees it: the worker plays its cues from it. */

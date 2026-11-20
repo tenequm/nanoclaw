@@ -325,28 +325,27 @@ seconds. The agent answers when Jev gives `answer` a probability of at least
 and `continue` takes 0.5. The agent's name alone ("Dan", "Hey Dan.") wakes it
 without a Jev call unless an answer is already on its way.
 
-By default on a jev call, any caller sound the VAD takes for speech pauses the agent's
-line 300 ms after the speech starts (Silero starts speech after about 50 ms of
-sound and ends it about 550 ms after the sound stops). Words of that speech cut
-the line, unless they are only acknowledgements ("uh-huh", "yeah", "ok", "ага",
-"так", "да"; `takesTurn` in `src/voice-mode-gemini-live.ts`), which a meeting's
-host does not pass on either. Two seconds of quiet resume the line where it
-stopped (LiveKit's `false_interruption_timeout`), as does 10 seconds of
-wordless sound, so a cough, music or "mm" does not cost the answer. Words that
-come for that speech after the resume still cut the line.
+On a Jev voice call, 300 ms of caller speech pauses the playing line. The
+worker asks Jev the dedicated `barge_in` question on each changed partial
+with words and on the final while paused. Identical text shares an in-flight
+request. Jev sees the conversation, the part of the agent's line already
+heard, and the caller's latest words. Only a verdict for the current text
+and pause can affect playback.
 
-Set `VOICE_MODE_JEV_DUCK=1` on the host to try overlap judging on new Jev
-voice calls. At the same 300 ms trigger, speech keeps playing and the agent
-stays speaking. Gain ramps down to -12 dB in 50 ms. On a partial with words
-or a final, Jev sees the conversation, the estimated words already played and
-the caller's words. An interruption cuts the line and returns the words to
-ordinary turn handling. A backchannel stays in the transcript and restores
-full volume over 400 ms, with no replay. A missing verdict after 1500 ms, a
-model error or the call's Jev rate cap falls back to `takesTurn`. Wordless
-sound uses the existing quiet and maximum timers. On app calls the worker
-handles overlap locally and does not advertise the phone's immediate-cut RPC.
-Meetings keep their existing pause behavior. The gain, timings and overlap
-question are provisional pending evaluation.
+At `p(yield) >= 0.6` the line is cut and the caller's words go to ordinary
+turn handling. At `p(keep_talking) >= 0.7` the line resumes where it stopped
+as soon as the caller's speech ends. The acknowledgement stays in the
+transcript. Between those thresholds, on a host error or rate cap, or after
+1500 ms without a verdict, `takesTurn` checks the current text. A word
+besides acknowledgements and hums cuts the line. Without a keep verdict,
+two seconds of quiet resume playback. A pause lasts at most ten seconds.
+
+Set `VOICE_MODE_JEV_OVERLAP_VERDICT=0` to use the word list directly.
+Set `VOICE_MODE_JEV_DUCK=1` to try the independent ducking switch. At the
+same 300 ms trigger the audio keeps playing, with gain ramped to -12 dB
+over 50 ms. Restoring full gain takes 400 ms and replays no audio. On app
+calls with either switch enabled, the worker handles interruptions locally.
+Meetings use their existing pause and host word detection.
 
 A jev voice call plays three cues, by the plain call's `cues` and `typing`
 switches: listening once at call start; the typing sound and the "working"
@@ -415,7 +414,8 @@ fake LiveKit/Gemini boundaries and cannot prove the microphone or media route.
 | `VOICE_MODE_WAKE_THRESHOLD` | `0.68` bundled, `0.5` custom | Acoustic confidence threshold between zero and one. |
 | `VOICE_MODE_WAKE_HOP_MS` | `40` | Acoustic scoring hop, `40` or `80` milliseconds; anything else is logged and read as `40`. `40` scores on two interleaved 80 ms grids, about 30% of one core during a call. |
 | `VOICE_MODE_WAKE_START_SECONDS`, `VOICE_MODE_WAKE_IDLE_SECONDS` | `8`, `20` | After the wake phrase, how long the wake waits for the caller's first speech, then how long after the caller's last speech, before it goes back to waiting; zero disables each timer. |
-| `VOICE_MODE_JEV_DUCK` | off | `1` or `true` enables ducking and Jev overlap verdicts for new non-meeting Jev calls. |
+| `VOICE_MODE_JEV_OVERLAP_VERDICT` | on | `0` or `false` disables Jev barge-in decisions for new Jev voice calls. |
+| `VOICE_MODE_JEV_DUCK` | off | `1` or `true` lowers speech gain during a barge-in on new Jev voice calls. |
 | `VOICE_MODE_RECORDINGS_DAYS` | `0` | Optional private caller/reply recordings in `data/voice-recordings`: one file per turn on a plain call, one per utterance on a jev call (those with no transcript included), and each spoken reply. Meetings record nothing. |
 | `VOICE_MODE_CALL_RECORDING` | off | Debug: `true` or `1` also records each caller's whole call, waiting for the wake phrase included, as `data/voice-recordings/<agent>/<date>/<callId>-call.wav` (16 kHz mono; a plain call keeps the agent's speech as silence, a jev call keeps the caller's audio throughout) with a `.json` of wake detections. Local only, owner-only files; pruned by `VOICE_MODE_RECORDINGS_DAYS` when that is set, kept otherwise. |
 | `RECALL_API_KEY` | none | Recall.ai API key; `/meet` is off without it, or with the two URLs below missing or invalid. |

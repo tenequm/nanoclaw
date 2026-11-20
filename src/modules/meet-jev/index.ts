@@ -42,7 +42,7 @@ export interface JevCallHost {
   statusRoom?: { name: string; url: string; apiKey: string; apiSecret: string };
   /** Which call this is; `voice` when left out. */
   kind?: CallKind;
-  jevDuck?: boolean;
+  jevOverlapVerdict?: boolean;
   callerName: string;
   agentName: string;
   /** Other names the agent goes by (the vocabulary file's wake names). */
@@ -82,12 +82,13 @@ export function createJevCall(host: JevCallHost, deps: Partial<JevDeps> = {}): J
   const judge = deps.judge ?? askAction;
   const recheck = deps.recheck ?? askStillWanted;
   const kind = host.kind ?? 'voice';
+  const judgeOverlap = kind === 'voice' && host.jevOverlapVerdict !== false;
   const policy = policyFor(kind, host.agentName, [...host.agentAliases]);
   const ingress = createWorkerIngress({ name: host.callerName }, host.maxTextBytes);
   const replyTurns = new Map<string, string | null>();
   let replies = 0;
   const fields = { callId: host.callId };
-  log.info('meet-jev: questions', { ...fields, questions: judgeQuestions(host.agentName, host.jevDuck) });
+  log.info('meet-jev: questions', { ...fields, questions: judgeQuestions(host.agentName, judgeOverlap) });
   const judgedAt: number[] = [];
   /** Lines the worker reported started and not yet over: `words` reaches it only while one plays. */
   const playing = new Set<string>();
@@ -212,7 +213,7 @@ export function createJevCall(host: JevCallHost, deps: Partial<JevDeps> = {}): J
           if (event.kind === 'speech') log.info('meet-jev: worker vad', { ...fields, on: event.on, at: event.at });
           continue;
         }
-        if (event.kind === 'overlap' && (!host.jevDuck || !playing.has(event.replyId))) continue;
+        if (event.kind === 'overlap' && (!judgeOverlap || !playing.has(event.replyId))) continue;
         runtime.feed(event);
       }
       return { accepted: events.length, dropped };

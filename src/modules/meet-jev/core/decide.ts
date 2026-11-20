@@ -49,19 +49,11 @@ export function reduce(prev: CallState, event: CallEvent): CallState {
   const out = state.commands;
   switch (event.kind) {
     case 'overlap': {
-      const { agent_name, window } = toJevState(state);
-      // A playing line in the ordinary window contains even its unsaid tail.
-      out.push({
-        kind: 'overlap',
-        requestId: event.requestId,
-        windowVersion: state.windowVersion,
-        state: {
-          agent_name,
-          window: window.filter((line) => !(line.agent && line.partial)),
-          played: event.played,
-          caller: event.text,
-        },
-      });
+      const latest = { speaker: event.speaker.name, text: event.text };
+      const input = toJevState(state, latest, addressedByName(state, event.text));
+      // Only the prefix already heard belongs in the playing line.
+      for (const line of input.window) if (line.agent && line.partial) line.text = event.played;
+      out.push({ kind: 'overlap', requestId: event.requestId, windowVersion: state.windowVersion, state: input });
       break;
     }
     case 'utterance':

@@ -14,7 +14,6 @@ import {
   type Choice,
   type JevState,
   type OverlapAction,
-  type OverlapState,
   type RecheckAction,
   type RecheckState,
   type RecheckVerdict,
@@ -164,22 +163,26 @@ function stillWantedDecision(agent: string): ChoiceDecision {
   };
 }
 
-// Distinguish taking the floor from reacting while the caller can still hear the line.
-const OVERLAP_DECISION: ChoiceDecision = {
-  kind: 'choice',
-  prompt:
-    'On this live call, caller is speech over the agent and played is the part of its line already heard. Use the earlier conversation in window. Should the agent stop for this caller?',
-  options: {
-    interruption: {
-      what: 'The caller takes the floor, asks a question, corrects the agent or asks it to stop.',
-      not_for: 'Agreement, encouragement or an aside.',
+const OVERLAP_YIELD_P = 0.6;
+const OVERLAP_KEEP_TALKING_P = 0.7;
+
+function bargeInDecision(agent: string): ChoiceDecision {
+  return {
+    kind: 'choice',
+    prompt: `A live voice call. ${agent} is speaking the \`partial\` agent line in \`window\`, and the caller said \`latest\` over it; ${agent}'s line is paused while you decide. Should ${agent} go on with the line or yield the turn to the caller?`,
+    options: {
+      keep_talking: {
+        what: `\`latest\` only shows the caller is listening, following or agreeing (a backchannel: a hum, "yeah", "okay", "right", in any language), or invites ${agent} to go on, and asks for nothing new.`,
+        not_for:
+          'A stop or wait, a correction, an objection, a question, a new request, or the caller carrying on with their own thought.',
+      },
+      yield: {
+        what: `\`latest\` takes the turn: it tells ${agent} to stop or wait, corrects or objects to what ${agent} says, asks a question, makes a new request, or the caller carries on with their own thought.`,
+        not_for: 'A backchannel that only shows the caller is listening or agrees, or an invitation to go on.',
+      },
     },
-    backchannel: {
-      what: 'The caller acknowledges, reacts briefly or speaks to someone else while the agent should keep talking.',
-      not_for: 'A request or correction that needs the agent to yield.',
-    },
-  },
-};
+  };
+}
 
 const toJevQuestion = (decision: Decision) =>
   decision.kind === 'choice'
@@ -192,7 +195,7 @@ export const judgeQuestions = (agent: string, overlap = false) =>
       action: actionDecision(agent),
       ...shadowDecisions(agent),
       still_wanted: stillWantedDecision(agent),
-      ...(overlap ? { overlap: OVERLAP_DECISION } : {}),
+      ...(overlap ? { barge_in: bargeInDecision(agent) } : {}),
     }).map(([name, decision]) => [name, toJevQuestion(decision)]),
   );
 
@@ -352,8 +355,20 @@ export const askAction = (state: JevState, opts: JudgeOptions = {}): Promise<{ v
     opts,
   );
 
-export const askOverlap = (state: OverlapState, opts: JudgeOptions = {}) =>
-  ask(state, { overlap: OVERLAP_DECISION }, (result) => verdictOf<OverlapAction>(result)?.action ?? null, opts);
+export async function askOverlap(
+  state: JevState,
+  opts: JudgeOptions = {},
+): Promise<{ verdict: OverlapAction | null; ms: number }> {
+  const { verdict, ms } = await ask(
+    state,
+    { barge_in: bargeInDecision(state.agent_name) },
+    verdictOf<OverlapAction>,
+    opts,
+  );
+  if (verdict && verdict.probabilities.yield >= OVERLAP_YIELD_P) return { verdict: 'yield', ms };
+  if (verdict && verdict.probabilities.keep_talking >= OVERLAP_KEEP_TALKING_P) return { verdict: 'keep_talking', ms };
+  return { verdict: null, ms };
+}
 
 /** Ask Jev whether a landed answer is still wanted. Never throws; null on any failure. */
 export const askStillWanted = (

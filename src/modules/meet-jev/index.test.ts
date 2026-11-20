@@ -78,12 +78,13 @@ describe('createJevCall', () => {
   });
 
   it.each([
+    ['voice', undefined, true],
     ['voice', true, true],
     ['meet', true, false],
     ['voice', false, false],
-  ] as const)('routes a correlated overlap on %s with duck=%s', async (kind, jevDuck, enabled) => {
+  ] as const)('routes a correlated overlap on %s with overlap verdict=%s', async (kind, jevOverlapVerdict, enabled) => {
     const push = vi.fn();
-    const overlap = vi.fn(async () => ({ verdict: 'backchannel' as const, ms: 1 }));
+    const overlap = vi.fn(async () => ({ verdict: 'keep_talking' as const, ms: 1 }));
     const judge = vi.fn(async () => ({ verdict: null, ms: 1 }));
     const call = createJevCall(
       {
@@ -92,18 +93,21 @@ describe('createJevCall', () => {
         agentName: 'Agent',
         agentAliases: [],
         kind,
-        jevDuck,
+        jevOverlapVerdict,
         now: () => 1000,
-        submitTurn: vi.fn(),
+        submitTurn: async () => ({ ok: true, turnId: 'turn' }),
         maxTextBytes: 4096,
         push,
       },
       { overlap, judge },
     );
+    call.workerEvents([{ type: 'utterance', uttId: 'wake', text: 'Agent', final: true, at: 980 }]);
+    await flush();
+    call.reply('First words then a private tail.', 'turn');
     call.workerEvents([
       { type: 'utterance', uttId: 'u', text: 'Some context', final: false, at: 990 },
-      { type: 'playback', replyId: 'r', state: 'started', at: 995 },
-      { type: 'overlap', requestId: 'request', replyId: 'r', played: 'First words', text: 'side remark', at: 999 },
+      { type: 'playback', replyId: 'r1', state: 'started', at: 995 },
+      { type: 'overlap', requestId: 'request', replyId: 'r1', played: 'First words', text: 'side remark', at: 999 },
       { type: 'utterance', uttId: 'u', text: 'side remark', final: true, contextOnly: true, at: 1000 },
       { type: 'speech', on: false, at: 1000 },
     ]);
@@ -112,13 +116,16 @@ describe('createJevCall', () => {
     if (enabled) {
       expect(overlap).toHaveBeenCalledWith(
         expect.objectContaining({
-          played: 'First words',
-          caller: 'side remark',
-          window: [expect.objectContaining({ text: 'Some context' })],
+          latest: { speaker: 'Caller', text: 'side remark' },
+          facts: expect.objectContaining({ agent_speaking: true, pending_answer: true }),
+          window: expect.arrayContaining([
+            expect.objectContaining({ text: 'Some context' }),
+            expect.objectContaining({ agent: true, partial: true, text: 'First words' }),
+          ]),
         }),
         expect.anything(),
       );
-      expect(push).toHaveBeenCalledWith({ type: 'overlap', requestId: 'request', verdict: 'backchannel' });
+      expect(push).toHaveBeenCalledWith({ type: 'overlap', requestId: 'request', verdict: 'keep_talking' });
       expect(judge).not.toHaveBeenCalled();
       call.workerEvents([{ type: 'utterance', uttId: 'u', text: 'side remark', final: true, at: 1001 }]);
       await flush();
