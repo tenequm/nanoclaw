@@ -19,7 +19,7 @@ import {
   LocalAudioTrack,
   type LocalParticipant,
 } from '@livekit/rtc-node';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
   CALL_CUE_TRACK,
@@ -128,6 +128,10 @@ import {
   type TurnTakingDeps,
   deliveredText,
   JEV_BARGE_MS,
+  JEV_DUCK_ATTACK_MS,
+  JEV_DUCK_DB,
+  JEV_DUCK_RELEASE_MS,
+  JEV_OVERLAP_VERDICT_TIMEOUT_MS,
   JEV_FALSE_INTERRUPTION_TIMEOUT_MS,
   JEV_MAX_PAUSE_MS,
   THINKING_HOLD_MS,
@@ -830,6 +834,8 @@ function fakeVoice(
       events.onAgentSpeaking(false);
       return { heard: true, failed: false, cut: false, audioMs: 0, playedMs: 0, complete: true };
     }),
+    setSpeechDucked: vi.fn((_ducked: boolean) => {}),
+    playedText: vi.fn(() => ''),
     setSpeechPaused: vi.fn((_paused: boolean) => {}),
     selectTts: undefined as CallVoice['selectTts'],
     setThinking: vi.fn(),
@@ -858,6 +864,8 @@ function fakeVoice(
         voice.say.mockImplementation(output.say);
         voice.speak.mockImplementation(output.speak);
         voice.selectTts = output.selectTts;
+        voice.setSpeechDucked.mockImplementation(output.setSpeechDucked);
+        voice.playedText.mockImplementation(output.playedText);
         voice.setSpeechPaused.mockImplementation(output.setSpeechPaused);
         voice.close.mockImplementation(async () => {
           await output.close();
@@ -6855,7 +6863,11 @@ describe('jev: the reporter', () => {
 });
 
 /** A JevLoop over a fake transcription (none: a meeting's) and a speech output the test drives line by line. */
-function jevLoop({ transcribed = true, app = false }: { transcribed?: boolean; app?: boolean } = {}) {
+function jevLoop({
+  transcribed = true,
+  app = false,
+  duck = false,
+}: { transcribed?: boolean; app?: boolean; duck?: boolean } = {}) {
   const transcription = fakeTranscription();
   const events: JevWorkerEvent[] = [];
   const captions: Array<[number, string, boolean]> = [];
@@ -6890,7 +6902,9 @@ function jevLoop({ transcribed = true, app = false }: { transcribed?: boolean; a
       signal.addEventListener('abort', () => resolve(outcome(line, { cut: true, playedMs: 800 })), { once: true });
     });
   });
+  const setDucked = vi.fn();
   const loop = new JevLoop({
+    ...(duck ? { duck: { set: setDucked, playedText: () => 'One two' } } : {}),
     ...(transcribed ? { transcriber: transcription } : {}),
     appCall: app,
     setSpeechPaused: vi.fn(),
@@ -6906,6 +6920,7 @@ function jevLoop({ transcribed = true, app = false }: { transcribed?: boolean; a
     events,
     captions,
     recorded,
+    setDucked,
     speak,
     lines,
     /** The events so far, one word each. */
@@ -6913,9 +6928,11 @@ function jevLoop({ transcribed = true, app = false }: { transcribed?: boolean; a
       events.map((e) =>
         e.type === 'playback'
           ? `${e.replyId}:${e.state}`
-          : e.type === 'speech'
-            ? `speech:${e.on ? 'on' : 'off'}`
-            : `${e.final ? 'final' : 'partial'}:${e.text}`,
+          : e.type === 'overlap'
+            ? 'overlap'
+            : e.type === 'speech'
+              ? `speech:${e.on ? 'on' : 'off'}`
+              : `${e.final ? 'final' : 'partial'}:${e.text}`,
       ),
     /** The line's first audio plays. */
     start: (line: Line) => {
@@ -6929,6 +6946,110 @@ function jevLoop({ transcribed = true, app = false }: { transcribed?: boolean; a
     },
   };
 }
+
+describe('Jev overlap ducking', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  async function talking() {
+    const h = jevLoop({ duck: true });
+    h.loop.onReply('r1', 'One two three four.');
+    await vi.advanceTimersByTimeAsync(1);
+    h.start(h.lines[0]);
+    h.loop.onSpeech(true, 0);
+    await vi.advanceTimersByTimeAsync(JEV_BARGE_MS - 1);
+    expect(h.setDucked).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(h.setDucked.mock.calls).toEqual([[true]]);
+    expect(h.loop.paused).toBe(false);
+    return h;
+  }
+  const request = (h: Awaited<ReturnType<typeof talking>>) => h.events.filter((e) => e.type === 'overlap').at(-1)!;
+
+  it('cuts for an interruption even on an acknowledgement and releases its words to the turn judge', async () => {
+    const h = await talking();
+    h.loop.onInterim('yeah');
+    const req = request(h);
+    expect(req).toMatchObject({ replyId: 'r1', played: 'One two', text: 'yeah' });
+    expect(h.lines[0].signal.aborted).toBe(false);
+    h.loop.onOverlap(req.requestId, 'interruption');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(h.events).toContainEqual(expect.objectContaining({ state: 'cut_off', delivered: 'One two' }));
+    expect(h.events.filter((e) => e.type === 'utterance').at(-1)).not.toHaveProperty('contextOnly');
+    h.loop.close();
+  });
+
+  it('accepts a final-only side remark, restores gain and ignores a duplicate verdict', async () => {
+    const h = await talking();
+    h.transcription.results.push(heard('', 'That sounds great.'));
+    h.loop.onSpeech(false, 9000);
+    await vi.advanceTimersByTimeAsync(1);
+    const req = request(h);
+    expect(req.text).toBe('That sounds great.');
+    h.loop.onOverlap(req.requestId, 'backchannel');
+    h.loop.onOverlap(req.requestId, 'interruption');
+    expect(h.setDucked.mock.calls).toEqual([[true], [false]]);
+    expect(h.lines[0].signal.aborted).toBe(false);
+    expect(h.events.filter((e) => e.type === 'utterance').at(-1)).toMatchObject({ final: true, contextOnly: true });
+    h.loop.close();
+  });
+
+  it.each([
+    ['yeah', false],
+    ['wait please', true],
+  ] as const)('uses the latest words at the deadline: %s', async (words, cut) => {
+    const h = await talking();
+    h.loop.onInterim('yeah');
+    h.loop.onInterim(words);
+    await vi.advanceTimersByTimeAsync(JEV_OVERLAP_VERDICT_TIMEOUT_MS - 1);
+    expect(h.lines[0].signal.aborted).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    h.loop.onOverlap(request(h).requestId, cut ? 'backchannel' : 'interruption');
+    expect(h.lines[0].signal.aborted).toBe(cut);
+    expect(h.setDucked.mock.calls).toEqual([[true], [false]]);
+    h.loop.close();
+  });
+
+  it('rechecks a growing acknowledgement without extending the original deadline', async () => {
+    const h = await talking();
+    h.loop.onInterim('yeah');
+    const first = request(h);
+    await vi.advanceTimersByTimeAsync(JEV_OVERLAP_VERDICT_TIMEOUT_MS - 10);
+    h.loop.onInterim('yeah but wait');
+    h.loop.onOverlap(first.requestId, 'backchannel');
+    const second = request(h);
+    expect(second.requestId).not.toBe(first.requestId);
+    expect(second.text).toBe('yeah but wait');
+    await vi.advanceTimersByTimeAsync(10);
+    expect(h.lines[0].signal.aborted).toBe(true);
+    h.loop.close();
+  });
+
+  it('keeps a late verdict for a completed line away from the next line', async () => {
+    const h = await talking();
+    h.loop.onInterim('wait');
+    h.transcription.results.push(heard('', 'wait'));
+    h.loop.onSpeech(false, 9000);
+    const req = request(h);
+    h.finish(h.lines[0]);
+    h.loop.onReply('r2', 'Another line.');
+    await vi.advanceTimersByTimeAsync(1);
+    h.start(h.lines[1]);
+    h.loop.onOverlap(req.requestId, 'interruption');
+    expect(h.lines[1].signal.aborted).toBe(false);
+    expect(h.events.at(-1)).toMatchObject({ type: 'utterance', final: true, text: 'wait' });
+    h.loop.close();
+  });
+
+  it('falls back immediately on a host error', async () => {
+    const h = await talking();
+    h.loop.onInterim('wait');
+    h.loop.onOverlap(request(h).requestId, null);
+    expect(h.lines[0].signal.aborted).toBe(true);
+    h.loop.close();
+  });
+});
 
 describe('app interrupt RPC', () => {
   const method = 'nanoclaw.voice-mode.interrupt';
@@ -7613,9 +7734,69 @@ describe('jev calls', () => {
   const summary = (e: JevWorkerEvent) =>
     e.type === 'playback'
       ? `${e.replyId}:${e.state}`
-      : e.type === 'speech'
-        ? `speech:${e.on ? 'on' : 'off'}`
-        : `${e.final ? 'final' : 'partial'}:${e.text}`;
+      : e.type === 'overlap'
+        ? 'overlap'
+        : e.type === 'speech'
+          ? `speech:${e.on ? 'on' : 'off'}`
+          : `${e.final ? 'final' : 'partial'}:${e.text}`;
+
+  it('runs ducking through job metadata, PCM playback and the host verdict stream', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    const { ctx, job } = fakeJob({ ...JEV_META, jevDuck: true });
+    const host = fakeHostFetch();
+    const sink = {
+      captureFrame: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      },
+      waitForPlayout: vi.fn(),
+      clearQueue: vi.fn(),
+      queuedDuration: 0,
+    };
+    const line = 'One two three four five six seven eight nine ten.';
+    const v = fakeVoice((meta, settings, events) =>
+      speechOutput({
+        meta,
+        settings,
+        sink,
+        log: silentLog,
+        started: () => events.onAgentSpeaking(true),
+        stopped: () => events.onAgentSpeaking(false),
+        changed: vi.fn(),
+        build: () => fakeTts(() => ({ chunks: 100, samples: 480 })).instance,
+      }),
+    );
+    await runCall(ctx, callDeps(host.fetchImpl, v));
+    try {
+      host.emit({ type: 'reply', replyId: 'r1', text: line });
+      await vi.advanceTimersByTimeAsync(220);
+      v.events.onSpeech(true, 0);
+      await vi.advanceTimersByTimeAsync(JEV_BARGE_MS);
+      expect(v.voice.setSpeechDucked).toHaveBeenCalledExactlyOnceWith(true);
+      expect(v.voice.setSpeechPaused).not.toHaveBeenCalled();
+      v.interim('could you stop');
+      await vi.advanceTimersByTimeAsync(1);
+      const request = jevEvents(host)
+        .flat()
+        .find((e) => e.type === 'overlap')!;
+      expect(request.played).toBe('One two');
+      await vi.advanceTimersByTimeAsync(500);
+      v.transcription.results.push(heard('', 'could you stop'));
+      v.events.onSpeech(false, 16000);
+      await vi.advanceTimersByTimeAsync(1);
+      host.emit({ type: 'overlap', requestId: request.requestId, verdict: 'interruption' });
+      await vi.advanceTimersByTimeAsync(30);
+      const events = jevEvents(host).flat();
+      const cut = events.findIndex((e) => e.type === 'playback' && e.state === 'cut_off');
+      expect(events[cut]).toMatchObject({ delivered: 'One two three' });
+      expect(events[cut + 1]).toMatchObject({ type: 'utterance', final: true, text: 'could you stop' });
+      expect(events[cut + 1]).not.toHaveProperty('contextOnly');
+      expect(sink.clearQueue).toHaveBeenCalledOnce();
+    } finally {
+      host.emit({ type: 'end', reason: 'done' });
+      await vi.advanceTimersByTimeAsync(50);
+      expect(job.shutdown).toHaveBeenCalled();
+    }
+  });
 
   it.each([
     { client: 'plain app', meta: { appCall: true }, trigger: 'settings-after-subscribe' },
@@ -8389,6 +8570,47 @@ describe('jev calls', () => {
 });
 
 describe('jev: an abortable line in the speech output', () => {
+  it('applies both gain ramps to every successive PCM sample and never clears or replays audio', async () => {
+    const frames: number[] = [];
+    const sample = (n: number) => 12000 + (n % 8000);
+    const frameSize = 480;
+    const framesInLine = 30;
+    const duckAt = frameSize;
+    const releaseAt = frameSize * 5;
+    const sink = {
+      captureFrame: async (frame: AudioFrame) => {
+        frames.push(...frame.data);
+        if (frames.length === duckAt) output.setSpeechDucked(true);
+        if (frames.length === releaseAt) output.setSpeechDucked(false);
+      },
+      clearQueue: vi.fn(),
+      waitForPlayout: vi.fn(),
+      queuedDuration: 0,
+    };
+    const output = speechOutput({
+      meta: META,
+      settings: { providerKeys: { gemini: 'gk' } },
+      sink,
+      log: silentLog,
+      started: vi.fn(),
+      stopped: vi.fn(),
+      changed: vi.fn(),
+      build: () => fakeTts(() => ({ chunks: framesInLine, samples: frameSize, value: sample })).instance,
+    });
+    const result = await output.speak('A complete line.', async () => {}, new AbortController().signal);
+    const target = 10 ** (JEV_DUCK_DB / 20);
+    const expected = Array.from({ length: frameSize * framesInLine }, (_, n) => {
+      let gain = 1;
+      if (n >= releaseAt) gain = target + (1 - target) * Math.min(1, (n - releaseAt + 1) / (24 * JEV_DUCK_RELEASE_MS));
+      else if (n >= duckAt) gain = 1 + (target - 1) * Math.min(1, (n - duckAt + 1) / (24 * JEV_DUCK_ATTACK_MS));
+      return Math.round(sample(n) * gain);
+    });
+    expect(frames).toEqual(expected);
+    expect(sink.clearQueue).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ complete: true, cut: false, playedMs: framesInLine * 20 });
+    await output.close();
+  });
+
   it("a plain call's line that the call's close stops mid-chunk flushes no tail and is no synthesis failure", async () => {
     const warn = vi.fn();
     let frames = 0;

@@ -37,10 +37,14 @@ export type RecheckAction = 'speak' | 'show';
 export const RECHECK_ACTIONS: readonly RecheckAction[] = ['speak', 'show'];
 export type RecheckVerdict = Choice<RecheckAction>;
 
+export type OverlapAction = 'interruption' | 'backchannel';
+export type OverlapState = Pick<JevState, 'agent_name' | 'window'> & { played: string; caller: string };
+
 export type CallEvent =
   | { kind: 'presence'; speaker: Speaker; joined: boolean; at: number }
   /** A participant's words: partials update the utterance, the final replaces it. */
-  | { kind: 'utterance'; speaker: Speaker; uttId: string; text: string; final: boolean; at: number }
+  | { kind: 'utterance'; speaker: Speaker; uttId: string; text: string; final: boolean; contextOnly?: true; at: number }
+  | { kind: 'overlap'; requestId: string; replyId: string; played: string; text: string; at: number }
   /** A participant started or stopped speaking (the worker's VAD, or a meeting participant's own). */
   | { kind: 'speech'; speaker: Speaker; on: boolean; at: number }
   /** A typed chat line (Meet chat): context only, never a boundary. */
@@ -70,6 +74,7 @@ export type CallEvent =
     };
 
 export type Command =
+  | { kind: 'overlap'; requestId: string; state: OverlapState; windowVersion: number }
   | { kind: 'status'; status: CallStatus }
   /** Ask Jev about the window as of `windowVersion`; the answer comes back as a `verdict`. */
   | { kind: 'judge'; windowVersion: number; state: JevState }

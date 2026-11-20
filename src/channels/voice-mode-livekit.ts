@@ -231,6 +231,7 @@ export interface SpeechSettings {
 }
 
 export interface LiveKitVoiceConfig {
+  jevDuck?: boolean;
   /** The wake phrase's name (wakePhraseName): what a jev call's people call the agent, over the line's agent name. */
   wakeName?: string;
   /** VOICE_MODE_LANGUAGES as parseVoiceLanguages read it; DEFAULT_VOICE_LANGUAGES when unset. */
@@ -977,6 +978,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
       agentName: line.agent.name,
       callerName: line.caller.name,
       ...job,
+      ...(job.jev && !job.meeting && config.jevDuck ? { jevDuck: true } : {}),
       vocabulary: [...(line.agent.vocabulary ?? [])],
       languages,
       ...(line.agent.wakeNames?.length ? { wakeNames: [...line.agent.wakeNames] } : {}),
@@ -1268,6 +1270,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
           apiSecret: config.apiSecret,
         },
         kind,
+        jevDuck: kind === 'voice' && !!config.jevDuck,
         callerName: call.line.caller.name,
         agentName: config.wakeName ?? call.line.agent.name,
         agentAliases: [call.line.agent.name, ...(call.line.agent.wakeNames ?? [])].filter(

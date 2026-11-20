@@ -48,7 +48,24 @@ export function reduce(prev: CallState, event: CallEvent): CallState {
   applyWindow(state, event);
   const out = state.commands;
   switch (event.kind) {
+    case 'overlap': {
+      const { agent_name, window } = toJevState(state);
+      // A playing line in the ordinary window contains even its unsaid tail.
+      out.push({
+        kind: 'overlap',
+        requestId: event.requestId,
+        windowVersion: state.windowVersion,
+        state: {
+          agent_name,
+          window: window.filter((line) => !(line.agent && line.partial)),
+          played: event.played,
+          caller: event.text,
+        },
+      });
+      break;
+    }
     case 'utterance':
+      if (event.contextOnly) break;
       if (event.final && hasWords(event.text)) out.push({ kind: 'status', status: 'heard' });
       // Both kinds decide on the final, which comes after the speaker's own VAD end (the worker's, or the
       // host's per-participant pipeline in a meeting). Only the current utterance's final is a boundary: a late
@@ -150,7 +167,7 @@ function boundary(state: CallState, speakerId: string): void {
 function decideLatest(state: CallState, speakerId: string): boolean {
   const speaker = state.speakers[speakerId];
   const utt = latestUtterance(state, speakerId);
-  if (!speaker || !utt || !hasWords(utt.text) || isHandled(speaker, utt.uttId)) return false;
+  if (!speaker || !utt || utt.contextOnly || !hasWords(utt.text) || isHandled(speaker, utt.uttId)) return false;
   markHandled(speaker, utt.uttId);
   // A newer decision sees the deferred utterance in its window; it is not decided again after it.
   const deferred = state.deferred;

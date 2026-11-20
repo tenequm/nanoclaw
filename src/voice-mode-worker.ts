@@ -1267,6 +1267,8 @@ export interface CallVoice {
   speak(text: string, ready: () => Promise<void>, signal: AbortSignal): Promise<LineOutcome>;
   /** Holds the playing line at its next unplayed sample, or lets it go on from there. */
   setSpeechPaused(paused: boolean): void;
+  setSpeechDucked(ducked: boolean): void;
+  playedText(): string;
   /** The `nanoclaw.voice-mode.thinking` attribute. */
   setThinking(thinking: boolean): void;
   /** One message on the `nanoclaw.voice-mode.turn` topic. */
@@ -4170,7 +4172,10 @@ export interface SpeechOutputOptions {
 }
 
 /** The call's speech: its lines into the speech sink, and the caller's pick of what speaks them. */
-export function speechOutput(o: SpeechOutputOptions): Pick<CallVoice, 'say' | 'speak' | 'setSpeechPaused'> & {
+export function speechOutput(o: SpeechOutputOptions): Pick<
+  CallVoice,
+  'say' | 'speak' | 'setSpeechPaused' | 'setSpeechDucked' | 'playedText'
+> & {
   selectTts: NonNullable<CallVoice['selectTts']>;
   readonly speech: LineSpeech;
   close(): Promise<void>;
@@ -4195,6 +4200,10 @@ export function speechOutput(o: SpeechOutputOptions): Pick<CallVoice, 'say' | 's
   /** The line's last frames sent, newest last, and those a pause took back from the sink to send again. */
   let recent: Int16Array[] = [];
   let held: Int16Array[] = [];
+  let gain = 1;
+  let targetGain = 1;
+  let rampSamples = 0;
+  let playedText = () => '';
   const releasePause = () => {
     hold = undefined;
     release?.();
@@ -4237,9 +4246,11 @@ export function speechOutput(o: SpeechOutputOptions): Pick<CallVoice, 'say' | 's
     /** Set by the line's abort, in whichever phase it lands: what had played by then. */
     let cutPlayedMs: number | undefined;
     // The abort silences the line at once, not at the next provider chunk or after the queue drained.
+    const playedDuration = () => Math.max(0, audioMs - o.sink.queuedDuration - held.length * SPEECH_FRAME_MS);
+    playedText = () => playedPrefix(text, playedDuration(), audioMs, complete);
     const cutNow = () => {
       if (closed || cutPlayedMs !== undefined) return;
-      cutPlayedMs = Math.max(0, audioMs - o.sink.queuedDuration - held.length * SPEECH_FRAME_MS);
+      cutPlayedMs = playedDuration();
       o.sink.clearQueue();
     };
     let abortedResolve!: () => void;
@@ -4285,6 +4296,12 @@ export function speechOutput(o: SpeechOutputOptions): Pick<CallVoice, 'say' | 's
       await resumed();
       if (lineSignal.aborted) return;
       const frame = filter ? filter(synthesized) : synthesized;
+      if (gain !== 1 || rampSamples) {
+        for (let i = 0; i < frame.length; i++) {
+          if (rampSamples > 0) gain += (targetGain - gain) / rampSamples--;
+          frame[i] = Math.round(frame[i] * gain);
+        }
+      }
       meter.frame(frame);
       if (o.settings.recordReplies) sent.push(frame);
       audioMs += SPEECH_FRAME_MS;
@@ -4349,6 +4366,9 @@ export function speechOutput(o: SpeechOutputOptions): Pick<CallVoice, 'say' | 's
       return { outcome: { heard, failed, cut: false, audioMs, playedMs, complete }, said: false };
     } finally {
       lineSignal.removeEventListener('abort', onAbort);
+      gain = targetGain = 1;
+      rampSamples = 0;
+      playedText = () => '';
       recent = [];
       held = [];
       releasePause();
@@ -4373,6 +4393,13 @@ export function speechOutput(o: SpeechOutputOptions): Pick<CallVoice, 'say' | 's
   return {
     say,
     speak,
+    playedText: () => playedText(),
+    setSpeechDucked(ducked) {
+      const target = ducked ? 10 ** (JEV_DUCK_DB / 20) : 1;
+      if (closed || target === targetGain) return;
+      targetGain = target;
+      rampSamples = Math.round((TTS_SAMPLE_RATE * (ducked ? JEV_DUCK_ATTACK_MS : JEV_DUCK_RELEASE_MS)) / 1000);
+    },
     setSpeechPaused(paused) {
       if (closed || paused === !!hold) return;
       if (paused) {
@@ -4465,7 +4492,7 @@ export function voiceAttribute(
   };
 }
 
-async function publishRoomTracks(local: LocalParticipant, log: WorkerLog) {
+async function publishRoomTracks(local: LocalParticipant, log: WorkerLog, jevDuck: boolean) {
   // Keep speech on the wire between lines and allow 64 kbps Opus over the SDK's 48 kbps default.
   const speech = await publishAudioTrack(
     local,
@@ -4477,7 +4504,7 @@ async function publishRoomTracks(local: LocalParticipant, log: WorkerLog) {
       red: true,
       audioEncoding: { maxBitrate: 64_000n },
     }),
-    SPEECH_QUEUE_MS,
+    jevDuck ? JEV_DUCK_QUEUE_MS : SPEECH_QUEUE_MS,
   );
   // Cues have their own short queue so speech buffering cannot delay them.
   const cue = await publishAudioTrack(
@@ -4626,6 +4653,8 @@ async function roomVoice(
     say: speaker.say,
     speak: speaker.speak,
     setSpeechPaused: speaker.setSpeechPaused,
+    setSpeechDucked: speaker.setSpeechDucked,
+    playedText: speaker.playedText,
     selectTts: speaker.selectTts,
     setThinking: (thinking) => setAttr(CALL_THINKING_ATTRIBUTE, thinking ? '1' : '', 'the thinking state'),
     publishTurn: (status) => sendJson(CALL_TURN_TOPIC, status, 'a turn status'),
@@ -4909,6 +4938,16 @@ export function callCues(o: {
  * speech that take the turn (`takesTurn`: a partial or final, or the host's `words`) cut it.
  */
 export const JEV_BARGE_MS = 300;
+// Leave the line audible beneath the caller while Jev decides.
+export const JEV_DUCK_DB = -12;
+// Lower the line quickly enough to give the caller room without a gain step.
+export const JEV_DUCK_ATTACK_MS = 50;
+// Restore speech gradually so a backchannel does not cause a sudden jump.
+export const JEV_DUCK_RELEASE_MS = 400;
+// Keep only one frame ahead of the gain envelope so a full sink cannot delay ducking by a second.
+const JEV_DUCK_QUEUE_MS = SPEECH_FRAME_MS;
+// Bound the wait from the first overlap request to a local word-list decision.
+export const JEV_OVERLAP_VERDICT_TIMEOUT_MS = 1500;
 /** Quiet this long after a pausing speech, with no words of it, resumes the line (`false_interruption_timeout`). */
 export const JEV_FALSE_INTERRUPTION_TIMEOUT_MS = 2_000;
 /**
@@ -4943,6 +4982,11 @@ export function deliveredText(text: string, share: number): string {
     out = text.slice(0, end);
   }
   return out;
+}
+
+function playedPrefix(text: string, playedMs: number, audioMs: number, complete: boolean): string {
+  const totalMs = complete ? audioMs : Math.max(audioMs, (text.length * 1000) / JEV_SPEECH_CHARS_PER_SECOND);
+  return totalMs > 0 ? deliveredText(text, Math.min(playedMs, audioMs) / totalMs) : '';
 }
 
 const isPartial = (e: JevWorkerEvent): e is Extract<JevWorkerEvent, { type: 'utterance' }> =>
@@ -4988,7 +5032,15 @@ export class JevReporter {
         });
       }
     }
-    this.inFlight ??= this.flush().finally(() => (this.inFlight = undefined));
+    this.startFlush();
+  }
+
+  private startFlush(): void {
+    this.inFlight ??= this.flush().finally(() => {
+      this.inFlight = undefined;
+      // A report can land after flush sees an empty queue but before this promise settles.
+      if (this.queue.length) this.startFlush();
+    });
   }
 
   /** Settles once everything reported so far went out or was dropped. */
@@ -5057,7 +5109,7 @@ export function serveAppInterrupt(
   callerTrack: () => CallerMic | undefined,
   interrupt: CallVoiceEvents['onInterrupt'],
 ): void {
-  if (!meta.appCall || !meta.jev || meta.meeting || !interrupt) return;
+  if (!meta.appCall || !meta.jev || meta.jevDuck || meta.meeting || !interrupt) return;
   register(CALL_INTERRUPT, async ({ payload, callerIdentity }) => {
     if (callerIdentity !== meta.callerIdentity) return JSON.stringify({ ok: false, reason: 'unknown caller' });
     let req: Partial<AppInterrupt> | null;
@@ -5095,6 +5147,7 @@ export interface JevLoopDeps {
   speak(text: string, ready: () => Promise<void>, signal: AbortSignal, replyId: string): Promise<LineOutcome>;
   /** Holds the playing line where it is, or lets it go on from there. */
   setSpeechPaused(paused: boolean): void;
+  duck?: { set(ducked: boolean): void; playedText(): string };
   /** One event for the host, in order. */
   report(event: JevWorkerEvent): void;
   /** The caller's caption for the utterance numbered `segment`. */
@@ -5106,6 +5159,8 @@ export interface JevLoopDeps {
 }
 
 interface JevUtterance {
+  overlap?: { line: JevPlayout; checked?: string; pending?: string; deadline?: number };
+  final?: boolean;
   phoneWords?: string;
   needsPhoneFinal?: boolean;
   uttId: string;
@@ -5117,6 +5172,7 @@ interface JevUtterance {
 }
 
 interface JevPlayout {
+  releaseTurn?: JevUtterance;
   phonePlayedMs?: number;
   replyId: string;
   text: string;
@@ -5157,6 +5213,11 @@ export class JevLoop {
   };
   /** The line the reflex paused, until words cut it or quiet (or JEV_MAX_PAUSE_MS) resumes it. */
   private pause?: { line: JevPlayout; since: number };
+  private readonly overlapRequests = new Map<
+    string,
+    { utterance: JevUtterance; timer: ReturnType<typeof setTimeout> }
+  >();
+  private duckOwner?: JevUtterance;
   private resumeTimer?: ReturnType<typeof setTimeout>;
   private maxPauseTimer?: ReturnType<typeof setTimeout>;
   /** This speech's pause ran out at JEV_MAX_PAUSE_MS: it does not pause the line again. */
@@ -5253,7 +5314,13 @@ export class JevLoop {
         // Recorded even when the call ended first: the last words before a hang-up are worth keeping.
         if (audio) this.deps.recorded?.(utterance.segment, audio, text || utterance.text);
         this.finishUtterance(utterance, text);
-        if (pausedLine && this.playing === pausedLine && !pausedLine.abort.signal.aborted && takesTurn(text)) {
+        if (
+          !this.deps.duck &&
+          pausedLine &&
+          this.playing === pausedLine &&
+          !pausedLine.abort.signal.aborted &&
+          takesTurn(text)
+        ) {
           this.deps.log.info('voice-mode worker: the words of the speech that paused the line came; it is cut', {
             replyId: pausedLine.replyId,
           });
@@ -5274,15 +5341,16 @@ export class JevLoop {
     const utterance = this.utterance;
     if (!utterance || text === utterance.text) return;
     utterance.text = text;
-    this.deps.report({ type: 'utterance', uttId: utterance.uttId, text, final: false, at: this.now() });
+    if (this.deps.duck) this.reflex();
+    this.reportTranscript(utterance, text, false);
     this.deps.caption?.(utterance.segment, text, false);
     utterance.worded = takesTurn(text);
-    if (utterance.worded) this.reflex();
+    if (utterance.worded && !this.deps.duck) this.reflex();
   }
 
   /** The host's `words`: a participant's words arrived (the reflex's confirmation where the worker has no transcript). */
   onWords(): void {
-    if (this.closed) return;
+    if (this.closed || this.deps.duck) return;
     if (this.speaking) {
       this.wordsHeard = true;
       this.reflex();
@@ -5395,7 +5463,7 @@ export class JevLoop {
     }
     const line = this.playing;
     if (line?.replyId !== replyId) return;
-    if (this.pause?.line === line) {
+    if (this.paused && this.pause?.line === line) {
       this.deps.log.info('voice-mode worker: the host revoked a paused line; it is cut', { replyId });
       line.abort.abort();
       return;
@@ -5409,7 +5477,7 @@ export class JevLoop {
   }
 
   get paused(): boolean {
-    return !!this.pause;
+    return !!this.pause && !this.deps.duck;
   }
 
   get callerSpeaking(): boolean {
@@ -5428,6 +5496,8 @@ export class JevLoop {
 
   close(): void {
     this.closed = true;
+    for (const { timer } of this.overlapRequests.values()) clearTimeout(timer);
+    this.overlapRequests.clear();
     clearTimeout(this.resumeTimer);
     clearTimeout(this.maxPauseTimer);
     clearTimeout(this.appSpeechTimer);
@@ -5448,7 +5518,26 @@ export class JevLoop {
   private reflex(): void {
     const line = this.playing;
     if (!line?.started || !this.speaking || line.abort.signal.aborted) return;
-    if (!this.pause && this.now() - this.speechSince < JEV_BARGE_MS) return;
+    if ((!this.pause || this.deps.duck) && this.now() - this.speechSince < JEV_BARGE_MS) return;
+    const utterance = this.utterance;
+    if (this.deps.duck && utterance) {
+      if (this.speechOver !== line) return;
+      if (!utterance.overlap) {
+        utterance.overlap = { line };
+        // An early partial already reached the window before VAD crossed the barge threshold.
+        if (utterance.text) this.reportTranscript(utterance, utterance.text, false);
+      }
+      if (!this.pauseSpent && this.duckOwner !== utterance) {
+        this.duckOwner = utterance;
+        this.pause = { line, since: this.now() };
+        clearTimeout(this.maxPauseTimer);
+        this.maxPauseTimer = setTimeout(() => this.resume('max_pause'), JEV_MAX_PAUSE_MS);
+        this.maxPauseTimer.unref?.();
+        this.deps.duck.set(true);
+      }
+      this.checkOverlap(utterance);
+      return;
+    }
     if (!this.utterance?.worded && !this.wordsHeard) {
       if (!this.pause && !this.pauseSpent) {
         this.pause = { line, since: this.now() };
@@ -5466,31 +5555,108 @@ export class JevLoop {
   }
 
   /** A false barge-in: the paused line goes on from where it stopped. */
-  private resume(reason: 'quiet' | 'max_pause'): void {
+  private resume(reason: 'quiet' | 'max_pause' | 'backchannel'): void {
     const pause = this.pause;
     if (!pause || pause.line.abort.signal.aborted) return;
+    const pauseOwner = this.duckOwner;
     this.endPause();
-    if (this.speaking) this.pauseSpent = true;
+    if (this.speaking && (!this.deps.duck || pauseOwner === this.utterance)) this.pauseSpent = true;
     else if (this.lastSpeech) this.lastSpeech.resumedAt = this.now();
     this.deps.log.info('voice-mode worker: false barge-in; the line resumes', {
       replyId: pause.line.replyId,
       pauseMs: this.now() - pause.since,
       reason,
     });
-    this.deps.setSpeechPaused(false);
+    if (this.deps.duck) this.deps.duck.set(false);
+    else this.deps.setSpeechPaused(false);
   }
 
   private endPause(): void {
     clearTimeout(this.resumeTimer);
     clearTimeout(this.maxPauseTimer);
     this.pause = undefined;
+    this.duckOwner = undefined;
   }
 
   private finishUtterance(utterance: JevUtterance, text: string): void {
     utterance.needsPhoneFinal = false;
     if (this.closed) return;
-    this.deps.report({ type: 'utterance', uttId: utterance.uttId, text, final: true, at: this.now() });
+    if (utterance.overlap) {
+      text ||= utterance.text;
+      utterance.text = text;
+      utterance.final = true;
+      this.checkOverlap(utterance);
+    }
+    this.reportTranscript(utterance, text, true);
     if (text) this.deps.caption?.(utterance.segment, text, true);
+  }
+
+  private reportTranscript(utt: JevUtterance, text: string, final: boolean): void {
+    this.deps.report({
+      type: 'utterance',
+      uttId: utt.uttId,
+      text,
+      final,
+      ...(utt.overlap ? { contextOnly: true } : {}),
+      at: this.now(),
+    });
+  }
+
+  private checkOverlap(utt: JevUtterance): void {
+    const overlap = utt.overlap;
+    if (!overlap || overlap.pending || overlap.line.releaseTurn === utt) return;
+    const words = utt.text
+      .toLowerCase()
+      .match(/[\p{L}\p{N}]+/gu)
+      ?.join(' ');
+    if (!words || words === overlap.checked) return;
+    if (this.playing !== overlap.line || overlap.line.abort.signal.aborted) {
+      utt.overlap = undefined;
+      return;
+    }
+    const requestId = randomUUID();
+    overlap.pending = requestId;
+    overlap.checked = words;
+    overlap.deadline ??= this.now() + JEV_OVERLAP_VERDICT_TIMEOUT_MS;
+    const timer = setTimeout(() => this.onOverlap(requestId, null), Math.max(0, overlap.deadline - this.now()));
+    timer.unref?.();
+    this.overlapRequests.set(requestId, { utterance: utt, timer });
+    this.deps.report({
+      type: 'overlap',
+      requestId,
+      replyId: overlap.line.replyId,
+      played: this.deps.duck!.playedText(),
+      text: utt.text,
+      at: this.now(),
+    });
+  }
+
+  onOverlap(requestId: string, verdict: 'interruption' | 'backchannel' | null): void {
+    const request = this.overlapRequests.get(requestId);
+    if (!request) return;
+    clearTimeout(request.timer);
+    this.overlapRequests.delete(requestId);
+    const utt = request.utterance;
+    const overlap = utt.overlap!;
+    overlap.pending = undefined;
+    const cut = verdict === null ? takesTurn(utt.text) : verdict === 'interruption';
+    if (cut) {
+      if (this.playing === overlap.line && !overlap.line.abort.signal.aborted) {
+        // The turn judge needs the cut playback report in its window before it decides on these words.
+        overlap.line.releaseTurn = utt;
+        this.cutSpeech(overlap.line);
+      } else {
+        utt.overlap = undefined;
+        this.reportTranscript(utt, utt.text, !!utt.final);
+      }
+      return;
+    }
+    if (verdict) this.checkOverlap(utt); // A partial acknowledgement may have grown into a request.
+    if (!utt.overlap) this.reportTranscript(utt, utt.text, !!utt.final);
+    if (!overlap.pending) {
+      overlap.deadline = undefined;
+      if (this.duckOwner === utt) this.resume('backchannel');
+    }
   }
 
   private cutSpeech(line: JevPlayout): void {
@@ -5507,6 +5673,11 @@ export class JevLoop {
           const line = this.queue.shift();
           if (!line || this.closed) break;
           await this.play(line);
+          const utt = line.releaseTurn;
+          if (utt && !this.closed) {
+            utt.overlap = undefined;
+            this.reportTranscript(utt, utt.text, !!utt.final);
+          }
         }
       } finally {
         this.pumping = false;
@@ -5529,16 +5700,17 @@ export class JevLoop {
       this.endPause();
       this.playing = undefined;
       // The speech output lets go of its hold as the line ends; a hold that outlived it would stall the next line.
-      if (paused) this.deps.setSpeechPaused(false);
+      if (paused) {
+        if (this.deps.duck) this.deps.duck.set(false);
+        else this.deps.setSpeechPaused(false);
+      }
     }
     const at = this.now();
     if (outcome.cut || (outcome.failed && outcome.heard)) {
       // Cut by the reflex or the host, or the speech model failed mid-line: what played is reported.
-      const totalMs = outcome.complete
-        ? outcome.audioMs
-        : Math.max(outcome.audioMs, (line.text.length * 1000) / JEV_SPEECH_CHARS_PER_SECOND);
-      const playedMs = Math.min(line.phonePlayedMs ?? outcome.playedMs, outcome.audioMs);
-      const delivered = outcome.heard && totalMs > 0 ? deliveredText(line.text, playedMs / totalMs) : '';
+      const delivered = outcome.heard
+        ? playedPrefix(line.text, line.phonePlayedMs ?? outcome.playedMs, outcome.audioMs, outcome.complete)
+        : '';
       if (outcome.failed) this.deps.log.warn('voice-mode worker: a line failed mid-way', { replyId: line.replyId });
       this.deps.report({ type: 'playback', replyId: line.replyId, state: 'cut_off', delivered, at });
       return;
@@ -5650,7 +5822,18 @@ async function runJevCall(s: JevCallSetup): Promise<void> {
     muted: () => !voiceCall || ending || !cuesOn || agentSpeaking,
     log: callLog,
   });
-  const reporter = new JevReporter((events) => host.post('jev', { events }), callLog);
+  const reporter = new JevReporter(async (events) => {
+    let ok = false;
+    try {
+      const response = await host.post('jev', { events });
+      ok = response.ok;
+      return response;
+    } finally {
+      if (!ok) {
+        for (const event of events) if (event.type === 'overlap') loop.onOverlap(event.requestId, null);
+      }
+    }
+  }, callLog);
   const languages = callLanguages(meta.languages);
   const transcriber = meta.meeting
     ? undefined
@@ -5667,6 +5850,14 @@ async function runJevCall(s: JevCallSetup): Promise<void> {
   const loop: JevLoop = new JevLoop({
     ...(transcriber ? { transcriber } : {}),
     appCall: !!meta.appCall && voiceCall,
+    ...(meta.jevDuck && voiceCall
+      ? {
+          duck: {
+            set: (on: boolean) => callVoice?.setSpeechDucked(on),
+            playedText: () => callVoice?.playedText() ?? '',
+          },
+        }
+      : {}),
     speak: async (text, ready, signal, replyId) => {
       if (!callVoice) return { heard: false, failed: true, cut: false, audioMs: 0, playedMs: 0, complete: false };
       speakingReplyId = replyId;
@@ -5864,6 +6055,7 @@ async function runJevCall(s: JevCallSetup): Promise<void> {
         refreshThinking();
       } else if (event.type === 'stop') loop.onStop();
       else if (event.type === 'words') loop.onWords();
+      else if (event.type === 'overlap') loop.onOverlap(event.requestId, event.verdict);
       else if (event.type === 'revoke') loop.onRevoke(event.replyId);
       else if (!voiceCall) return;
       else if (event.type === 'thinking') {
@@ -5893,7 +6085,11 @@ let callVoiceNames: VoiceCatalog | undefined;
 export async function publishCallTracks(ctx: CallJob, meta: LiveKitJobMetadata): Promise<PublishedVoiceTracks> {
   const local = ctx.room.localParticipant;
   if (!local) throw new Error('no local participant');
-  const tracks = await publishRoomTracks(local, workerLog(agentsLog().child({ callId: meta.callId })));
+  const tracks = await publishRoomTracks(
+    local,
+    workerLog(agentsLog().child({ callId: meta.callId })),
+    !!(meta.jev && meta.jevDuck && !meta.meeting),
+  );
   return {
     cueSubscribed: tracks.cue?.publication.waitForSubscription(),
     close: tracks.close,

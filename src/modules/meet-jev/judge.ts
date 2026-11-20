@@ -13,6 +13,8 @@ import {
   type Action,
   type Choice,
   type JevState,
+  type OverlapAction,
+  type OverlapState,
   type RecheckAction,
   type RecheckState,
   type RecheckVerdict,
@@ -162,17 +164,35 @@ function stillWantedDecision(agent: string): ChoiceDecision {
   };
 }
 
+// Distinguish taking the floor from reacting while the caller can still hear the line.
+const OVERLAP_DECISION: ChoiceDecision = {
+  kind: 'choice',
+  prompt:
+    'On this live call, caller is speech over the agent and played is the part of its line already heard. Use the earlier conversation in window. Should the agent stop for this caller?',
+  options: {
+    interruption: {
+      what: 'The caller takes the floor, asks a question, corrects the agent or asks it to stop.',
+      not_for: 'Agreement, encouragement or an aside.',
+    },
+    backchannel: {
+      what: 'The caller acknowledges, reacts briefly or speaks to someone else while the agent should keep talking.',
+      not_for: 'A request or correction that needs the agent to yield.',
+    },
+  },
+};
+
 const toJevQuestion = (decision: Decision) =>
   decision.kind === 'choice'
     ? { type: 'choice', instructions: decision.prompt, criteria: decision.options }
     : { type: 'noul', instructions: decision.prompt, criteria: decision.criteria };
 
-export const judgeQuestions = (agent: string) =>
+export const judgeQuestions = (agent: string, overlap = false) =>
   Object.fromEntries(
     Object.entries({
       action: actionDecision(agent),
       ...shadowDecisions(agent),
       still_wanted: stillWantedDecision(agent),
+      ...(overlap ? { overlap: OVERLAP_DECISION } : {}),
     }).map(([name, decision]) => [name, toJevQuestion(decision)]),
   );
 
@@ -331,6 +351,9 @@ export const askAction = (state: JevState, opts: JudgeOptions = {}): Promise<{ v
     (result) => verdictOf<Action>(result),
     opts,
   );
+
+export const askOverlap = (state: OverlapState, opts: JudgeOptions = {}) =>
+  ask(state, { overlap: OVERLAP_DECISION }, (result) => verdictOf<OverlapAction>(result)?.action ?? null, opts);
 
 /** Ask Jev whether a landed answer is still wanted. Never throws; null on any failure. */
 export const askStillWanted = (

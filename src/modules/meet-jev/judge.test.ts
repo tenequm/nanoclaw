@@ -21,7 +21,7 @@ vi.mock('../../config.js', async () => {
 
 import { log } from '../../log.js';
 import type { JevState } from './core/types.js';
-import { askAction, askStillWanted, judgeQuestions, parseAction, parseStillWanted } from './judge.js';
+import { askAction, askOverlap, askStillWanted, judgeQuestions, parseAction, parseStillWanted } from './judge.js';
 
 const state: JevState = {
   policy: 'Dan answers the caller.',
@@ -326,6 +326,43 @@ describe('parseAction', () => {
       probabilities,
       confidence: 0.72,
     });
+  });
+});
+
+describe('askOverlap', () => {
+  const input = { agent_name: 'Assistant', window: state.window, played: 'The first step', caller: 'wait' };
+  it.each(['interruption', 'backchannel'])('asks a single overlap choice and parses %s', async (choice) => {
+    const fetch = respond({
+      answers: {
+        overlap: {
+          choice,
+          confidence: 1,
+          probabilities: {
+            interruption: Number(choice === 'interruption'),
+            backchannel: Number(choice === 'backchannel'),
+          },
+        },
+      },
+    });
+    expect((await askOverlap(input)).verdict).toBe(choice);
+    const body = JSON.parse((fetch.mock.calls[0] as [string, { body: string }])[1].body);
+    expect(body.state).toEqual(input);
+    expect(body.questions).toEqual({
+      overlap: {
+        type: 'choice',
+        instructions: expect.stringContaining('part of its line already heard'),
+        criteria: { interruption: expect.any(Object), backchannel: expect.any(Object) },
+      },
+    });
+  });
+  it('rejects an unknown choice or an incomplete distribution', async () => {
+    for (const answer of [
+      { choice: 'stop', probabilities: { interruption: 1, backchannel: 0 } },
+      { choice: 'backchannel', probabilities: { backchannel: 1 } },
+    ]) {
+      respond({ answers: { overlap: { ...answer, confidence: 1 } } });
+      expect((await askOverlap(input)).verdict).toBeNull();
+    }
   });
 });
 

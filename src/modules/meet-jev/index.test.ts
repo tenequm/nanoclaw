@@ -77,6 +77,56 @@ describe('createJevCall', () => {
     );
   });
 
+  it.each([
+    ['voice', true, true],
+    ['meet', true, false],
+    ['voice', false, false],
+  ] as const)('routes a correlated overlap on %s with duck=%s', async (kind, jevDuck, enabled) => {
+    const push = vi.fn();
+    const overlap = vi.fn(async () => ({ verdict: 'backchannel' as const, ms: 1 }));
+    const judge = vi.fn(async () => ({ verdict: null, ms: 1 }));
+    const call = createJevCall(
+      {
+        callId: 'call',
+        callerName: 'Caller',
+        agentName: 'Agent',
+        agentAliases: [],
+        kind,
+        jevDuck,
+        now: () => 1000,
+        submitTurn: vi.fn(),
+        maxTextBytes: 4096,
+        push,
+      },
+      { overlap, judge },
+    );
+    call.workerEvents([
+      { type: 'utterance', uttId: 'u', text: 'Some context', final: false, at: 990 },
+      { type: 'playback', replyId: 'r', state: 'started', at: 995 },
+      { type: 'overlap', requestId: 'request', replyId: 'r', played: 'First words', text: 'side remark', at: 999 },
+      { type: 'utterance', uttId: 'u', text: 'side remark', final: true, contextOnly: true, at: 1000 },
+      { type: 'speech', on: false, at: 1000 },
+    ]);
+    await flush();
+    expect(overlap).toHaveBeenCalledTimes(enabled ? 1 : 0);
+    if (enabled) {
+      expect(overlap).toHaveBeenCalledWith(
+        expect.objectContaining({
+          played: 'First words',
+          caller: 'side remark',
+          window: [expect.objectContaining({ text: 'Some context' })],
+        }),
+        expect.anything(),
+      );
+      expect(push).toHaveBeenCalledWith({ type: 'overlap', requestId: 'request', verdict: 'backchannel' });
+      expect(judge).not.toHaveBeenCalled();
+      call.workerEvents([{ type: 'utterance', uttId: 'u', text: 'side remark', final: true, at: 1001 }]);
+      await flush();
+      expect(judge).toHaveBeenCalledOnce();
+    }
+    call.end('done');
+  });
+
   it('logs both question texts once per call', async () => {
     vi.mocked(log.info).mockClear();
     const { call, say } = jevCall();

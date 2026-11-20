@@ -120,6 +120,7 @@ export interface LiveKitJobMetadata {
    * the host sends.
    */
   jev?: boolean;
+  jevDuck?: boolean;
 }
 
 /**
@@ -129,7 +130,8 @@ export interface LiveKitJobMetadata {
  */
 export type JevWorkerEvent =
   /** Words heard: partials of one `uttId` update it, its final replaces it. */
-  | { type: 'utterance'; uttId: string; text: string; final: boolean; at: number }
+  | { type: 'utterance'; uttId: string; text: string; final: boolean; contextOnly?: true; at: number }
+  | { type: 'overlap'; requestId: string; replyId: string; played: string; text: string; at: number }
   /** VAD start or end of speech on the call's input. */
   | { type: 'speech'; on: boolean; at: number }
   /**
@@ -539,6 +541,7 @@ export type LiveKitHostEvent =
   | { type: 'stop' }
   | { type: 'revoke'; replyId: string }
   | { type: 'words' }
+  | { type: 'overlap'; requestId: string; verdict: 'interruption' | 'backchannel' | null }
   | { type: 'thinking' }
   | { type: 'working' }
   /** A jev voice call's state as the host's loop sees it: the worker plays its cues from it. */

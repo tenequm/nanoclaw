@@ -21,7 +21,7 @@ import { log } from '../../log.js';
 import { callCore } from './core/index.js';
 import type { CallCore, CallEvent, CallKind } from './core/types.js';
 import { createWorkerIngress } from './ingress/worker.js';
-import { askAction, askStillWanted, judgeQuestions } from './judge.js';
+import { askAction, askOverlap, askStillWanted, judgeQuestions } from './judge.js';
 import { policyFor } from './policy.js';
 import { createCallRuntime, type CallRuntime, type JevTurnResult } from './runtime.js';
 
@@ -42,6 +42,7 @@ export interface JevCallHost {
   statusRoom?: { name: string; url: string; apiKey: string; apiSecret: string };
   /** Which call this is; `voice` when left out. */
   kind?: CallKind;
+  jevDuck?: boolean;
   callerName: string;
   agentName: string;
   /** Other names the agent goes by (the vocabulary file's wake names). */
@@ -59,6 +60,7 @@ export interface JevCallHost {
 export interface JevDeps {
   core: CallCore<unknown>;
   judge: typeof askAction;
+  overlap: typeof askOverlap;
   recheck: typeof askStillWanted;
 }
 
@@ -85,7 +87,7 @@ export function createJevCall(host: JevCallHost, deps: Partial<JevDeps> = {}): J
   const replyTurns = new Map<string, string | null>();
   let replies = 0;
   const fields = { callId: host.callId };
-  log.info('meet-jev: questions', { ...fields, questions: judgeQuestions(host.agentName) });
+  log.info('meet-jev: questions', { ...fields, questions: judgeQuestions(host.agentName, host.jevDuck) });
   const judgedAt: number[] = [];
   /** Lines the worker reported started and not yet over: `words` reaches it only while one plays. */
   const playing = new Set<string>();
@@ -129,6 +131,12 @@ export function createJevCall(host: JevCallHost, deps: Partial<JevDeps> = {}): J
             err: err instanceof Error ? err.message : String(err),
           }),
         );
+    },
+    overlap: async ({ requestId, state, windowVersion }, signal) => {
+      const result = capped()
+        ? null
+        : await (deps.overlap ?? askOverlap)(state, { signal, ...fields, windowVersion }).catch(() => null);
+      if (!signal.aborted) host.push({ type: 'overlap', requestId, verdict: result?.verdict ?? null });
     },
     judge: async (state, signal, windowVersion) => {
       if (!capped()) return judge(state, { signal, ...fields, windowVersion });
@@ -204,6 +212,7 @@ export function createJevCall(host: JevCallHost, deps: Partial<JevDeps> = {}): J
           if (event.kind === 'speech') log.info('meet-jev: worker vad', { ...fields, on: event.on, at: event.at });
           continue;
         }
+        if (event.kind === 'overlap' && (!host.jevDuck || !playing.has(event.replyId))) continue;
         runtime.feed(event);
       }
       return { accepted: events.length, dropped };
