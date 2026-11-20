@@ -450,16 +450,16 @@ describe('mesh addresses', () => {
     ]);
     for (const to of ['tester', 'review@repo'])
       expect((await sendMessage.handler({ to, text: 'test' })).isError).toBeFalsy();
-    insert.run('review@repo:bl', 'session', 'bl', 'repo', 'busy', null);
+    insert.run('review@repo:server', 'session', 'server', 'repo', 'busy', null);
     const ambiguous = await sendMessage.handler({ to: 'review@repo', text: 'test' });
     expect(ambiguous.isError).toBe(true);
     expect(ambiguous.content[0].text).toContain('review@repo:mac');
-    expect(ambiguous.content[0].text).toContain('review@repo:bl');
-    await sendMessage.handler({ to: 'review@repo:bl', text: 'test' });
+    expect(ambiguous.content[0].text).toContain('review@repo:server');
+    await sendMessage.handler({ to: 'review@repo:server', text: 'test' });
     expect(getUndeliveredMessages().map((m) => [m.channel_type, m.platform_id])).toEqual([
       ['agent', 'ag-test'],
       ['peer', 'review@repo:mac'],
-      ['peer', 'review@repo:bl'],
+      ['peer', 'review@repo:server'],
     ]);
   });
 });
