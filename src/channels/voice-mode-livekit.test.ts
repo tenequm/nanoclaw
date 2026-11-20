@@ -80,6 +80,10 @@ const API_SECRET = 'fakesecretfakesecretfakesecretfakesecretfakesecr';
 
 interface FakeLiveKit extends LiveKitServerApi {
   rooms: string[];
+  /** Rooms that exist now: created, or opened by a dispatch or a join as an auto-create server does. */
+  open: Set<string>;
+  /** Every listRooms call's names, in order. */
+  listed: string[][];
   /** Each created room's options, in order. */
   roomOptions: Array<Parameters<LiveKitServerApi['createRoom']>[0]>;
   deleted: string[];
@@ -96,6 +100,8 @@ interface FakeLiveKit extends LiveKitServerApi {
 function fakeLiveKit(): FakeLiveKit {
   const fake: FakeLiveKit = {
     rooms: [],
+    open: new Set(),
+    listed: [],
     roomOptions: [],
     deleted: [],
     dispatches: [],
@@ -107,15 +113,22 @@ function fakeLiveKit(): FakeLiveKit {
       await fake.createGate;
       if (fake.failCreate) throw new Error('connection refused');
       fake.rooms.push(options.name);
+      fake.open.add(options.name);
       fake.roomOptions.push(options);
       fake.ops.push(`create:${options.name}`);
       return {};
     },
     async deleteRoom(room) {
+      fake.open.delete(room);
       fake.deleted.push(room);
       fake.ops.push(`delete:${room}`);
     },
+    async listRooms(names) {
+      fake.listed.push(names);
+      return names.filter((name) => fake.open.has(name));
+    },
     async createDispatch(room, agentName, options) {
+      fake.open.add(room);
       fake.dispatches.push({ room, agentName, metadata: JSON.parse(options.metadata) as LiveKitJobMetadata });
       return {};
     },
@@ -439,6 +452,16 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
   });
   afterEach(async () => {
     await h.stop();
+  });
+
+  it('creates each room before its dispatch and never lists rooms on a server that does not auto-create', async () => {
+    const res = await post(`${h.base}/livekit/token?v=6&t=tok123&jev=0`);
+    expect(res.status).toBe(200);
+    const { callId } = (await res.json()) as TokenResponse;
+    expect(h.lk.rooms).toEqual([h.lk.dispatches[0].room]);
+    expect((await post(`${h.base}/livekit/end?t=tok123`, { callId })).status).toBe(204);
+    await vi.waitFor(() => expect(h.lk.deleted).toEqual(h.lk.rooms));
+    expect(h.lk.listed).toEqual([]);
   });
 
   it('refuses protocol four and five clients with 426 before creating a room', async () => {
@@ -1459,6 +1482,66 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     expect(h.lk.deleted).toEqual([]);
     expect(worker.events.some((e) => e.type === 'end')).toBe(false);
     worker.close();
+  });
+});
+
+describe('livekit on an auto-create server (LIVEKIT_AUTO_CREATE, LiveKit Cloud)', () => {
+  let h: Harness;
+
+  beforeEach(async () => {
+    h = await startHarness({}, { autoCreate: true, staleRoomChecksMs: [20, 80] });
+  });
+  afterEach(async () => {
+    await h.stop();
+  });
+
+  const startAndEnd = async (): Promise<string> => {
+    const res = await post(`${h.base}/livekit/token?v=6&t=tok123&jev=0`);
+    expect(res.status).toBe(200);
+    const { callId } = (await res.json()) as TokenResponse;
+    const room = h.lk.dispatches.at(-1)!.room;
+    expect((await post(`${h.base}/livekit/end?t=tok123`, { callId })).status).toBe(204);
+    await vi.waitFor(() => expect(h.lk.deleted).toContain(room));
+    return room;
+  };
+
+  it('dispatches the worker without CreateRoom; the dispatch opens the room', async () => {
+    const res = await post(`${h.base}/livekit/token?v=6&t=tok123&jev=0`);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as TokenResponse;
+    expect(h.lk.rooms).toEqual([]);
+    expect(h.lk.dispatches).toHaveLength(1);
+    const room = h.lk.dispatches[0].room;
+    expect(h.lk.open.has(room)).toBe(true);
+    expect(jwtPayload(body.token).video).toMatchObject({ room, roomJoin: true });
+  });
+
+  it("deletes an ended call's room again when a late token opened it after the delete", async () => {
+    const room = await startAndEnd();
+    // The caller's token outlives the call: joining with it opens the room again, with no worker in it.
+    h.lk.open.add(room);
+    await vi.waitFor(() => expect(h.lk.deleted.filter((r) => r === room)).toHaveLength(2));
+    expect(h.lk.open.has(room)).toBe(false);
+    expect(h.lk.dispatches.filter((d) => d.room === room)).toHaveLength(1);
+  });
+
+  it("checks an ended call's room until past the token lifetime and leaves a gone room alone", async () => {
+    const room = await startAndEnd();
+    await vi.waitFor(() => expect(h.lk.listed.filter(([r]) => r === room)).toHaveLength(2));
+    expect(h.lk.deleted.filter((r) => r === room)).toHaveLength(1);
+  });
+
+  it('deletes the room of a call that ended before its caller joined, if the token opens it later', async () => {
+    await h.stop();
+    h = await startHarness({}, { autoCreate: true, staleRoomChecksMs: [20, 80] });
+    const res = await post(`${h.base}/livekit/token?v=6&t=tok123&jev=0`);
+    expect(res.status).toBe(200);
+    const room = h.lk.dispatches.at(-1)!.room;
+    // A newer call on the line ends this one before its caller ever joined.
+    expect((await post(`${h.base}/livekit/token?v=6&t=tok123&jev=0`)).status).toBe(200);
+    await vi.waitFor(() => expect(h.lk.deleted).toContain(room));
+    h.lk.open.add(room);
+    await vi.waitFor(() => expect(h.lk.open.has(room)).toBe(false));
   });
 });
 

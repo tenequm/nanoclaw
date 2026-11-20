@@ -10,19 +10,28 @@ import { log } from './log.js';
  *
  * `projectRoot` defaults to the current working directory; pass it when
  * reading a .env that is not the running process's own.
+ *
+ * The process's own reads also take NANOCLAW_ENV_OVERLAY, the path of a file in
+ * the same format whose keys win over `.env`: settings another tool renders
+ * (secrets included) without editing `.env`. Only the path is in the environment.
  */
 export function readEnvFile(keys: string[], projectRoot?: string): Record<string, string> {
-  const envFile = path.join(projectRoot ?? process.cwd(), '.env');
+  const wanted = new Set(keys);
+  const result = parseEnvFile(path.join(projectRoot ?? process.cwd(), '.env'), wanted);
+  const overlay = projectRoot === undefined ? process.env.NANOCLAW_ENV_OVERLAY : undefined;
+  return overlay ? { ...result, ...parseEnvFile(overlay, wanted) } : result;
+}
+
+function parseEnvFile(file: string, wanted: Set<string>): Record<string, string> {
   let content: string;
   try {
-    content = fs.readFileSync(envFile, 'utf-8');
+    content = fs.readFileSync(file, 'utf-8');
   } catch (err) {
-    log.debug('.env file not found, using defaults', { err });
+    log.debug('env file not found, using defaults', { file, err });
     return {};
   }
 
   const result: Record<string, string> = {};
-  const wanted = new Set(keys);
 
   for (const line of content.split('\n')) {
     const trimmed = line.trim();

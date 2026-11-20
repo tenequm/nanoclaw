@@ -59,7 +59,7 @@ import {
 } from './voice-mode-livekit.js';
 import { linePlatformId } from './voice-mode-line.js';
 import { callPageHtml, type VoiceModeUiConfig } from './voice-mode-page.js';
-import { LIVEKIT_PROTOCOL_VERSION } from './voice-mode-protocol.js';
+import { CALLER_TOKEN_TTL_SECONDS, LIVEKIT_PROTOCOL_VERSION } from './voice-mode-protocol.js';
 
 /** The call page URL for a token. */
 export type CallUrlFn = (token: string) => string;
@@ -419,7 +419,6 @@ registerMessageInterceptor((event) => handleVoiceCommand(event));
 
 /** How long the caller's page has to join the room after it got its token. */
 const CALL_JOIN_TIMEOUT_MS = 60_000;
-const CALLER_TOKEN_TTL_SECONDS = 120;
 /** The page's `livekit/end` body is a call id and a reason. */
 const MAX_END_BODY_BYTES = 1024;
 
@@ -600,6 +599,8 @@ export function createCallPage(core: Pick<LiveKitVoice, 'openCall' | 'endCall' |
   const pageHeaders = (): Record<string, string> => {
     const lk = new URL(config.livekit.url);
     const https = `${lk.protocol === 'ws:' ? 'http:' : 'https:'}//${lk.host}`;
+    // LiveKit Cloud's client falls back to the project's regional hosts when the first connect fails.
+    const cloud = lk.hostname.endsWith('.livekit.cloud') ? ' wss://*.livekit.cloud https://*.livekit.cloud' : '';
     return {
       'Content-Type': 'text/html; charset=utf-8',
       'Cache-Control': 'no-store',
@@ -609,7 +610,7 @@ export function createCallPage(core: Pick<LiveKitVoice, 'openCall' | 'endCall' |
       // and images); signaling to the LiveKit server. WebRTC media is not governed by connect-src.
       'Content-Security-Policy':
         "default-src 'self' 'unsafe-inline' blob: data:; " +
-        `connect-src 'self' ${lk.protocol}//${lk.host} ${https}; media-src 'self' blob: mediastream:; ` +
+        `connect-src 'self' ${lk.protocol}//${lk.host} ${https}${cloud}; media-src 'self' blob: mediastream:; ` +
         "object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
     };
   };

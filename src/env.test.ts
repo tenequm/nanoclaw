@@ -52,6 +52,49 @@ describe('envValue', () => {
   });
 });
 
+describe('NANOCLAW_ENV_OVERLAY', () => {
+  let root: string;
+  let cwd: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-env-overlay-'));
+    cwd = vi.spyOn(process, 'cwd').mockReturnValue(root);
+  });
+
+  afterEach(() => {
+    cwd.mockRestore();
+    delete process.env.NANOCLAW_ENV_OVERLAY;
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it("wins over the process's own .env, key by key, and leaves other keys to .env", () => {
+    fs.writeFileSync(path.join(root, '.env'), 'LIVEKIT_URL=wss://old\nLIVEKIT_HOST_URL=http://127.0.0.1:3001\n');
+    const overlay = path.join(root, 'overlay.env');
+    fs.writeFileSync(overlay, 'LIVEKIT_URL="wss://new.livekit.cloud"\n');
+    process.env.NANOCLAW_ENV_OVERLAY = overlay;
+    expect(readEnvFile(['LIVEKIT_URL', 'LIVEKIT_HOST_URL'])).toEqual({
+      LIVEKIT_URL: 'wss://new.livekit.cloud',
+      LIVEKIT_HOST_URL: 'http://127.0.0.1:3001',
+    });
+    expect(envValue('LIVEKIT_URL')).toBe('wss://new.livekit.cloud');
+  });
+
+  it("does not apply to another checkout's .env, and a missing overlay file changes nothing", () => {
+    const other = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-env-other-'));
+    try {
+      fs.writeFileSync(path.join(other, '.env'), 'LIVEKIT_URL=wss://other\n');
+      const overlay = path.join(root, 'overlay.env');
+      fs.writeFileSync(overlay, 'LIVEKIT_URL=wss://new\n');
+      process.env.NANOCLAW_ENV_OVERLAY = overlay;
+      expect(envValue('LIVEKIT_URL', other)).toBe('wss://other');
+      process.env.NANOCLAW_ENV_OVERLAY = path.join(root, 'missing.env');
+      expect(envValue('LIVEKIT_URL', other)).toBe('wss://other');
+    } finally {
+      fs.rmSync(other, { recursive: true, force: true });
+    }
+  });
+});
+
 // The guard lives in src/test-setup.ts. A real .env already in the checkout is
 // never overwritten: then the test proves it is invisible without planting.
 describe('test-setup guard on the checkout .env', () => {
