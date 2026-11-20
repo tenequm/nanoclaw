@@ -200,8 +200,12 @@ The host retries an interrupted transcription once across restarts.
 
 Store separate APNs signing keys for sandbox and production. Register each device token
 with its build environment and optional string `topic` (the installed app's bundle identifier).
-The host uses the registered topic only while it is allowlisted. An omitted or unlisted
-topic uses `APP_APNS_TOPIC`, including for devices registered before this field existed.
+The host stores topics of 1 to 255 ASCII letters, digits, dots or hyphens verbatim.
+Omitted or malformed topics and older registrations use `APP_APNS_TOPIC`.
+At send time, an unlisted stored topic also falls back to `APP_APNS_TOPIC`. If APNs
+rejects that fallback with `DeviceTokenNotForTopic`, the host keeps the registration.
+Adding the stored topic to `APP_APNS_TOPICS` lets the next alert use it once the host
+refreshes its configuration, without an app relaunch.
 New agent messages and questions trigger push alerts. Edits, reactions, host messages
 and mirrored call speech do not trigger alerts.
 The preview passes through Apple's push service. The payload includes host identity from

@@ -200,6 +200,51 @@ it.each([undefined, 'com.example.unlisted'])('falls back when re-registering wit
     ),
   );
 });
+it.each(['', ' com.example.client', 'com.example/client', 'com.example.client\n', 'x'.repeat(256), 42])(
+  'stores malformed topic %# as absent',
+  async (topic) => {
+    vi.stubEnv('APP_APNS_TOPIC', String(topic));
+    expect(await register({ ...fixtures.pushTokenRequest, topic })).toBe(204);
+    expect(await db.get("SELECT topic FROM app_push_tokens WHERE device_id = 'first'")).toEqual({ topic: null });
+  },
+);
+it('keeps an unlisted registration through fallback mismatches and uses it once allowlisted', async () => {
+  const request = fixtures.pushTokenRequest;
+  vi.stubEnv('APP_APNS_TOPICS', '');
+  expect(await register(request)).toBe(204);
+  expect(await db.get("SELECT topic FROM app_push_tokens WHERE device_id = 'first'")).toEqual({ topic: request.topic });
+  const warn = vi.fn();
+  const deliver = vi.fn(async (destination: apns.PushDestination) =>
+    destination.token === request.token && destination.topic !== request.topic
+      ? { status: 400, reason: 'DeviceTokenNotForTopic', clearToken: true }
+      : { status: 200, clearToken: false },
+  );
+  start({ send: deliver, warn, concurrency: 1 });
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    emit();
+    await vi.waitFor(() => expect(deliver).toHaveBeenCalledTimes(attempt * 2));
+  }
+  expect(deliver).toHaveBeenCalledWith({ ...request, topic: 'com.example.client' }, 'msg_2102', expect.anything());
+  expect(warn).toHaveBeenCalledExactlyOnceWith('PushRejected', {
+    deviceId: 'first',
+    entityId: 'msg_2102',
+    environment: request.environment,
+    status: 400,
+    reason: 'DeviceTokenNotForTopic',
+    storedTopic: request.topic,
+  });
+  vi.stubEnv('APP_APNS_TOPICS', request.topic);
+  emit();
+  await vi.waitFor(() => expect(deliver).toHaveBeenCalledWith(request, 'msg_2102', expect.anything()));
+});
+it('clears a listed registration when APNs rejects its topic', async () => {
+  expect(await register(fixtures.pushTokenRequest)).toBe(204);
+  start({ send: async () => ({ status: 400, reason: 'DeviceTokenNotForTopic', clearToken: true }) });
+  emit();
+  await vi.waitFor(async () =>
+    expect(await db.get("SELECT topic FROM app_push_tokens WHERE device_id = 'first'")).toBeUndefined(),
+  );
+});
 it('uses the default when a registered topic leaves the allowlist', async () => {
   expect(await register(fixtures.pushTokenRequest)).toBe(204);
   vi.stubEnv('APP_APNS_TOPICS', '');

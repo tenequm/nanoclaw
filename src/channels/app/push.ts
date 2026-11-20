@@ -35,7 +35,7 @@ export function pushTokenHandler(db: () => DbDriver = getDb, readBody = readSign
       json(res, 400, { error: 'bad_request', message: 'Provide a hexadecimal token and its environment.' });
       return;
     }
-    const topic = allowedPushTopic(value.topic, appConfig().apns);
+    const topic = typeof value.topic === 'string' && /^[A-Za-z0-9.-]{1,255}$/.test(value.topic) ? value.topic : null;
     const database = db();
     await database.transaction(async () => {
       await database.run(
@@ -87,6 +87,7 @@ export function subscribePush(
   const concurrency = Math.max(1, options.concurrency ?? 4);
   let active = 0;
   let stopped = false;
+  const warnedFallbackTopics = new Map<string, string>();
   let warnedBase = false;
   let warnedFull = false;
   function enqueue(job: () => Promise<void>) {
@@ -158,7 +159,10 @@ export function subscribePush(
           };
           if (stopped || !(await reachableAgentIds(device.id)).includes(event.agent_group_id)) return;
           const apns = config().apns;
-          const topic = apns.topic && (allowedPushTopic(row.topic, apns) ?? apns.topic);
+          const storedTopic = row.topic;
+          const topic = apns.topic && (allowedPushTopic(storedTopic, apns) ?? apns.topic);
+          const usedFallback = storedTopic !== null && topic !== null && topic !== storedTopic;
+          if (!usedFallback) warnedFallbackTopics.delete(device.id);
           const result = await send({ token: row.token, environment: row.environment, topic }, entity.id, payload);
           const fields = {
             deviceId: device.id,
@@ -167,6 +171,13 @@ export function subscribePush(
             status: result.status,
             reason: result.reason,
           };
+          if (usedFallback && result.reason === 'DeviceTokenNotForTopic') {
+            if (warnedFallbackTopics.get(device.id) !== storedTopic) {
+              warnedFallbackTopics.set(device.id, storedTopic);
+              warn('PushRejected', { ...fields, storedTopic });
+            }
+            return;
+          }
           if (result.status !== 200) warn('PushRejected', fields);
           if (result.clearToken) {
             // A delayed rejection must not erase a replacement registration.
