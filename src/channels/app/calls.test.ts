@@ -184,6 +184,9 @@ beforeEach(async () => {
         async deleteRoom() {
           deleted++;
         },
+        async listRooms() {
+          return [];
+        },
         async createDispatch() {
           return {};
         },

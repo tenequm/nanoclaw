@@ -944,6 +944,7 @@ describe('signed HTTP fixture producers', () => {
         api: {
           createRoom: async () => ({}),
           deleteRoom: async () => {},
+          listRooms: async () => [],
           createDispatch: async () => ({}),
           updateRoomMetadata: async () => {},
         },

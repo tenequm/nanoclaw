@@ -58,6 +58,7 @@ import { getChannelAdapterExact } from './channel-registry.js';
 import type { VoiceModeTurn, VoiceModeTurnEvent } from './voice-mode-route.js';
 import { lineIdOf, sameCallerAndAgent, type ResolveLineOptions, type VoiceModeLine } from './voice-mode-line.js';
 import {
+  CALLER_TOKEN_TTL_SECONDS,
   DEFAULT_LIVEKIT_AGENT_NAME,
   DEFAULT_VOICE_SILENCE_MS,
   DEFAULT_VOICE_STT_MODEL,
@@ -116,6 +117,11 @@ const END_NOTICE_TIMEOUT_MS = 2_000;
  * sent (a spoken send whose final was still out): it is taken this long, or until the worker's `ended`.
  */
 const HANGUP_GRACE_MS = 5_000;
+/**
+ * When an auto-create server (autoCreate) is checked again for an ended call's room, after its delete; the
+ * last check is past the caller token's lifetime, so no token is left that could open the room again.
+ */
+const STALE_ROOM_CHECKS_MS: readonly number[] = [10_000, 30_000, 60_000, CALLER_TOKEN_TTL_SECONDS * 1000 + 10_000];
 
 /** The transcription takes its language codes as a hint only, so a Ukrainian turn can come out in Russian spelling. */
 export const CALL_LANGUAGE_NOTE =
@@ -186,6 +192,8 @@ export interface LiveKitServerApi {
     maxParticipants: number;
   }): Promise<unknown>;
   deleteRoom(room: string): Promise<void>;
+  /** The rooms among `names` that exist now. */
+  listRooms(names: string[]): Promise<unknown[]>;
   createDispatch(room: string, agentName: string, options: { metadata: string }): Promise<unknown>;
   updateRoomMetadata(room: string, metadata: string): Promise<unknown>;
 }
@@ -231,6 +239,14 @@ export interface LiveKitVoiceConfig {
   url: string;
   /** Server-side URL for the host's API calls (LIVEKIT_WORKER_URL); defaults to `url`. */
   serverUrl?: string;
+  /**
+   * LIVEKIT_AUTO_CREATE=1: the server creates a room on dispatch and on any join, as LiveKit Cloud does. The
+   * host then dispatches without CreateRoom, and deletes an ended call's room again if a caller token that
+   * outlived the call brought it back (STALE_ROOM_CHECKS_MS).
+   */
+  autoCreate?: boolean;
+  /** STALE_ROOM_CHECKS_MS; a test seam. */
+  staleRoomChecksMs?: readonly number[];
   apiKey: string;
   apiSecret: string;
   /** Dispatch name the worker registers under. */
@@ -554,6 +570,7 @@ function defaultApi(config: LiveKitVoiceConfig): LiveKitServerApi {
   return {
     createRoom: (options) => rooms.createRoom(options),
     deleteRoom: (room) => rooms.deleteRoom(room),
+    listRooms: (names) => rooms.listRooms(names),
     createDispatch: (room, agentName, options) => dispatch.createDispatch(room, agentName, options),
     updateRoomMetadata: (room, metadata) => rooms.updateRoomMetadata(room, metadata),
   };
@@ -613,6 +630,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
   /** Calls the caller's page hung up, by call id, while their worker may still post a turn (HANGUP_GRACE_MS). */
   const hungUp = new Map<string, { call: LiveKitCall; timer: ReturnType<typeof setTimeout> }>();
   const cleanups = new Set<Promise<void>>();
+  const staleRoomChecks = new Set<ReturnType<typeof setTimeout>>();
   /** Per line, so transcripts land in the order they were spoken. */
   const mirrorChains = new Map<string, Promise<void>>();
   /** The last call-chat note logged per line, so a line logs when it changes, not every turn. */
@@ -775,8 +793,38 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     });
   };
 
+  /**
+   * On an auto-create server a caller token outlives its call, and joining with it opens the room again: empty,
+   * since nothing dispatches the worker to it. Each check deletes such a room, which disconnects that caller.
+   */
+  const checkStaleRoom = (call: LiveKitCall): void => {
+    if (!config.autoCreate) return;
+    for (const ms of config.staleRoomChecksMs ?? STALE_ROOM_CHECKS_MS) {
+      const timer = setTimeout(() => {
+        staleRoomChecks.delete(timer);
+        void api
+          .listRooms([call.roomName])
+          .then(async (open) => {
+            if (open.length === 0) return;
+            log.warn("livekit-voice-mode: a late join opened an ended call's room again; deleting it", {
+              callId: call.callId,
+              room: call.roomName,
+            });
+            await api.deleteRoom(call.roomName);
+          })
+          .catch((err: unknown) => {
+            if (!isNotFound(err))
+              log.warn("livekit-voice-mode: checking an ended call's room failed", { callId: call.callId, err });
+          });
+      }, ms);
+      timer.unref();
+      staleRoomChecks.add(timer);
+    }
+  };
+
   /** The room going away is what ends the call for caller and worker; retried, a missing room counts as gone. */
   const deleteRoom = async (call: LiveKitCall): Promise<void> => {
+    checkStaleRoom(call);
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
         await api.deleteRoom(call.roomName);
@@ -938,7 +986,8 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
       joinTimeoutMs: kind.joinTimeoutMs,
     };
     try {
-      await api.createRoom({ name: roomName, ...kind.room });
+      // An auto-create server opens the room for the dispatch; CreateRoom would only add a round trip.
+      if (!config.autoCreate) await api.createRoom({ name: roomName, ...kind.room });
       await api.createDispatch(roomName, agentName, { metadata: JSON.stringify(metadata) });
     } catch (err) {
       log.warn('livekit-voice-mode: room setup failed', { platformId, callId, err });
@@ -1368,6 +1417,8 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
       for (const call of [...calls.values()]) endCall(call, 'teardown', 'shutdown');
       for (const callId of [...hungUp.keys()]) endGrace(callId);
       await Promise.all([...cleanups, ...mirrorChains.values()]);
+      for (const timer of staleRoomChecks) clearTimeout(timer);
+      staleRoomChecks.clear();
     },
   };
   engines.add(engine);

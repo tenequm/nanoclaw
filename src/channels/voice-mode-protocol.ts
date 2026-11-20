@@ -33,6 +33,9 @@ export async function settleWithin<T, F>(promise: Promise<T>, ms: number, fallba
 export const PING_INTERVAL_MS = 15_000;
 /** The worker drops the host link after this long without a line: three missed pings. */
 export const HOST_SILENCE_MS = 3 * PING_INTERVAL_MS;
+/** How long a caller's room token can be used to join, from when the host mints it. */
+export const CALLER_TOKEN_TTL_SECONDS = 120;
+
 /** How long the worker waits for the host to answer one of its POSTs (a turn included). */
 export const WORKER_REQUEST_TIMEOUT_MS = 10_000;
 
