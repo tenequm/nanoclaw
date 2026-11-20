@@ -133,7 +133,7 @@ export type NotHumanPromptPrefixes = string[];
  */
 export type LaneId = string;
 /**
- * send_message result. A refusal is an answer, not an error (isError false).
+ * send_message result. A refusal is an answer, not an error (isError false). A send between two sessions of one machine never reaches the hub; the daemon counts them per session pair and refuses at 20 until either session's next human turn (a daemon restart also resets the count).
  */
 export type McpSendResult =
   | {
@@ -840,8 +840,9 @@ export interface SupersededEvent {
  * (amesh: <name> cannot see what you write here. To answer, call send_message with to="<address>".)
  * A sender with no assigned address gets the native line, SendMessage with the frame's exact
  * from address. send_message with reply_to is sent to that endpoint exactly as a native reply
- * on its relay socket would be; an unknown reply_to is ignored and the message goes to the
- * address. Lane and notice rules follow contract.md section 15.
+ * on its relay socket would be, when this session is a party to it and `to` names its peer;
+ * any other reply_to is ignored and the message goes to the address. Lane and notice rules
+ * follow contract.md section 15.
  */
 export interface NativeUserFrame {
   type: 'user';

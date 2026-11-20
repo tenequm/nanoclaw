@@ -1456,8 +1456,9 @@ components:
         (amesh: <name> cannot see what you write here. To answer, call send_message with to="<address>".)
         A sender with no assigned address gets the native line, SendMessage with the frame's exact
         from address. send_message with reply_to is sent to that endpoint exactly as a native reply
-        on its relay socket would be; an unknown reply_to is ignored and the message goes to the
-        address. Lane and notice rules follow contract.md section 15.
+        on its relay socket would be, when this session is a party to it and `to` names its peer;
+        any other reply_to is ignored and the message goes to the address. Lane and notice rules
+        follow contract.md section 15.
       x-amesh-native: true
       externalDocs: {description: 's-native.md: exact frame and envelope formats', url: './s-native.md#exact-frame-and-envelope-formats-that-worked'}
       type: object
@@ -1755,7 +1756,7 @@ components:
           type: string
           description: Present when the hub is unreachable or the daemon halted. Hub statuses may be stale. Local sessions come from the registry.
     McpSendResult:
-      description: send_message result. A refusal is an answer, not an error (isError false).
+      description: send_message result. A refusal is an answer, not an error (isError false). A send between two sessions of one machine never reaches the hub; the daemon counts them per session pair and refuses at 20 until either session's next human turn (a daemon restart also resets the count).
       type: object
       oneOf:
         - type: object
@@ -1991,8 +1992,8 @@ components:
           c3n-MHUOLraqLSy4lX8rIw
           deb49541799facb6913807e1cffdab2dbcdefe077a77fbab1ae0173fc48aa32b
           pm_PCly-PiMxyo5IXRSo4i70g
-        signature: MEUCIEpAma1F2VxxMOMgGMnFnyVgnpOU8dSeaSvQBjwDFLYyAiEAzGOe3V6QarZhW20CvIbfyab8rmQmCbRWMKRlBvRFB2o
-        authorization: Amesh-Sig v=1,p=1,d=pm_PCly-PiMxyo5IXRSo4i70g,t=1795089600,n=c3n-MHUOLraqLSy4lX8rIw,bh=deb49541799facb6913807e1cffdab2dbcdefe077a77fbab1ae0173fc48aa32b,s=MEUCIEpAma1F2VxxMOMgGMnFnyVgnpOU8dSeaSvQBjwDFLYyAiEAzGOe3V6QarZhW20CvIbfyab8rmQmCbRWMKRlBvRFB2o
+        signature: MEQCIG5Qni8-LtWc3QN0Siq7dVBISeFHnUdxuyaOXBRzIdiTAiBcTlzzUE_y6_zzoP19t3L5a6wFR_5k4bOTpQd4RVlLMw
+        authorization: Amesh-Sig v=1,p=1,d=pm_PCly-PiMxyo5IXRSo4i70g,t=1795089600,n=c3n-MHUOLraqLSy4lX8rIw,bh=deb49541799facb6913807e1cffdab2dbcdefe077a77fbab1ae0173fc48aa32b,s=MEQCIG5Qni8-LtWc3QN0Siq7dVBISeFHnUdxuyaOXBRzIdiTAiBcTlzzUE_y6_zzoP19t3L5a6wFR_5k4bOTpQd4RVlLMw
         signatureValid: true
     sigEventsConnect:
       summary: 'Valid, GET /peer/events'
@@ -2016,8 +2017,8 @@ components:
           gDZl6DWT3atXh6Z_x2AT1A
           e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
           pm_PCly-PiMxyo5IXRSo4i70g
-        signature: MEUCIBWLT_NePCuupflIPAGBMK0NZYB7xezyZpLLUY9MzBfOAiEAk3plKHxOfc4YnjGS74rxAVJLwQGJr4rc72CbYeKf1UM
-        authorization: Amesh-Sig v=1,p=1,d=pm_PCly-PiMxyo5IXRSo4i70g,t=1795089600,n=gDZl6DWT3atXh6Z_x2AT1A,bh=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855,s=MEUCIBWLT_NePCuupflIPAGBMK0NZYB7xezyZpLLUY9MzBfOAiEAk3plKHxOfc4YnjGS74rxAVJLwQGJr4rc72CbYeKf1UM
+        signature: MEQCIF8UntIgwiiFjruURW9OVKXRjvLbncxAqemIJyL4EndNAiBJZ1KmuTkE-rx0JiQ00Ik-RqrwD3ty8xLmc8qiBMyoHA
+        authorization: Amesh-Sig v=1,p=1,d=pm_PCly-PiMxyo5IXRSo4i70g,t=1795089600,n=gDZl6DWT3atXh6Z_x2AT1A,bh=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855,s=MEQCIF8UntIgwiiFjruURW9OVKXRjvLbncxAqemIJyL4EndNAiBJZ1KmuTkE-rx0JiQ00Ik-RqrwD3ty8xLmc8qiBMyoHA
         signatureValid: true
     sigGetPeersFilter:
       summary: 'Valid, GET /peer/peers with a filter'
@@ -2041,8 +2042,8 @@ components:
           4eIavNJcFsJcPJOWdcqsfg
           e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
           pm_PCly-PiMxyo5IXRSo4i70g
-        signature: MEQCIHVDX8Hl7rWxkUNtygXmxQ-3hQ1LpD12o-gSlYQ9pHhhAiB4ycNDEmWnNzSyoxoNVmpow5CBe49gqcAUgfmBGlpN_A
-        authorization: Amesh-Sig v=1,p=1,d=pm_PCly-PiMxyo5IXRSo4i70g,t=1795089600,n=4eIavNJcFsJcPJOWdcqsfg,bh=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855,s=MEQCIHVDX8Hl7rWxkUNtygXmxQ-3hQ1LpD12o-gSlYQ9pHhhAiB4ycNDEmWnNzSyoxoNVmpow5CBe49gqcAUgfmBGlpN_A
+        signature: MEYCIQCFO7cMAMhQNh54s2WJpJ7etmQDVi2ugPs80x92n7ZB_QIhAI8ARd-7NPaTHLkt27kN8cvgkvfXW_Ow6OS-RW-h1mmH
+        authorization: Amesh-Sig v=1,p=1,d=pm_PCly-PiMxyo5IXRSo4i70g,t=1795089600,n=4eIavNJcFsJcPJOWdcqsfg,bh=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855,s=MEYCIQCFO7cMAMhQNh54s2WJpJ7etmQDVi2ugPs80x92n7ZB_QIhAI8ARd-7NPaTHLkt27kN8cvgkvfXW_Ow6OS-RW-h1mmH
         signatureValid: true
     sigPostMessage:
       summary: 'Valid, POST /peer/messages'
@@ -2066,8 +2067,8 @@ components:
           f302A6d7AdJeQ4Xd1umgBQ
           76db4cfdc10521c2f1982f653a93d238c0cad37f4a503b74c39395cad2195a82
           pm_PCly-PiMxyo5IXRSo4i70g
-        signature: MEYCIQCvw_0c7nFYUeVzwnAs0xesaLGz5kLcYaMzrunc37GGwQIhAMkiTuiQE9PhgDS67aXlu8GTWkoVytpMilEtcOJ2Badv
-        authorization: Amesh-Sig v=1,p=1,d=pm_PCly-PiMxyo5IXRSo4i70g,t=1795089600,n=f302A6d7AdJeQ4Xd1umgBQ,bh=76db4cfdc10521c2f1982f653a93d238c0cad37f4a503b74c39395cad2195a82,s=MEYCIQCvw_0c7nFYUeVzwnAs0xesaLGz5kLcYaMzrunc37GGwQIhAMkiTuiQE9PhgDS67aXlu8GTWkoVytpMilEtcOJ2Badv
+        signature: MEUCICP4ao9Ma-xjJFWqgZntJMGAQFMmhjudMry6ScwX7iqDAiEA6Z6UHft7uNtycEAidXkz7o4ZRX-olnj5ljer5YxhUkQ
+        authorization: Amesh-Sig v=1,p=1,d=pm_PCly-PiMxyo5IXRSo4i70g,t=1795089600,n=f302A6d7AdJeQ4Xd1umgBQ,bh=76db4cfdc10521c2f1982f653a93d238c0cad37f4a503b74c39395cad2195a82,s=MEUCICP4ao9Ma-xjJFWqgZntJMGAQFMmhjudMry6ScwX7iqDAiEA6Z6UHft7uNtycEAidXkz7o4ZRX-olnj5ljer5YxhUkQ
         signatureValid: true
     sigBadChangedBody:
       summary: 'Tampered body, must not verify'
@@ -2091,8 +2092,8 @@ components:
           agYlKuRtFDQDhynLE0sM7g
           316617b4958f908dab2628f1f4ca40f868faebb9f472285206876be6efea4fbe
           pm_PCly-PiMxyo5IXRSo4i70g
-        signature: MEQCIBcXoyL5Dp-Nh8ZFQ9L5Fay8ZyyYWsYnPww1bHUrxTc0AiBctVyz1E7wSgdvkUn7tPtXO-6V8gj6cSQyWH-EtU0jfw
-        authorization: Amesh-Sig v=1,p=1,d=pm_PCly-PiMxyo5IXRSo4i70g,t=1795089600,n=agYlKuRtFDQDhynLE0sM7g,bh=316617b4958f908dab2628f1f4ca40f868faebb9f472285206876be6efea4fbe,s=MEQCIBcXoyL5Dp-Nh8ZFQ9L5Fay8ZyyYWsYnPww1bHUrxTc0AiBctVyz1E7wSgdvkUn7tPtXO-6V8gj6cSQyWH-EtU0jfw
+        signature: MEUCIQD36eOXUvlKTpeGQqzzqVE8tEBWY3VT8EnwiyWvWEPYjgIgMAxLAhW0W9W_vJje94WDRK9g2bPkT2IHxPu0dnGSGOU
+        authorization: Amesh-Sig v=1,p=1,d=pm_PCly-PiMxyo5IXRSo4i70g,t=1795089600,n=agYlKuRtFDQDhynLE0sM7g,bh=316617b4958f908dab2628f1f4ca40f868faebb9f472285206876be6efea4fbe,s=MEUCIQD36eOXUvlKTpeGQqzzqVE8tEBWY3VT8EnwiyWvWEPYjgIgMAxLAhW0W9W_vJje94WDRK9g2bPkT2IHxPu0dnGSGOU
         signatureValid: false
         note: Signed over the original body hash; the header carries the changed body hash, so the signature does not verify.
     envAgentMessage:
