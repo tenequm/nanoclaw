@@ -13,6 +13,7 @@ import {
   type Heard,
   type LiveSocket,
   stripVocabularyEcho,
+  takesTurn,
 } from './voice-mode-gemini-live.js';
 import { CALL_COMMAND_WORDS } from './channels/voice-mode-protocol.js';
 
@@ -608,4 +609,14 @@ describe('GeminiLiveTranscriber', () => {
     h.sockets[3].ready();
     expect(await second).toBe(true);
   });
+});
+
+describe('takesTurn', () => {
+  it.each(['Uh-huh.', 'Mm-hmm', 'mhm', 'Hmmm...', 'Yeah, yeah.', 'OK, I see.', 'Ага.', 'Угу, так', 'Да, понятно', ''])(
+    '"%s" is only an acknowledgement',
+    (text) => expect(takesTurn(text)).toBe(false),
+  );
+  it.each(['wait, stop', 'Yeah but no', 'Ага, стоп', 'Почекай', '5'])('"%s" takes the turn', (text) =>
+    expect(takesTurn(text)).toBe(true),
+  );
 });

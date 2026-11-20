@@ -12,7 +12,12 @@
  * comes. Times: speech marks at their audio's place on Recall's clock (the frame's `at`), never later
  * than now; partials and finals when they arrive, as the worker stamps them.
  */
-import { GeminiLiveTranscriber, turnText, type TranscriberOptions } from '../../../voice-mode-gemini-live.js';
+import {
+  GeminiLiveTranscriber,
+  takesTurn,
+  turnText,
+  type TranscriberOptions,
+} from '../../../voice-mode-gemini-live.js';
 import type { CallEvent, Speaker } from '../core/types.js';
 
 export const SAMPLE_RATE = 16_000;
@@ -55,7 +60,7 @@ export interface MeetingAudioOptions {
   detector(): SpeechDetectorFactory | null;
   transcriber?: (options: TranscriberOptions) => MeetingTranscription;
   onEvent(event: CallEvent): void;
-  /** A participant's partial carried words: the worker reflex's text confirmation. */
+  /** A participant's partial carried words beyond acknowledgements (`takesTurn`): the worker reflex's text confirmation. */
   onWords(): void;
   log: Pick<Console, 'info' | 'warn'> & { debug?(message: string, fields?: unknown): void };
   now?: () => number;
@@ -291,7 +296,7 @@ class Pipeline {
       final: false,
       at: this.opts.now(),
     });
-    if (text.trim() && !this.silenced) this.opts.onWords();
+    if (takesTurn(text) && !this.silenced) this.opts.onWords();
   }
 
   private fillGap(): void {

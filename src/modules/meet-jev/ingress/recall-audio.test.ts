@@ -153,6 +153,13 @@ describe('createMeetingAudio', () => {
     h.vads[0].onSpeech(false, 21_000);
     await flush();
     expect(h.summary().slice(5)).toEqual(['100:speech:on', '100:speech:off']);
+    // An acknowledgement is a partial for the host, but no words for the worker's reflex.
+    h.vads[0].onSpeech(true, 24_000);
+    h.stts[0].options.onInterim('Uh-huh.');
+    h.stts[0].options.onInterim('Ага, так');
+    expect(h.words()).toBe(2);
+    h.stts[0].options.onInterim('Ага, стоп');
+    expect(h.words()).toBe(3);
   });
 
   it("keeps each participant's pipeline apart", async () => {

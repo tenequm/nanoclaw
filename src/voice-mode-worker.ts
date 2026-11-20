@@ -123,6 +123,7 @@ import { readEnvFile } from './env.js';
 import {
   FINAL_GRACE_MS,
   GeminiLiveTranscriber,
+  takesTurn,
   turnText,
   type Heard,
   type TextSource,
@@ -3953,7 +3954,10 @@ const SPEECH_FRAME = TTS_SAMPLE_RATE / 50;
 const SPEECH_FRAME_MS = (SPEECH_FRAME * 1000) / TTS_SAMPLE_RATE;
 /** The speech track's native queue (the SDK's default); a pause takes back from it what has not played. */
 const SPEECH_QUEUE_MS = 1_000;
-/** The last frames sent that a pause may take back: the queue's worth, and the one a capture still waits on. */
+/**
+ * The last frames sent that a pause may take back: the queue's worth, and the one a capture still waits
+ * on. Relies on the native source completing a capture only once its buffer is within the queue size.
+ */
 const SPEECH_REPLAY_FRAMES = SPEECH_QUEUE_MS / SPEECH_FRAME_MS + 1;
 /** What the page reads, in the shapes agents-js's AgentSession published them. */
 const AGENT_STATE_ATTRIBUTE = 'lk.agent.state';
@@ -4321,7 +4325,7 @@ export function speechOutput(o: SpeechOutputOptions): Pick<CallVoice, 'say' | 's
       if (cut()) return cutResult();
       complete = !closed;
       if (heard && !closed) await play(resample.flush());
-      if (rest && !signal?.aborted) {
+      if (rest && !lineSignal.aborted) {
         const tail = new Int16Array(SPEECH_FRAME);
         tail.set(rest);
         rest = undefined;
@@ -4374,7 +4378,8 @@ export function speechOutput(o: SpeechOutputOptions): Pick<CallVoice, 'say' | 's
       if (paused) {
         hold = new Promise<void>((resolve) => (release = resolve));
         // The sink would play its queue on through the pause: what it has not played goes back in line.
-        const unplayed = Math.min(recent.length, Math.round(o.sink.queuedDuration / SPEECH_FRAME_MS));
+        // Rounded up: the sink's count is an estimate, and a frame heard twice beats one never heard.
+        const unplayed = Math.min(recent.length, Math.ceil(o.sink.queuedDuration / SPEECH_FRAME_MS));
         if (unplayed > 0) {
           o.sink.clearQueue();
           held = [...recent.splice(recent.length - unplayed), ...held];
@@ -4898,12 +4903,19 @@ export function callCues(o: {
 // ---------------------------------------------------------------------------------------------
 
 /**
- * The reflex: caller speech this long over a playing line pauses it (LiveKit's `min_duration`); words
- * of that speech (a non-empty partial or final, or the host's `words`) cut it.
+ * The reflex: this long after the VAD's speech start over a playing line, the line pauses (Jev's own
+ * `min_duration`; LiveKit's default is 500 ms). Silero starts speech after about 50 ms of sound and
+ * ends it about 550 ms after the sound stops, so any sound that trips it pauses the line. Words of the
+ * speech that take the turn (`takesTurn`: a partial or final, or the host's `words`) cut it.
  */
 export const JEV_BARGE_MS = 300;
 /** Quiet this long after a pausing speech, with no words of it, resumes the line (`false_interruption_timeout`). */
 export const JEV_FALSE_INTERRUPTION_TIMEOUT_MS = 2_000;
+/**
+ * A pause this long with no words resumes the line even though the caller's sound goes on: music or
+ * steady noise would otherwise hold it forever, and a person who means to talk has words by then.
+ */
+export const JEV_MAX_PAUSE_MS = 10_000;
 /**
  * How far the host's `words` (a meeting's) may miss the worker's VAD: the host's partial and the local
  * speech marks run on separate clocks and transports, so the words of one speech can land just before
@@ -5100,7 +5112,7 @@ interface JevUtterance {
   segment: number;
   /** The partial text so far. */
   text: string;
-  /** A partial with words came: the reflex's text confirmation. */
+  /** The partial so far takes the turn (`takesTurn`): the reflex's text confirmation. */
   worded: boolean;
 }
 
@@ -5140,11 +5152,15 @@ export class JevLoop {
     endSample: number;
     utterance?: JevUtterance;
     over?: JevPlayout;
-    resumed?: boolean;
+    /** When the line it paused went on: host `words` within JEV_WORDS_WINDOW_MS of it are its late ones. */
+    resumedAt?: number;
   };
-  /** The line the reflex paused, until words cut it or JEV_FALSE_INTERRUPTION_TIMEOUT_MS of quiet resumes it. */
+  /** The line the reflex paused, until words cut it or quiet (or JEV_MAX_PAUSE_MS) resumes it. */
   private pause?: { line: JevPlayout; since: number };
   private resumeTimer?: ReturnType<typeof setTimeout>;
+  private maxPauseTimer?: ReturnType<typeof setTimeout>;
+  /** This speech's pause ran out at JEV_MAX_PAUSE_MS: it does not pause the line again. */
+  private pauseSpent = false;
   private lastAppCut?: { track: string; at: number };
   private appSpeechTimer?: ReturnType<typeof setTimeout>;
   private bargeTimer?: ReturnType<typeof setTimeout>;
@@ -5183,6 +5199,7 @@ export class JevLoop {
       this.wordsHeard = this.earlyWordsAt !== undefined && this.speechSince - this.earlyWordsAt <= JEV_WORDS_WINDOW_MS;
       this.earlyWordsAt = undefined;
       this.lastSpeech = undefined;
+      this.pauseSpent = false;
       this.speechOver = this.playing?.started ? this.playing : undefined;
       if (transcriber) {
         this.utterance = { uttId: randomUUID(), segment: ++this.segments, text: '', worded: false };
@@ -5210,17 +5227,12 @@ export class JevLoop {
     const pause = this.pause;
     if (pause && !pause.line.abort.signal.aborted) {
       this.resumeTimer = setTimeout(() => {
-        if (pause !== this.pause || pause.line.abort.signal.aborted || this.speaking) return;
-        this.pause = undefined;
-        if (this.lastSpeech) this.lastSpeech.resumed = true;
-        this.deps.log.info('voice-mode worker: false barge-in; the line resumes', {
-          replyId: pause.line.replyId,
-          pauseMs: this.now() - pause.since,
-        });
-        this.deps.setSpeechPaused(false);
+        if (pause === this.pause && !this.speaking) this.resume('quiet');
       }, JEV_FALSE_INTERRUPTION_TIMEOUT_MS);
       this.resumeTimer.unref?.();
     }
+    // The line this speech paused: its words take the turn from it even after it went on.
+    const pausedLine = pause?.line ?? (this.pauseSpent ? this.speechOver : undefined);
     this.speechOver = undefined;
     this.wake();
     const audio = this.capture?.take(endedAt - this.speechSince);
@@ -5241,8 +5253,12 @@ export class JevLoop {
         // Recorded even when the call ended first: the last words before a hang-up are worth keeping.
         if (audio) this.deps.recorded?.(utterance.segment, audio, text || utterance.text);
         this.finishUtterance(utterance, text);
-        if (text.trim() && pause && this.pause === pause && !pause.line.abort.signal.aborted)
-          this.cutSpeech(pause.line);
+        if (pausedLine && this.playing === pausedLine && !pausedLine.abort.signal.aborted && takesTurn(text)) {
+          this.deps.log.info('voice-mode worker: the words of the speech that paused the line came; it is cut', {
+            replyId: pausedLine.replyId,
+          });
+          this.cutSpeech(pausedLine);
+        }
       },
       (err: unknown) => {
         this.deps.log.warn('voice-mode worker: an utterance has no final', { err });
@@ -5260,10 +5276,8 @@ export class JevLoop {
     utterance.text = text;
     this.deps.report({ type: 'utterance', uttId: utterance.uttId, text, final: false, at: this.now() });
     this.deps.caption?.(utterance.segment, text, false);
-    if (text.trim()) {
-      utterance.worded = true;
-      this.reflex();
-    }
+    utterance.worded = takesTurn(text);
+    if (utterance.worded) this.reflex();
   }
 
   /** The host's `words`: a participant's words arrived (the reflex's confirmation where the worker has no transcript). */
@@ -5279,8 +5293,13 @@ export class JevLoop {
       return;
     }
     const last = this.lastSpeech;
-    if (last?.resumed && last.over === this.playing) return;
     const at = this.now();
+    const line = this.playing;
+    // Late words of the speech whose pause just ran out: it took the turn after all.
+    if (last?.resumedAt !== undefined && at - last.resumedAt <= JEV_WORDS_WINDOW_MS && line && last.over === line) {
+      if (!line.abort.signal.aborted) this.cutSpeech(line);
+      return;
+    }
     if (!last || at - last.endedAt > JEV_WORDS_WINDOW_MS) this.earlyWordsAt = at;
   }
 
@@ -5377,6 +5396,7 @@ export class JevLoop {
     const line = this.playing;
     if (line?.replyId !== replyId) return;
     if (this.pause?.line === line) {
+      this.deps.log.info('voice-mode worker: the host revoked a paused line; it is cut', { replyId });
       line.abort.abort();
       return;
     }
@@ -5409,6 +5429,7 @@ export class JevLoop {
   close(): void {
     this.closed = true;
     clearTimeout(this.resumeTimer);
+    clearTimeout(this.maxPauseTimer);
     clearTimeout(this.appSpeechTimer);
     clearTimeout(this.bargeTimer);
     this.utterance = undefined;
@@ -5429,8 +5450,10 @@ export class JevLoop {
     if (!line?.started || !this.speaking || line.abort.signal.aborted) return;
     if (!this.pause && this.now() - this.speechSince < JEV_BARGE_MS) return;
     if (!this.utterance?.worded && !this.wordsHeard) {
-      if (!this.pause) {
+      if (!this.pause && !this.pauseSpent) {
         this.pause = { line, since: this.now() };
+        this.maxPauseTimer = setTimeout(() => this.resume('max_pause'), JEV_MAX_PAUSE_MS);
+        this.maxPauseTimer.unref?.();
         this.deps.setSpeechPaused(true);
       }
       return;
@@ -5440,6 +5463,27 @@ export class JevLoop {
       speechMs: this.now() - this.speechSince,
     });
     this.cutSpeech(line);
+  }
+
+  /** A false barge-in: the paused line goes on from where it stopped. */
+  private resume(reason: 'quiet' | 'max_pause'): void {
+    const pause = this.pause;
+    if (!pause || pause.line.abort.signal.aborted) return;
+    this.endPause();
+    if (this.speaking) this.pauseSpent = true;
+    else if (this.lastSpeech) this.lastSpeech.resumedAt = this.now();
+    this.deps.log.info('voice-mode worker: false barge-in; the line resumes', {
+      replyId: pause.line.replyId,
+      pauseMs: this.now() - pause.since,
+      reason,
+    });
+    this.deps.setSpeechPaused(false);
+  }
+
+  private endPause(): void {
+    clearTimeout(this.resumeTimer);
+    clearTimeout(this.maxPauseTimer);
+    this.pause = undefined;
   }
 
   private finishUtterance(utterance: JevUtterance, text: string): void {
@@ -5481,9 +5525,11 @@ export class JevLoop {
       this.deps.log.warn('voice-mode worker: speaking failed', { err });
       outcome = { heard: false, failed: true, cut: false, audioMs: 0, playedMs: 0, complete: false };
     } finally {
-      clearTimeout(this.resumeTimer);
-      this.pause = undefined;
+      const paused = !!this.pause;
+      this.endPause();
       this.playing = undefined;
+      // The speech output lets go of its hold as the line ends; a hold that outlived it would stall the next line.
+      if (paused) this.deps.setSpeechPaused(false);
     }
     const at = this.now();
     if (outcome.cut || (outcome.failed && outcome.heard)) {

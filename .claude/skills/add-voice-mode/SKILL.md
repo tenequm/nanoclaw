@@ -325,10 +325,15 @@ seconds. The agent answers when Jev gives `answer` a probability of at least
 and `continue` takes 0.5. The agent's name alone ("Dan", "Hey Dan.") wakes it
 without a Jev call unless an answer is already on its way.
 
-On a jev call, 300 ms of caller speech over the agent's line pauses it, and
-words of that speech cut it. Two seconds of quiet with no words resume the
-line where it stopped (LiveKit's `false_interruption_timeout`), so a cough or
-"mm" does not cost the answer.
+On a jev call, any caller sound the VAD takes for speech pauses the agent's
+line 300 ms after the speech starts (Silero starts speech after about 50 ms of
+sound and ends it about 550 ms after the sound stops). Words of that speech cut
+the line, unless they are only acknowledgements ("uh-huh", "yeah", "ok", "ага",
+"так", "да"; `takesTurn` in `src/voice-mode-gemini-live.ts`), which a meeting's
+host does not pass on either. Two seconds of quiet resume the line where it
+stopped (LiveKit's `false_interruption_timeout`), as does 10 seconds of
+wordless sound, so a cough, music or "mm" does not cost the answer. Words that
+come for that speech after the resume still cut the line.
 
 A jev voice call plays three cues, by the plain call's `cues` and `typing`
 switches: listening once at call start; the typing sound and the "working"
