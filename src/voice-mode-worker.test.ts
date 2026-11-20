@@ -4679,6 +4679,7 @@ describe('room output and the caller input', () => {
     );
     const frame = () => input.frame(new AudioFrame(new Int16Array(320), 16_000, 1, 320));
     for (let i = 0; i < 50; i++) frame();
+    expect(input.trackStart).toBe(0);
     streams[0].push({
       type: VADEventType.START_OF_SPEECH,
       samplesIndex: 16_000,
@@ -4700,6 +4701,7 @@ describe('room output and the caller input', () => {
       silenceDuration: 600,
     });
     for (let i = 0; i < 50; i++) frame();
+    expect(input.trackStart).toBe(16_000);
     streams[1].push({
       type: VADEventType.START_OF_SPEECH,
       samplesIndex: 8_000,
@@ -6886,7 +6888,7 @@ function jevLoop({ transcribed = true, app = false }: { transcribed?: boolean; a
   });
   const loop = new JevLoop({
     ...(transcribed ? { transcriber: transcription } : {}),
-    ...(app ? { appSilenceMs: SILENCE } : {}),
+    appCall: app,
     speak,
     report: (event) => void events.push(event),
     caption: (segment, text, final) => void captions.push([segment, text, final]),
@@ -6925,7 +6927,7 @@ function jevLoop({ transcribed = true, app = false }: { transcribed?: boolean; a
 
 describe('app interrupt RPC', () => {
   const method = 'nanoclaw.voice-mode.interrupt';
-  const payload = { heard: 'Wait', cutAtMs: 350, playedMs: 400 };
+  const payload = { heard: 'Wait', cutAtMs: 350, micMs: 600, playedMs: 400 };
   function rpc(loop: JevLoop, meta: LiveKitJobMetadata = { ...META, appCall: true, jev: true }) {
     let handler: Parameters<LocalParticipant['registerRpcMethod']>[1];
     const register = vi.fn((_method: string, handle: typeof handler) => {
@@ -7008,7 +7010,7 @@ describe('app interrupt RPC', () => {
   it('refuses unknown and ended calls, other participants and malformed payloads without cutting', async () => {
     const h = jevLoop({ app: true });
     const app = rpc(h.loop);
-    expect(await app.call()).toMatchObject({ ok: false, reason: expect.any(String) });
+    expect(await app.call()).toEqual({ ok: false, reason: 'no active utterance' });
     h.loop.onReply('r1', 'One two.');
     await flush();
     h.start(h.lines[0]);
@@ -7016,19 +7018,21 @@ describe('app interrupt RPC', () => {
       '{',
       null,
       { ...payload, cutAtMs: -1 },
+      { ...payload, micMs: undefined },
+      { ...payload, micMs: null },
+      { ...payload, micMs: -1 },
       { ...payload, heard: 1 },
       { ...payload, playedMs: -1 },
       { ...payload, playedMs: undefined },
     ]) {
-      expect(await app.call(value)).toMatchObject({ ok: false, reason: expect.any(String) });
+      expect(await app.call(value)).toEqual({ ok: false, reason: 'invalid payload' });
     }
-    expect(await app.call(payload, 'other')).toMatchObject({ ok: false, reason: expect.any(String) });
+    expect(await app.call(payload, 'other')).toEqual({ ok: false, reason: 'unknown caller' });
     app.track(undefined);
-    expect(await app.call()).toMatchObject({ ok: false, reason: expect.any(String) });
+    expect(await app.call()).toEqual({ ok: false, reason: 'no caller microphone' });
     expect(h.lines[0].signal.aborted).toBe(false);
     h.loop.close();
-    app.track('mic');
-    expect(await app.call()).toMatchObject({ ok: false, reason: expect.any(String) });
+    expect(await app.call()).toEqual({ ok: false, reason: 'call closed' });
   });
 
   it('uses worker playout when unknown and keeps phone words when local VAD misses them', async () => {
@@ -7044,6 +7048,60 @@ describe('app interrupt RPC', () => {
     expect(h.events).toContainEqual(expect.objectContaining({ state: 'cut_off', delivered: 'One two' }));
     h.loop.close();
   });
+
+  it.each([
+    { localPartial: '', result: 'Stop.', finals: ['final:Stop.'] },
+    { localPartial: 'St', result: '', finals: ['final:'] },
+    { localPartial: '', result: '', finals: ['final:Stop'] },
+  ])(
+    'associates a late phone cut with one ended VAD turn ($localPartial / $result)',
+    async ({ localPartial, result, finals }) => {
+      vi.useFakeTimers();
+      const h = jevLoop({ app: true });
+      const app = rpc(h.loop);
+      app.track('mic', 16_000);
+      h.loop.audio(new Int16Array(24_000));
+      h.loop.onReply('r1', 'First reply.');
+      await vi.advanceTimersByTimeAsync(1);
+      h.start(h.lines[0]);
+      h.loop.onSpeech(true, 20_000);
+      if (localPartial) h.loop.onInterim(localPartial);
+      h.transcription.results.push(heard(result));
+      h.loop.onSpeech(false, 24_000);
+      await vi.advanceTimersByTimeAsync(1);
+      h.loop.audio(new Int16Array(12_000));
+      expect(await app.call({ ...payload, heard: 'Stop', cutAtMs: 2_000, micMs: 2_500 })).toEqual({ ok: true });
+      await vi.runAllTimersAsync();
+      expect(h.kinds().filter((k) => k.startsWith('speech:'))).toEqual(['speech:on', 'speech:off']);
+      expect(h.kinds().filter((k) => k.startsWith('final:'))).toEqual(finals);
+      expect(h.kinds()).toContain('r1:cut_off');
+      expect(h.transcription.begins).toHaveLength(1);
+      h.loop.close();
+    },
+  );
+
+  it.each([
+    { cutAtMs: 2_000, micMs: 2_750, preRollMs: 750 + PRE_ROLL_MS },
+    { cutAtMs: 2_000, micMs: 50_000, preRollMs: 1_500 },
+    { cutAtMs: 2_001, micMs: 2_000, preRollMs: PRE_ROLL_MS },
+  ])(
+    'bounds phone-only transcription to unrepeated audio ($cutAtMs / $micMs)',
+    async ({ cutAtMs, micMs, preRollMs }) => {
+      const h = jevLoop({ app: true });
+      const app = rpc(h.loop);
+      app.track('mic', 16_000);
+      h.loop.audio(new Int16Array(24_000));
+      h.loop.onSpeech(true, 20_000);
+      h.loop.onSpeech(false, 24_000);
+      h.loop.audio(new Int16Array(24_000));
+      h.loop.onReply('r1', 'First reply.');
+      await flush();
+      h.start(h.lines[0]);
+      expect(await app.call({ ...payload, cutAtMs, micMs })).toEqual({ ok: true });
+      expect(h.transcription.begins.at(-1)).toBe(preRollMs * 16);
+      h.loop.close();
+    },
+  );
 
   it('associates a delayed first RPC with the VAD cut after another reply has started', async () => {
     vi.useFakeTimers();
@@ -7727,6 +7785,43 @@ describe('jev calls', () => {
     host.endStream();
   });
 
+  it('holds the turn cue during phone-only speech and releases the next reply on the Jev timeout', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    const { ctx, job } = fakeJob({ ...JEV_META, appCall: true, silenceMs: 60_000 });
+    const host = fakeHostFetch();
+    const v = fakeVoice();
+    await runCall(ctx, callDeps(host.fetchImpl, v));
+    try {
+      host.emit({ type: 'reply', replyId: 'r1', text: 'First line.' });
+      await vi.advanceTimersByTimeAsync(10);
+      v.voice.speak.mockImplementationOnce(async (_text, ready, signal) => {
+        await ready();
+        v.events.onAgentSpeaking(true);
+        await new Promise<void>((resolve) => signal.addEventListener('abort', () => resolve(), { once: true }));
+        v.events.onAgentSpeaking(false);
+        return { heard: true, cut: true, failed: false, audioMs: 100, playedMs: 50, complete: true };
+      });
+      host.emit({ type: 'reply', replyId: 'r2', text: 'Second line.' });
+      await vi.advanceTimersByTimeAsync(10);
+      v.events.onInterrupt!({ heard: 'Wait', cutAtMs: 100, micMs: 200, playedMs: null }, { sid: 'mic', from: 0 });
+      await vi.advanceTimersByTimeAsync(TURN_CUE_DELAY_MS + 1);
+      expect(jevEvents(host).flat().map(summary)).toContain('speech:on');
+      expect(jevEvents(host).flat().map(summary)).not.toContain('speech:off');
+      expect(v.voice.playCue.mock.calls.map(([kind]) => kind)).not.toContain('turn');
+      host.emit({ type: 'reply', replyId: 'r3', text: 'Ready.' });
+      await vi.advanceTimersByTimeAsync(10);
+      expect(jevEvents(host).flat().map(summary)).not.toContain('r3:started');
+      await vi.advanceTimersByTimeAsync(JEV_WORDS_WINDOW_MS);
+      expect(jevEvents(host).flat().map(summary)).toEqual(
+        expect.arrayContaining(['speech:off', 'final:Wait', 'r3:completed']),
+      );
+    } finally {
+      host.emit({ type: 'end', reason: 'done' });
+      await vi.advanceTimersByTimeAsync(10);
+      expect(job.shutdown).toHaveBeenCalled();
+    }
+  });
+
   it("types on from the reply's arrival until its first audio, not only until the reply", async () => {
     const { ctx } = fakeJob({ ...JEV_META });
     const host = fakeHostFetch();
@@ -7931,7 +8026,9 @@ describe('jev calls', () => {
       host.emit({ type: 'reply', replyId: 'first', text: 'One two three.' });
       await vi.waitFor(() => expect(sink.waitForPlayout).toHaveBeenCalledOnce());
       const frames = sink.captureFrame.mock.calls.length;
-      expect(v.events.onInterrupt!({ heard: 'Wait', cutAtMs: 100, playedMs: 100 }, { sid: 'mic', from: 0 })).toBe(true);
+      expect(
+        v.events.onInterrupt!({ heard: 'Wait', cutAtMs: 100, micMs: 150, playedMs: 100 }, { sid: 'mic', from: 0 }),
+      ).toEqual({ ok: true });
       expect(sink.clearQueue).toHaveBeenCalledOnce();
       await vi.waitFor(() =>
         expect(jevEvents(host).flat()).toContainEqual(

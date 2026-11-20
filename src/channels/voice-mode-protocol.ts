@@ -43,6 +43,13 @@ export const WORKER_REQUEST_TIMEOUT_MS = 10_000;
 export const LIVEKIT_PROTOCOL_VERSION = 6;
 /** The worker's participant attribute with LIVEKIT_PROTOCOL_VERSION; native clients log it with a call. */
 export const CALL_PROTOCOL_ATTRIBUTE = 'nanoclaw.voice-mode.protocol';
+/**
+ * On app Jev calls the agent advertises "1" here and serves the caller's interrupt RPC at the same name.
+ * The app mutes roomio_audio and sends { heard, cutAtMs, micMs, playedMs }. heard contains words from
+ * the cut onward. Both required timestamps are milliseconds on the same caller mic clock: the word
+ * onset and the reading at send time. playedMs is the speech playout position in ms, or null if unknown.
+ * The reply is { ok: true } for an accepted or repeated cut, or { ok: false, reason: string }.
+ */
 export const CALL_INTERRUPT = 'nanoclaw.voice-mode.interrupt';
 
 /** Transcription over the Gemini Live API, verbatim, one manual activity per caller turn. */
