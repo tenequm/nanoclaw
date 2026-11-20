@@ -18,7 +18,7 @@ ncl mesh add test-agent
 {"extensions":{"ai.nanoco.nanoclaw":{"mesh":true}}}
 ```
 
-The flag applies on the first stamp. Use the operator CLI to change an existing group's membership. For a local proof, use the disposable stack's seeded test group. Adding a machine creates a role-less `peer:<machine>` user. The host authenticates signed requests, checks timestamp and nonce, and builds the inbound sender identity itself.
+The flag applies on the first stamp. Use the operator CLI to change an existing group's membership. For a local proof, use the disposable stack's seeded test group. Adding a machine creates a role-less `peer:<machine>` user. The host authenticates signed requests, checks timestamp and nonce, and builds the inbound sender identity itself. Machines sign with the `Amesh-Sig` scheme over a canonical text that starts `AMESH-SIG-V1`. The host also accepts the `HeyDan-Sig` scheme over `HEYDAN-SIG-V1`, which amesh 0.1.5 and older send, each scheme only with its own prefix; that pair will be dropped once every enrolled machine has upgraded. Device auth for the app keeps `HeyDan-Sig`.
 
 ## Send from an agent
 

@@ -1,0 +1,1 @@
+bash scripts/leaks.sh --pre-push

@@ -1,0 +1,71 @@
+# Betterleaks 1.10 config (https://github.com/betterleaks/betterleaks): the built-in secret rules
+# plus rules for private data that does not belong in a public repository. Run through
+# scripts/leaks.sh, which scans only new changes: staged files, or the first-parent commits a push
+# or pull request adds, so upstream history merged into this fork is not scanned again.
+# The rules match classes of values, never a real value: a list of the values to keep out would
+# publish them. Literal rules for one deployment go in a private config that scripts/leaks.sh also
+# runs when it exists (BETTERLEAKS_PRIVATE_CONFIG, default ~/.config/betterleaks/private.toml).
+title = "nanoclaw"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "home-directory"
+description = "A real user's home directory. Use /Users/me or /home/me."
+regex = '''(?:/Users/|/home/)([A-Za-z][A-Za-z0-9._-]*)'''
+secretGroup = 1
+keywords = ["/users/", "/home/"]
+[[rules.allowlists]]
+regexTarget = "secret"
+regexes = ['''^(?:me|you|user|username|test|tester|example|runner|alice|bob|linuxbrew|Shared|node|nc|operator)\.?$''']
+
+[[rules]]
+id = "claude-project-directory"
+description = "A Claude Code project directory named after a real home directory. Use -Users-me-..."
+regex = '''-(?:Users|home)-([A-Za-z][A-Za-z0-9._]*)-'''
+secretGroup = 1
+keywords = ["-users-", "-home-"]
+[[rules.allowlists]]
+regexTarget = "secret"
+regexes = ['''^(?:me|you|user|test|example|runner|node)$''']
+
+[[rules]]
+id = "tailnet-hostname"
+description = "A Tailscale MagicDNS name, which names a private tailnet."
+regex = '''\b[a-z0-9][a-z0-9-]*\.ts\.net\b'''
+keywords = [".ts.net"]
+[[rules.allowlists]]
+regexTarget = "match"
+regexes = ['''^(?:[a-z0-9-]+\.)?example\.ts\.net$''']
+
+[[rules]]
+id = "tailnet-address"
+description = "An address in Tailscale's 100.64.0.0/10 range."
+regex = '''\b100\.(?:6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.[0-9]{1,3}\.[0-9]{1,3}\b'''
+keywords = ["100."]
+[[rules.allowlists]]
+regexTarget = "match"
+regexes = ['''^100\.64\.0\.0$''']
+
+[[rules]]
+id = "telegram-chat-id"
+description = "A Telegram user or chat id."
+regex = '''\b(?:telegram|tg):-?[0-9]{5,}\b'''
+keywords = ["telegram:", "tg:"]
+
+# Tests and fixtures need made-up ids and addresses of these shapes.
+[[allowlists]]
+description = "Made-up ids and addresses in tests"
+targetRules = ["tailnet-address", "telegram-chat-id"]
+paths = ['''\.test\.ts$''', '''(?:^|/)[a-z-]*fixtures\.json$''']
+
+# The device-auth and peer contracts' throwaway P-256 test key, published on purpose so anyone can
+# check the signature vectors. It signs nothing real.
+[[allowlists]]
+description = "Contract test key"
+targetRules = ["private-key"]
+condition = "AND"
+paths = ['''^src/channels/(?:app/app-contract\.fixtures\.json|peer/openapi\.yaml)$''']
+regexTarget = "match"
+regexes = ['''MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgcHxq9X9L26iCQrkR''']

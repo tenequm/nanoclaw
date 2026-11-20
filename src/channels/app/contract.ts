@@ -332,9 +332,10 @@ export interface Authorization extends Omit<SigningFields, 'method' | 'target'> 
 /** The app wire protocol this host speaks; a request on any other is refused with `426 protocol`. */
 export const APP_PROTOCOL = 1;
 
-export function canonicalSigningText(fields: SigningFields): string {
+/** The prefix defaults to device auth's; the peer channel passes its own (`peer/store.ts`). */
+export function canonicalSigningText(fields: SigningFields, prefix = 'HEYDAN-SIG-V1'): string {
   return [
-    'HEYDAN-SIG-V1',
+    prefix,
     fields.protocol,
     fields.method,
     fields.target,
@@ -351,10 +352,10 @@ function decodeBase64url(value: string): Buffer | null {
   return bytes.toString('base64url') === value ? bytes : null;
 }
 
-export function parseAuthorization(header: string | undefined): Authorization | null {
-  if (!header?.startsWith('HeyDan-Sig ')) return null;
+export function parseAuthorization(header: string | undefined, scheme = 'HeyDan-Sig'): Authorization | null {
+  if (!header?.startsWith(scheme + ' ')) return null;
   const fields = new Map<string, string>();
-  for (const part of header.slice(11).split(',')) {
+  for (const part of header.slice(scheme.length + 1).split(',')) {
     const match = /^([a-z]+)=([^\s,=]+)$/.exec(part);
     if (!match || fields.has(match[1])) return null;
     fields.set(match[1], match[2]);
@@ -382,8 +383,12 @@ export function parseAuthorization(header: string | undefined): Authorization | 
 }
 
 // This checks cryptography only; device, clock, protocol, nonce persistence and body streaming belong to the caller.
-export const verifyRequestSignature = (fields: SigningFields, signature: string, publicKey: string): boolean =>
-  verifyP256(canonicalSigningText(fields), signature, publicKey);
+export const verifyRequestSignature = (
+  fields: SigningFields,
+  signature: string,
+  publicKey: string,
+  prefix?: string,
+): boolean => verifyP256(canonicalSigningText(fields, prefix), signature, publicKey);
 
 export function verifyP256(text: string, signature: string, publicKey: string): boolean {
   try {
