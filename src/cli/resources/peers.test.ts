@@ -11,7 +11,7 @@ import { startMeshProjection } from '../../channels/peer/directory.js';
 import { createSession } from '../../db/sessions.js';
 import { inboundDbPath } from '../../mailbox/sqlite/paths.js';
 import { initSessionFolder } from '../../session-manager.js';
-import { isMeshMember } from '../../channels/peer/store.js';
+import { isMeshMember, listPeers } from '../../channels/peer/store.js';
 import { closeDb, createAgentGroup, initTestDb, runMigrations } from '../../db/index.js';
 import { dispatch } from '../dispatch.js';
 import './peers.js';
@@ -52,13 +52,58 @@ it('toggles membership by group name or id and rejects container administration'
   expect(await isMeshMember('ag-test')).toBe(true);
   expect(await host('mesh-remove-ag-test')).toMatchObject({ ok: true });
   expect(await isMeshMember('ag-test')).toBe(false);
-  for (const command of ['peers-list', 'peers-add', 'peers-revoke', 'mesh-add', 'mesh-remove']) {
+  for (const command of ['peers-list', 'peers-add', 'peers-revoke', 'mesh-add', 'mesh-update', 'mesh-remove']) {
     const result = await dispatch(
       { id: 'test', command, args: {} },
       { caller: 'agent', sessionId: 's', messagingGroupId: 'm', agentGroupId: 'ag-test' },
     );
     expect(result).toMatchObject({ ok: false, error: { code: 'forbidden' } });
   }
+});
+
+it('adds a normalized mesh address and preserves it on repeated add', async () => {
+  const id = 'ag-test';
+  expect(await host('mesh-add', { id, address: 'Lead.Team_2-' })).toMatchObject({ ok: true });
+  expect(await host('mesh-add', { id })).toMatchObject({ ok: true });
+  expect(await host('mesh-add', { id, address: 'lead.team_2' })).toMatchObject({ ok: true });
+  expect(await host('mesh-add', { id, address: 'other' })).toMatchObject({
+    ok: false,
+    error: { message: expect.stringContaining('mesh update') },
+  });
+  expect(await listPeers()).toMatchObject([{ address: 'lead.team_2' }]);
+});
+
+it('refuses invalid or occupied mesh addresses without changing membership', async () => {
+  await createAgentGroup({
+    id: 'other',
+    name: 'Test Peer',
+    folder: 'other',
+    agent_provider: null,
+    created_at: new Date().toISOString(),
+  });
+  const id = 'ag-test';
+  expect(await host('mesh-update', { id, address: 'lead' })).toMatchObject({
+    ok: false,
+    error: { message: expect.stringContaining('member') },
+  });
+  expect(await host('mesh-update', { id })).toMatchObject({ ok: false, error: { code: 'invalid-args' } });
+  for (const address of ['', '.lead', 'lead role', '\u212Aey', 'lead@project', 'a'.repeat(41)]) {
+    expect(await host('mesh-add', { id, address })).toMatchObject({
+      ok: false,
+      error: { message: expect.stringContaining('Invalid') },
+    });
+  }
+  expect(await isMeshMember(id)).toBe(false);
+  expect(await host('mesh-add', { id })).toMatchObject({ ok: true });
+  const conflict = { ok: false, error: { message: expect.stringContaining('already in use') } };
+  expect(await host('mesh-add', { id: 'other', address: 'Test-Peer' })).toMatchObject(conflict);
+  expect(await host('mesh-add', { id: 'other', address: 'lead' })).toMatchObject({ ok: true });
+  expect(await host('mesh-update', { id, address: 'Lead' })).toMatchObject(conflict);
+  expect(await host('mesh-update', { id, address: '!bad' })).toMatchObject({
+    ok: false,
+    error: { message: expect.stringContaining('Invalid') },
+  });
+  expect(await listPeers()).toMatchObject([{ address: 'lead' }, { address: 'test-peer' }]);
 });
 
 it('projects CLI membership changes into every active member session and clears them on removal', async () => {
@@ -99,6 +144,8 @@ it('projects CLI membership changes into every active member session and clears 
     await vi.waitFor(() => expect(read()).toEqual([['test-peer'], ['test-peer'], []]));
     await host('mesh-add-other');
     await vi.waitFor(() => expect(read()).toEqual(Array(3).fill(['other-test', 'test-peer'])));
+    expect(await host('mesh-update', { id: 'ag-test', address: 'lead' })).toMatchObject({ ok: true });
+    await vi.waitFor(() => expect(read()).toEqual(Array(3).fill(['lead', 'other-test'])));
     await host('mesh-remove-ag-test');
     await vi.waitFor(() => expect(read()).toEqual([[], [], ['other-test']]));
   } finally {

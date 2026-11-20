@@ -4,10 +4,11 @@ import {
   listMachines,
   revokeMachine,
   setMeshMembership,
+  updateMeshAddress,
 } from '../../channels/peer/store.js';
 import { getAgentGroup } from '../../db/agent-groups.js';
 import { getDb } from '../../db/connection.js';
-import { registerResource } from '../crud.js';
+import { registerResource, type ColumnDef, type CustomOperation } from '../crud.js';
 
 registerResource({
   name: 'peer machine',
@@ -49,13 +50,28 @@ registerResource({
   },
 });
 
-function membershipOperation(member: boolean) {
+function membershipOperation(verb: 'add' | 'update' | 'remove'): CustomOperation {
+  const args: ColumnDef[] = [
+    { name: 'id', type: 'string', required: true, description: 'Agent group id or display name.' },
+  ];
+  if (verb !== 'remove')
+    args.push({
+      name: 'address',
+      type: 'string',
+      required: verb === 'update',
+      description: 'Mesh address for the agent group.',
+    });
+  const descriptions = {
+    add: 'Add an agent group to the mesh.',
+    update: 'Change the address of a mesh member.',
+    remove: 'Remove an agent group from the mesh.',
+  };
   return {
     hostOnly: true,
-    access: 'open' as const,
-    description: member ? 'Add an agent group to the mesh.' : 'Remove an agent group from the mesh.',
-    args: [{ name: 'id', type: 'string' as const, required: true, description: 'Agent group id or display name.' }],
-    handler: async ({ id }: Record<string, unknown>) => {
+    access: 'open',
+    description: descriptions[verb],
+    args,
+    handler: async ({ id, address }) => {
       const value = String(id);
       let groupId = (await getAgentGroup(value))?.id;
       if (!groupId) {
@@ -68,8 +84,9 @@ function membershipOperation(member: boolean) {
         if (!matches.length) throw new Error('Unknown agent group');
         groupId = matches[0].id;
       }
-      await setMeshMembership(groupId, member);
-      return { agent_group_id: groupId, member };
+      if (verb === 'update') await updateMeshAddress(groupId, String(address));
+      else await setMeshMembership(groupId, verb === 'add', address as string | undefined);
+      return { agent_group_id: groupId, member: verb !== 'remove' };
     },
   };
 }
@@ -82,5 +99,9 @@ registerResource({
   description: 'Agent membership in the peer mesh.',
   columns: [],
   operations: {},
-  customOperations: { add: membershipOperation(true), remove: membershipOperation(false) },
+  customOperations: {
+    add: membershipOperation('add'),
+    update: membershipOperation('update'),
+    remove: membershipOperation('remove'),
+  },
 });

@@ -9,10 +9,14 @@ Run these commands on the host with the operator CLI. Substitute the name and pu
 ```sh
 ncl peers add --name mac --public-key "$MACHINE_PUBLIC_KEY"
 ncl peers list
-ncl mesh add test-agent
+ncl mesh add --id test-agent --address lead
 ```
 
-`mesh add` and `mesh remove` accept a group id or its case-insensitive display name. Use the id if several groups have the same name. A new group can also opt in at creation through its template's `plugin.json`:
+Omit `--address` to derive the address from the group's display name on first add. Repeating `mesh add` preserves the existing address. A chosen address is a single label of 1 to 40 ASCII characters. Start with a letter or digit. The remaining characters may also include dots, underscores and hyphens. The hub lowercases the label and strips trailing punctuation. Each member needs a unique address.
+
+Use `ncl mesh update --id test-agent --address coordinator` to rename a member in place. Its queued messages, conversations and hop counts survive. Open endpoints keep their IDs and announce the new address to connected sessions. Reconnecting sessions receive it in their endpoint snapshot.
+
+`mesh add`, `mesh update` and `mesh remove` accept a group id or its case-insensitive display name. Use the id if several groups have the same name. A new group can also opt in at creation through its template's `plugin.json`:
 
 ```json
 {"extensions":{"ai.nanoco.nanoclaw":{"mesh":true}}}
@@ -28,7 +32,7 @@ Call `list_peers({})` to read the live directory. Each row has an address, kind,
 {"to":"review@sample:mac","text":"The test build is ready for review."}
 ```
 
-Pass those arguments to `send_message`. A bare agent name uses agent-to-agent delivery. An agent can use `review@sample` when exactly one machine has that session. An ambiguous short address returns the qualified candidates. Registered mesh addresses take precedence over local destination aliases.
+Pass those arguments to `send_message`. A bare agent address uses agent-to-agent delivery. An agent can use `review@sample` when exactly one machine has that session. An ambiguous short address returns the qualified candidates. Registered mesh addresses take precedence over local destination aliases.
 
 The host records the originating agent session for replies. When a remote session contacts an agent, the hub pairs the agent with the machine's session key. Two live processes with the same `sessionId` get separate hub sessions. If the old key has ended, a new key on that machine with the same `sessionId` inherits the hub session and its endpoints.
 
