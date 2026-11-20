@@ -8,7 +8,7 @@ import { createApnsClient } from './apns.js';
 import fixtures from './app-contract.fixtures.json' with { type: 'json' };
 
 const body = fixtures.pushPayload.body;
-const destination = { token: fixtures.pushTokenRequest.token, environment: 'sandbox' as const };
+const destination = { ...fixtures.pushTokenRequest, environment: 'sandbox' as const };
 let directory: string;
 let sandboxPort: number;
 let productionPort: number;
@@ -77,7 +77,8 @@ beforeEach(async () => {
   client = createApnsClient({
     config: {
       teamId: 'team',
-      topic: 'com.example.HeyDan',
+      topic: 'com.example.client',
+      topics: [fixtures.pushTokenRequest.topic],
       sandbox: { keyId: 'sandbox', keyPath: join(directory, 'key.p8') },
       production: { keyId: 'production', keyPath: join(directory, 'production.p8') },
     },
@@ -136,6 +137,10 @@ it('sends the fixture over HTTP/2 and signs reusable per-environment ES256 token
   expect(requests[3].port).toBe(productionPort);
   expect(JSON.parse(Buffer.from(ph, 'base64url').toString()).kid).toBe('production');
 });
+it('uses the configured default when no topic is supplied', async () => {
+  await client.sendPush({ ...destination, topic: undefined }, 'message', body);
+  expect(requests[0].headers).toMatchObject({ 'apns-push-type': 'alert', 'apns-topic': 'com.example.client' });
+});
 it.each(['Unregistered', 'BadDeviceToken', 'ExpiredToken', 'DeviceTokenNotForTopic'])(
   'marks %s dead without retry',
   async (reason) => {
@@ -168,7 +173,10 @@ it.each([429, 500, 503])('retries %s twice', async (status) => {
 });
 it('disables a missing key once and rejects oversized payloads', async () => {
   client.close();
-  client = createApnsClient({ config: { teamId: null, topic: 'test', sandbox: null, production: null }, warn });
+  client = createApnsClient({
+    config: { teamId: null, topic: 'com.example.client', topics: [], sandbox: null, production: null },
+    warn,
+  });
   for (let i = 0; i < 2; i++)
     expect((await client.sendPush(destination, 'msg', body)).reason).toBe('EnvironmentDisabled');
   expect(warn).toHaveBeenCalledTimes(1);

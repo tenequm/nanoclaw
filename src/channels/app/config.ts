@@ -21,12 +21,21 @@ export function readAppConfig(
     apns: {
       teamId: read('APP_APNS_TEAM_ID') || null,
       topic: read('APP_APNS_TOPIC') || null,
+      topics: (read('APP_APNS_TOPICS') ?? '')
+        .split(',')
+        .map((topic) => topic.trim())
+        .filter(Boolean),
       sandbox: apnsKey('SANDBOX'),
       production: apnsKey('PRODUCTION'),
     },
   };
 }
 export type AppConfig = ReturnType<typeof readAppConfig>;
+export function allowedPushTopic(requested: unknown, config: AppConfig['apns']): string | null {
+  return typeof requested === 'string' && (requested === config.topic || config.topics.includes(requested))
+    ? requested
+    : null;
+}
 export function configuredFeatures(config: AppConfig): string[] {
   const pushReady =
     config.publicBase &&

@@ -975,7 +975,9 @@ describe('signed HTTP fixture producers', () => {
       await adapter.teardown();
     }
   });
-  it('produces push payload and headers at a local h2c endpoint', async () => {
+  it('sends the registered topic to a local HTTP/2 endpoint', async () => {
+    vi.stubEnv('APP_APNS_TOPIC', 'com.example.client');
+    vi.stubEnv('APP_APNS_TOPICS', fixtures.pushTokenRequest.topic);
     vi.stubEnv('APP_PUBLIC_BASE', fixtures.pairLink.host);
     resetAppConfigCache();
     const keyPath = join(directory, 'apns.p8');
@@ -1002,8 +1004,8 @@ describe('signed HTTP fixture producers', () => {
     const origin = `http://127.0.0.1:${(h2.address() as AddressInfo).port}`;
     const client = createApnsClient({
       config: {
+        ...readAppConfig().apns,
         teamId: 'fixture-team',
-        topic: fixtures.pushPayload.headers['apns-topic'],
         sandbox: { keyId: 'fixture-key', keyPath },
         production: null,
       },

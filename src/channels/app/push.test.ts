@@ -7,7 +7,7 @@ import { Socket } from 'node:net';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { initDb, closeDb } from '../../db/connection.js';
 import type { DbDriver } from '../../db/driver.js';
-import { runMigrations } from '../../db/migrations/index.js';
+import { getRegisteredMigrations, runMigrations } from '../../db/migrations/index.js';
 import type { EventRow } from './db.js';
 import { pushTokenHandler, subscribePush, type PushDependencies } from './push.js';
 import { readAppConfig, resetAppConfigCache } from './config.js';
@@ -30,7 +30,10 @@ const send = vi.fn(async () => ({ status: 200, clearToken: false }));
 beforeEach(async () => {
   directory = mkdtempSync(join(tmpdir(), 'app-push-'));
   db = await initDb(join(directory, 'test.db'), { role: 'test' });
-  await runMigrations(db);
+  await runMigrations(
+    db,
+    getRegisteredMigrations().filter((migration) => migration.name !== 'module:app:push-topic'),
+  );
   send.mockClear();
   deps = {
     onEventAppended: (listener) => {
@@ -56,7 +59,16 @@ beforeEach(async () => {
     id === 'other' ? ['ag_other'] : ['ag_taylor', ...(id === 'second' ? ['ag_extra'] : [])],
   );
   for (const id of ['first', 'second', 'other', 'revoked'])
-    await db.run('INSERT INTO app_push_tokens VALUES (?, ?, ?, ?)', id, id, 'sandbox', 1);
+    await db.run(
+      'INSERT INTO app_push_tokens (device_id, token, environment, updated_at) VALUES (?, ?, ?, ?)',
+      id,
+      id,
+      'sandbox',
+      1,
+    );
+  await runMigrations(db);
+  vi.stubEnv('APP_APNS_TOPIC', 'com.example.client');
+  vi.stubEnv('APP_APNS_TOPICS', ` com.example.extra, ${fixtures.pushTokenRequest.topic} , `);
 });
 afterEach(async () => {
   stop?.();
@@ -70,7 +82,7 @@ afterEach(async () => {
 function start(overrides: Parameters<typeof subscribePush>[1] = {}) {
   stop = subscribePush(deps, {
     db: () => db,
-    config: () => ({ ...readAppConfig(() => undefined), publicBase: 'https://app.example.com' }),
+    config: () => ({ ...readAppConfig(), publicBase: 'https://app.example.com' }),
     send,
     agent: async () => ({
       id: 'ag_taylor',
@@ -94,16 +106,17 @@ function emit(entity: unknown = fixtures.messages.agentWithFiles, kind = 'messag
     created_at: 0,
   });
 }
-it('pushes the fixture to eligible devices with their own badges', async () => {
+it('pushes to an upgraded device and a beta installation with their own topics and badges', async () => {
+  expect(await register(fixtures.pushTokenRequest, 'second')).toBe(204);
   start();
   emit();
   await vi.waitFor(() => expect(send).toHaveBeenCalledTimes(2));
   const calls = send.mock.calls as unknown as Array<[unknown, string, typeof fixtures.pushPayload.body]>;
   expect(calls).toEqual(
     expect.arrayContaining([
-      [{ token: 'first', environment: 'sandbox' }, 'msg_2102', fixtures.pushPayload.body],
+      [{ token: 'first', environment: 'sandbox', topic: 'com.example.client' }, 'msg_2102', fixtures.pushPayload.body],
       [
-        { token: 'second', environment: 'sandbox' },
+        fixtures.pushTokenRequest,
         'msg_2102',
         { ...fixtures.pushPayload.body, aps: { ...fixtures.pushPayload.body.aps, badge: 7 } },
       ],
@@ -119,6 +132,7 @@ it.each(['/', '///'])('normalizes the push host with trailing %s', async (suffix
     expect(call[2].hd.h).toBe('https://app.example.com');
 });
 it('ignores updates, reactions, host and voice lines but pushes questions', async () => {
+  expect(await register(fixtures.pushTokenRequest, 'second')).toBe(204);
   start();
   const message = fixtures.messages.agentWithFiles;
   emit({ ...message, seq: message.seq + 1 });
@@ -129,6 +143,7 @@ it('ignores updates, reactions, host and voice lines but pushes questions', asyn
   await vi.waitFor(() => expect(send).toHaveBeenCalledTimes(2));
   for (const call of send.mock.calls as unknown as Array<[unknown, string, typeof fixtures.pushPayload.body]>)
     expect(call[2].hd.k).toBe('question');
+  expect(send).toHaveBeenCalledWith(fixtures.pushTokenRequest, fixtures.questions.open.id, expect.anything());
 });
 it('clears rejected and revoked tokens', async () => {
   start({ send: async () => ({ status: 410, clearToken: true, reason: 'Unregistered' }) });
@@ -167,10 +182,36 @@ it('stores the fixture, transfers duplicate tokens atomically and accepts simula
   expect(await register(fixtures.pushTokenRequest)).toBe(204);
   expect(await register(fixtures.pushTokenRequest, 'second')).toBe(204);
   expect(await db.get('SELECT * FROM app_push_tokens WHERE device_id = ?', 'first')).toBeUndefined();
-  expect(await db.get('SELECT token, environment FROM app_push_tokens WHERE device_id = ?', 'second')).toEqual(
+  expect(await db.get('SELECT token, environment, topic FROM app_push_tokens WHERE device_id = ?', 'second')).toEqual(
     fixtures.pushTokenRequest,
   );
   expect(await register({ token: 'ab'.repeat(80), environment: 'production' })).toBe(204);
+});
+it.each([undefined, 'com.example.unlisted'])('falls back when re-registering with topic %s', async (topic) => {
+  expect(await register(fixtures.pushTokenRequest)).toBe(204);
+  expect(await register({ ...fixtures.pushTokenRequest, topic })).toBe(204);
+  start();
+  emit();
+  await vi.waitFor(() =>
+    expect(send).toHaveBeenCalledWith(
+      { ...fixtures.pushTokenRequest, topic: 'com.example.client' },
+      expect.any(String),
+      expect.anything(),
+    ),
+  );
+});
+it('uses the default when a registered topic leaves the allowlist', async () => {
+  expect(await register(fixtures.pushTokenRequest)).toBe(204);
+  vi.stubEnv('APP_APNS_TOPICS', '');
+  start();
+  emit();
+  await vi.waitFor(() =>
+    expect(send).toHaveBeenCalledWith(
+      { ...fixtures.pushTokenRequest, topic: 'com.example.client' },
+      expect.any(String),
+      expect.anything(),
+    ),
+  );
 });
 it.each([
   null,
@@ -199,6 +240,21 @@ it('rechecks access after queued work and bounds sends in flight', async () => {
   release();
   await vi.waitFor(() => expect(slow).toHaveResolvedTimes(1));
   expect(slow).toHaveBeenCalledTimes(1);
+});
+it('preserves a topic-only replacement while a rejection is in flight', async () => {
+  const replacement = fixtures.pushTokenRequest.topic;
+  start({
+    concurrency: 1,
+    send: async () => {
+      await db.run("UPDATE app_push_tokens SET topic = ? WHERE device_id = 'first'", replacement);
+      return { status: 400, clearToken: true, reason: 'DeviceTokenNotForTopic' };
+    },
+  });
+  emit();
+  await vi.waitFor(async () => {
+    expect(await db.get("SELECT token FROM app_push_tokens WHERE device_id = 'second'")).toBeUndefined();
+    expect(await db.get("SELECT topic FROM app_push_tokens WHERE device_id = 'first'")).toEqual({ topic: replacement });
+  });
 });
 it('preserves a registration replaced while a rejection was in flight', async () => {
   start({
@@ -274,7 +330,7 @@ it('queues committed agent messages through the module-level push subscription',
   await appTransaction(() => appendEvent(db, 'user', 'ag_taylor', message));
   await vi.waitFor(() => expect(apns.sendPush).toHaveBeenCalledTimes(2));
   expect(apns.sendPush).toHaveBeenCalledWith(
-    { token: 'first', environment: 'sandbox' },
+    { token: 'first', environment: 'sandbox', topic: 'com.example.client' },
     message.id,
     expect.objectContaining({
       hd: expect.objectContaining({ m: message.id, k: 'message', a: { id: 'ag_taylor', name: 'Taylor' } }),

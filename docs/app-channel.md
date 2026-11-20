@@ -15,7 +15,8 @@ API. Whole messages arrive after a working status, without token streaming.
 | `OPENAI_API_KEY`                                             | Host credential for voice transcription.                                                                             | `voice-messages` when `files` is enabled.                                           |
 | `APP_LIVEKIT_URL`                                            | Public WebSocket address returned in app call grants.                                                                | `calls`, `voice-picker` when set.                                                   |
 | `APP_APNS_TEAM_ID`                                           | Apple developer team for push signing.                                                                               | `push` with a topic, a public base and at least one readable P-256 environment key. |
-| `APP_APNS_TOPIC`                                             | App bundle topic: your application bundle identifier. No default; push stays off without it.                         | Required for `push`.                                                                |
+| `APP_APNS_TOPIC`                                             | Default APNs topic (app bundle identifier), always allowed.                                                          | Required for `push`.                                                                |
+| `APP_APNS_TOPICS`                                            | Comma-separated additional bundle identifiers, for example `com.example.client.beta`.                                | Optional for `push`.                                                                |
 | `APP_APNS_SANDBOX_KEY_ID`, `APP_APNS_SANDBOX_KEY_PATH`       | Sandbox signing key identifier and host-local key file.                                                              | Both required for sandbox credentials.                                              |
 | `APP_APNS_PRODUCTION_KEY_ID`, `APP_APNS_PRODUCTION_KEY_PATH` | Production signing key identifier and host-local key file.                                                           | Both required for production credentials.                                           |
 
@@ -133,7 +134,7 @@ All paths below are under `/app`. `:id` denotes an opaque identifier.
 | GET    | `/conversations/:id/voice`          | Read saved voice                               | Signature     |
 | PATCH  | `/conversations/:id/voice`          | Update saved voice                             | Signature     |
 | GET    | `/conversations/:id/voices`         | Browse voice catalog                           | Signature     |
-| PUT    | `/devices/me/push-token`            | Register token and environment                 | Signature     |
+| PUT    | `/devices/me/push-token`            | Register token, environment and optional topic | Signature     |
 | DELETE | `/devices/me`                       | Revoke this device                             | Signature     |
 
 Errors have a stable `error` code and display-ready `message`, with extra fields where
@@ -198,8 +199,11 @@ The host retries an interrupted transcription once across restarts.
 ## Push and calls
 
 Store separate APNs signing keys for sandbox and production. Register each device token
-with its build environment; do not guess it from token length. Push is sent for new agent
-messages and questions only, not edits, reactions, host messages or mirrored call speech.
+with its build environment and optional string `topic` (the installed app's bundle identifier).
+The host uses the registered topic only while it is allowlisted. An omitted or unlisted
+topic uses `APP_APNS_TOPIC`, including for devices registered before this field existed.
+New agent messages and questions trigger push alerts. Edits, reactions, host messages
+and mirrored call speech do not trigger alerts.
 The preview passes through Apple's push service. The payload includes host identity from
 `APP_PUBLIC_BASE`, the conversation and entity ids, and the device-scoped unread badge.
 Invalid or unregistered tokens are cleared. Approval cards remain in Telegram.

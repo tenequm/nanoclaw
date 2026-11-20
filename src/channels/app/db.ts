@@ -96,6 +96,7 @@ export interface PushTokenRow {
   device_id: string;
   token: string;
   environment: string;
+  topic: string | null;
   updated_at: number;
 }
 export interface CallAttemptRow {
@@ -152,5 +153,13 @@ registerMigration({
   name: 'module:app:voice-messages',
   async up(db) {
     await db.exec('ALTER TABLE app_files ADD COLUMN duration_ms INTEGER');
+  },
+});
+
+registerMigration({
+  version: 1,
+  name: 'module:app:push-topic',
+  async up(db) {
+    await db.exec('ALTER TABLE app_push_tokens ADD COLUMN topic TEXT');
   },
 });
