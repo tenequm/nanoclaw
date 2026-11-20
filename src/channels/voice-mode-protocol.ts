@@ -83,6 +83,8 @@ export interface LiveKitJobMetadata {
   agentName: string;
   callerName: string;
   callerIdentity: string;
+  /** A call started through the app API. */
+  appCall?: boolean;
   /** Spelling hints for the transcription: VOICE_MODE_VOCABULARY plus the agent's voice.vocabulary.txt. */
   vocabulary: string[];
   /** VOICE_MODE_LANGUAGES: the transcription's language hints, the first the call's default; never empty. */
