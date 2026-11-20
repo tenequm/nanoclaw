@@ -7871,6 +7871,13 @@ describe('jev calls', () => {
     host.emit({ type: 'thinking' });
     await vi.advanceTimersByTimeAsync(200);
     expect(v.voice.setThinking.mock.calls).toEqual([[true], [false], [true]]);
+    // A long turn: ticks every 4 s keep the indicator up well past AWAIT_REPLY_MS.
+    for (let i = 0; i < 10; i++) {
+      await vi.advanceTimersByTimeAsync(4_000);
+      host.emit({ type: 'thinking' });
+    }
+    await vi.advanceTimersByTimeAsync(1);
+    expect(v.voice.setThinking.mock.calls).toEqual([[true], [false], [true]]);
 
     host.emit({ type: 'status', status: 'idle' });
     await vi.advanceTimersByTimeAsync(1);

@@ -5720,7 +5720,9 @@ async function runJevCall(s: JevCallSetup): Promise<void> {
       else if (event.type === 'thinking') {
         const now = Date.now();
         if (awaitingUntil <= now) return;
+        // A turn that works past AWAIT_REPLY_MS keeps its wait open while the ticks go on.
         typingUntil = now + THINKING_HOLD_MS;
+        awaitingUntil = Math.max(awaitingUntil, typingUntil);
         refreshThinking();
       } else if (event.type === 'status' && (event.status === 'thinking' || event.status === 'idle')) {
         // `heard` and `speaking` say nothing about the agent: it may still work on the turn before.
