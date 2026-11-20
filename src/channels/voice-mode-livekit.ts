@@ -301,7 +301,9 @@ export interface CallKind {
   maxDurationMs: number;
   room: { emptyTimeout: number; departureTimeout: number; maxParticipants: number };
   /** The kind's part of the worker's job metadata. */
-  job(call: Pick<KindCall, 'callId' | 'roomName'>): Pick<LiveKitJobMetadata, 'callerIdentity' | 'meeting' | 'jev'>;
+  job(
+    call: Pick<KindCall, 'callId' | 'roomName'>,
+  ): Pick<LiveKitJobMetadata, 'callerIdentity' | 'meeting' | 'jev' | 'appCall'>;
   /** Who each turn comes from; a guest (no user id) gets no role over the agent. */
   sender(line: VoiceModeLine): { id: string | null; name: string };
   /** What each turn tells the agent, given the caller's language note (callLanguageNote). */

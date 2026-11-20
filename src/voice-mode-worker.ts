@@ -77,6 +77,7 @@ import {
   CALL_COMMAND_WORDS,
   CALL_COMMAND_WORDS_ATTRIBUTE,
   CALL_PROTOCOL_ATTRIBUTE,
+  CALL_INTERRUPT,
   CALL_COMMANDS_ATTRIBUTE,
   CALL_COMMANDS_VERSION,
   CALL_CUE_TRACK,
@@ -1308,6 +1309,7 @@ export interface ReviewSession {
 
 /** What the room reports back. */
 export interface CallVoiceEvents {
+  onInterrupt?(request: AppInterrupt, track: CallerMic): boolean;
   /** The caller's audio: 16 kHz mono, every frame since the first, so stream positions line up. */
   onAudio(pcm: Int16Array): void;
   /** The VAD: the caller's speech started or ended at stream position `at` (16 kHz samples). */
@@ -4052,6 +4054,10 @@ export class CallerInput {
     this.events.onAudio(frame.data);
   }
 
+  get trackStart(): number {
+    return this.vad?.from ?? this.position;
+  }
+
   /** The microphone's track ended. */
   ended(): void {
     const vad = this.vad;
@@ -4472,6 +4478,14 @@ async function roomVoice(
       if (publication.track) listen(publication.track as RemoteTrack, publication, participant);
     }
   }
+
+  serveAppInterrupt(
+    meta,
+    local.registerRpcMethod.bind(local),
+    setAttr,
+    () => (!closed && callerTrack ? { sid: callerTrack, from: input.trackStart } : undefined),
+    events.onInterrupt,
+  );
 
   let typing = false;
   const voice = voiceAttribute(
@@ -4902,9 +4916,55 @@ export class JevReporter {
   }
 }
 
+interface CallerMic {
+  sid: string;
+  from: number;
+}
+
+interface AppInterrupt {
+  heard: string;
+  cutAtMs: number;
+  playedMs: number | null;
+}
+
+export function serveAppInterrupt(
+  meta: LiveKitJobMetadata,
+  register: LocalParticipant['registerRpcMethod'],
+  attribute: (key: string, value: string, what: string) => void,
+  callerTrack: () => CallerMic | undefined,
+  interrupt: CallVoiceEvents['onInterrupt'],
+): void {
+  if (!meta.appCall || !meta.jev || meta.meeting || !interrupt) return;
+  register(CALL_INTERRUPT, async ({ payload, callerIdentity }) => {
+    const track = callerTrack();
+    if (!track || callerIdentity !== meta.callerIdentity)
+      return JSON.stringify({ ok: false, reason: 'unknown caller' });
+    let req: Partial<AppInterrupt> | null;
+    try {
+      req = JSON.parse(payload);
+    } catch {
+      req = null;
+    }
+    const ms = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value) && value >= 0;
+    if (
+      !req ||
+      typeof req.heard !== 'string' ||
+      Buffer.byteLength(req.heard) > MAX_TURN_TEXT_BYTES ||
+      !ms(req.cutAtMs) ||
+      !(req.playedMs === null || ms(req.playedMs))
+    ) {
+      return JSON.stringify({ ok: false, reason: 'invalid payload' });
+    }
+    const ok = interrupt({ heard: req.heard.trim(), cutAtMs: req.cutAtMs, playedMs: req.playedMs }, track);
+    return JSON.stringify(ok ? { ok } : { ok, reason: 'no active utterance' });
+  });
+  attribute(CALL_INTERRUPT, '1', 'the app interrupt capability');
+}
+
 export interface JevLoopDeps {
   /** None on a meeting: the host transcribes each participant, and the reflex has its `words`. */
   transcriber?: Transcription;
+  appSilenceMs?: number;
   /** One line into the room; `ready` is awaited before its first audio, `signal` aborts its playout. */
   speak(text: string, ready: () => Promise<void>, signal: AbortSignal, replyId: string): Promise<LineOutcome>;
   /** One event for the host, in order. */
@@ -4918,6 +4978,8 @@ export interface JevLoopDeps {
 }
 
 interface JevUtterance {
+  phoneWords?: string;
+  finalText?: string;
   uttId: string;
   segment: number;
   /** The partial text so far. */
@@ -4927,6 +4989,7 @@ interface JevUtterance {
 }
 
 interface JevPlayout {
+  phonePlayedMs?: number;
   replyId: string;
   text: string;
   abort: AbortController;
@@ -4956,7 +5019,16 @@ export class JevLoop {
   /** The line that had started playing when this speech began: the one it talks over. */
   private speechOver?: JevPlayout;
   /** The speech that ended last: `words` landing soon after it are its own. */
-  private lastSpeech?: { endedAt: number; over?: JevPlayout; sustained: boolean; confirmed: boolean };
+  private lastSpeech?: {
+    endedAt: number;
+    endSample: number;
+    utterance?: JevUtterance;
+    over?: JevPlayout;
+    sustained: boolean;
+    confirmed: boolean;
+  };
+  private lastAppCut?: { track: string; at: number };
+  private appSpeechTimer?: ReturnType<typeof setTimeout>;
   private bargeTimer?: ReturnType<typeof setTimeout>;
   private readonly queue: JevPlayout[] = [];
   private playing?: JevPlayout;
@@ -4981,6 +5053,7 @@ export class JevLoop {
 
   /** The VAD: the caller's speech started or ended at stream position `at`. */
   onSpeech(speaking: boolean, at: number): void {
+    clearTimeout(this.appSpeechTimer);
     if (this.closed || speaking === this.speaking) return;
     this.speaking = speaking;
     this.deps.report({ type: 'speech', on: speaking, at: this.now() });
@@ -5010,6 +5083,8 @@ export class JevLoop {
     const endedAt = this.now();
     this.lastSpeech = {
       endedAt,
+      endSample: at,
+      utterance,
       ...(this.speechOver ? { over: this.speechOver } : {}),
       sustained: endedAt - this.speechSince >= JEV_BARGE_MS,
       confirmed: this.wordsHeard || !!utterance?.worded,
@@ -5020,10 +5095,11 @@ export class JevLoop {
     if (!utterance || !transcriber) return;
     transcriber.end().then(
       (heard) => {
-        const { text } = turnText(heard);
+        const text = turnText(heard).text || (utterance.phoneWords ? utterance.text || utterance.phoneWords : '');
         // Nothing heard and nothing shown: a noise, which the host never hears of. Its recording says
         // whether it was long enough to have been words the transcription missed.
         if (!text && !utterance.text) {
+          utterance.finalText = '';
           if (audio) {
             const reason = heard.failed || audio.speechMs >= MIN_LOST_SPEECH_MS ? 'stt' : 'noise';
             this.deps.recorded?.(utterance.segment, audio, '', reason);
@@ -5032,13 +5108,13 @@ export class JevLoop {
         }
         // Recorded even when the call ended first: the last words before a hang-up are worth keeping.
         if (audio) this.deps.recorded?.(utterance.segment, audio, text || utterance.text);
-        if (this.closed) return;
-        this.deps.report({ type: 'utterance', uttId: utterance.uttId, text, final: true, at: this.now() });
-        if (text) this.deps.caption?.(utterance.segment, text, true);
+        this.finishUtterance(utterance, text);
       },
       (err: unknown) => {
         this.deps.log.warn('voice-mode worker: an utterance has no final', { err });
         if (audio) this.deps.recorded?.(utterance.segment, audio, utterance.text, 'stt');
+        utterance.finalText = '';
+        if (utterance.phoneWords) this.finishUtterance(utterance, utterance.text || utterance.phoneWords);
       },
     );
   }
@@ -5079,7 +5155,7 @@ export class JevLoop {
       replyId: line.replyId,
       wordsLateMs: at - last.endedAt,
     });
-    line.abort.abort();
+    this.cutSpeech(line);
   }
 
   /** The room: the agent's audio started or stopped playing. */
@@ -5101,6 +5177,41 @@ export class JevLoop {
     }
     this.queue.push({ replyId, text: full, abort: new AbortController(), started: false });
     this.pump();
+  }
+
+  onInterrupt(request: AppInterrupt, track: CallerMic): boolean {
+    const silenceMs = this.deps.appSilenceMs;
+    if (this.closed || silenceMs === undefined) return false;
+    const last = this.lastAppCut;
+    if (last?.track === track.sid && request.cutAtMs <= last.at) return true;
+
+    const at = track.from + samplesOf(request.cutAtMs);
+    const ended = this.lastSpeech;
+    const afterSpeech = ended?.over && at <= ended.endSample && this.now() - ended.endedAt <= JEV_WORDS_WINDOW_MS;
+    const line = afterSpeech ? ended.over : (this.speechOver ?? this.playing);
+    if (!line?.started || (line !== this.playing && !line.abort.signal.aborted)) return false;
+    this.lastAppCut = { track: track.sid, at: request.cutAtMs };
+    line.phonePlayedMs = request.playedMs ?? undefined;
+    if (!line.abort.signal.aborted) this.cutSpeech(line);
+    if (afterSpeech) {
+      if (request.heard && ended.utterance) {
+        ended.utterance.phoneWords = request.heard;
+        if (ended.utterance.finalText === '') this.finishUtterance(ended.utterance, request.heard);
+      }
+      return true;
+    }
+
+    if (!this.speaking) {
+      this.onSpeech(true, Math.min(at, this.ring.position));
+      // Local VAD takes over when it detects the same speech. A phone-only turn still needs an end.
+      this.appSpeechTimer = setTimeout(() => this.onSpeech(false, this.ring.position), silenceMs);
+      this.appSpeechTimer.unref?.();
+    }
+    if (request.heard && this.utterance) {
+      this.utterance.phoneWords = request.heard;
+      if (!this.utterance.text) this.onInterim(request.heard);
+    }
+    return true;
   }
 
   /** The host's `stop`: the line playing is cut, and every queued one is dropped (reported `cut_off` with nothing delivered). */
@@ -5151,6 +5262,7 @@ export class JevLoop {
 
   close(): void {
     this.closed = true;
+    clearTimeout(this.appSpeechTimer);
     clearTimeout(this.bargeTimer);
     this.utterance = undefined;
     this.dropQueue();
@@ -5174,7 +5286,19 @@ export class JevLoop {
       replyId: line.replyId,
       speechMs: this.now() - this.speechSince,
     });
+    this.cutSpeech(line);
+  }
+
+  private finishUtterance(utterance: JevUtterance, text: string): void {
+    utterance.finalText = text;
+    if (this.closed) return;
+    this.deps.report({ type: 'utterance', uttId: utterance.uttId, text, final: true, at: this.now() });
+    if (text) this.deps.caption?.(utterance.segment, text, true);
+  }
+
+  private cutSpeech(line: JevPlayout): void {
     line.abort.abort();
+    if (this.deps.appSilenceMs !== undefined) this.dropQueue();
   }
 
   private pump(): void {
@@ -5212,7 +5336,8 @@ export class JevLoop {
       const totalMs = outcome.complete
         ? outcome.audioMs
         : Math.max(outcome.audioMs, (line.text.length * 1000) / JEV_SPEECH_CHARS_PER_SECOND);
-      const delivered = outcome.heard && totalMs > 0 ? deliveredText(line.text, outcome.playedMs / totalMs) : '';
+      const playedMs = Math.min(line.phonePlayedMs ?? outcome.playedMs, outcome.audioMs);
+      const delivered = outcome.heard && totalMs > 0 ? deliveredText(line.text, playedMs / totalMs) : '';
       if (outcome.failed) this.deps.log.warn('voice-mode worker: a line failed mid-way', { replyId: line.replyId });
       this.deps.report({ type: 'playback', replyId: line.replyId, state: 'cut_off', delivered, at });
       return;
@@ -5338,6 +5463,7 @@ async function runJevCall(s: JevCallSetup): Promise<void> {
       });
   const loop: JevLoop = new JevLoop({
     ...(transcriber ? { transcriber } : {}),
+    ...(meta.appCall && voiceCall ? { appSilenceMs: meta.silenceMs } : {}),
     speak: async (text, ready, signal, replyId) => {
       if (!callVoice) return { heard: false, failed: true, cut: false, audioMs: 0, playedMs: 0, complete: false };
       speakingReplyId = replyId;
@@ -5433,6 +5559,7 @@ async function runJevCall(s: JevCallSetup): Promise<void> {
         },
       },
       {
+        onInterrupt: (request, track) => loop.onInterrupt(request, track),
         onAudio: (pcm) => {
           loop.audio(pcm);
           callRecording?.push(pcm);

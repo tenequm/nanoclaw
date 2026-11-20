@@ -738,6 +738,18 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     expect(h.lk.dispatches.at(-1)!.metadata.tts).toEqual(gone);
   });
 
+  it('marks only app-originated jobs for the worker on jev calls', async () => {
+    const page = await post(`${h.base}/livekit/token?v=${LIVEKIT_PROTOCOL_VERSION}&t=tok123&jev=1`);
+    expect(page.status).toBe(200);
+    const browser = h.lk.dispatches.at(-1)!.metadata;
+    expect(browser.jev).toBe(true);
+    expect(browser.appCall).toBeUndefined();
+    await h.adapter.endAppCall(LINE, browser.callId, 'hangup');
+    const app = await h.adapter.startAppCall(LINE, 'wss://example.test', true, async () => true);
+    expect(app.ok).toBe(true);
+    expect(h.lk.dispatches.at(-1)!.metadata).toMatchObject({ jev: true, appCall: true });
+  });
+
   it('opens a unique room, dispatches the worker with the call metadata and mints a room-only caller token', async () => {
     const res = await post(`${h.base}/livekit/token?v=6&t=tok123&jev=0`);
     expect(res.status).toBe(200);

@@ -43,6 +43,7 @@ export const WORKER_REQUEST_TIMEOUT_MS = 10_000;
 export const LIVEKIT_PROTOCOL_VERSION = 6;
 /** The worker's participant attribute with LIVEKIT_PROTOCOL_VERSION; native clients log it with a call. */
 export const CALL_PROTOCOL_ATTRIBUTE = 'nanoclaw.voice-mode.protocol';
+export const CALL_INTERRUPT = 'nanoclaw.voice-mode.interrupt';
 
 /** Transcription over the Gemini Live API, verbatim, one manual activity per caller turn. */
 export const DEFAULT_VOICE_STT_MODEL = 'gemini-3.5-transcribe-live';
@@ -83,6 +84,8 @@ export interface LiveKitJobMetadata {
   agentName: string;
   callerName: string;
   callerIdentity: string;
+  /** A call started through the app API. */
+  appCall?: boolean;
   /** Spelling hints for the transcription: VOICE_MODE_VOCABULARY plus the agent's voice.vocabulary.txt. */
   vocabulary: string[];
   /** VOICE_MODE_LANGUAGES: the transcription's language hints, the first the call's default; never empty. */

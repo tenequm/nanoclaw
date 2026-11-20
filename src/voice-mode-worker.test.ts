@@ -11,7 +11,7 @@ import { getEventListeners } from 'node:events';
 import { fileURLToPath } from 'node:url';
 
 import { AgentServer, InferenceRunner, initializeLogger, ServerOptions, VADEventType } from '@livekit/agents';
-import { AudioFrame, AudioResampler, DisconnectReason } from '@livekit/rtc-node';
+import { AudioFrame, AudioResampler, DisconnectReason, type LocalParticipant } from '@livekit/rtc-node';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
@@ -115,6 +115,7 @@ import {
   JEV_BARGE_MS,
   THINKING_HOLD_MS,
   JEV_WORDS_WINDOW_MS,
+  serveAppInterrupt,
   JevLoop,
   JevReporter,
   PRE_ROLL_MS,
@@ -6686,7 +6687,7 @@ describe('jev: the reporter', () => {
 });
 
 /** A JevLoop over a fake transcription (none: a meeting's) and a speech output the test drives line by line. */
-function jevLoop({ transcribed = true }: { transcribed?: boolean } = {}) {
+function jevLoop({ transcribed = true, app = false }: { transcribed?: boolean; app?: boolean } = {}) {
   const transcription = fakeTranscription();
   const events: JevWorkerEvent[] = [];
   const captions: Array<[number, string, boolean]> = [];
@@ -6723,6 +6724,7 @@ function jevLoop({ transcribed = true }: { transcribed?: boolean } = {}) {
   });
   const loop = new JevLoop({
     ...(transcribed ? { transcriber: transcription } : {}),
+    ...(app ? { appSilenceMs: SILENCE } : {}),
     speak,
     report: (event) => void events.push(event),
     caption: (segment, text, final) => void captions.push([segment, text, final]),
@@ -6758,6 +6760,173 @@ function jevLoop({ transcribed = true }: { transcribed?: boolean } = {}) {
     },
   };
 }
+
+describe('app interrupt RPC', () => {
+  const method = 'nanoclaw.voice-mode.interrupt';
+  const payload = { heard: 'Wait', cutAtMs: 350, playedMs: 400 };
+  function rpc(loop: JevLoop, meta: LiveKitJobMetadata = { ...META, appCall: true, jev: true }) {
+    let handler: Parameters<LocalParticipant['registerRpcMethod']>[1];
+    const register = vi.fn((_method: string, handle: typeof handler) => {
+      handler = handle;
+    });
+    const attribute = vi.fn();
+    let track: { sid: string; from: number } | undefined = { sid: 'mic', from: 0 };
+    serveAppInterrupt(
+      meta,
+      register,
+      attribute,
+      () => track,
+      (request, sid) => loop.onInterrupt(request, sid),
+    );
+    return {
+      register,
+      attribute,
+      track: (sid?: string, from = 0) => {
+        track = sid ? { sid, from } : undefined;
+      },
+      call: async (body: unknown = payload, callerIdentity = META.callerIdentity) =>
+        JSON.parse(
+          await handler({
+            method,
+            requestId: 'req',
+            responseTimeout: 1000,
+            callerIdentity,
+            payload: typeof body === 'string' ? body : JSON.stringify(body),
+          }),
+        ),
+    };
+  }
+
+  it('registers and advertises only on app jev calls', () => {
+    const { loop } = jevLoop({ app: true });
+    const app = rpc(loop);
+    expect(app.register).toHaveBeenCalledWith(method, expect.any(Function));
+    expect(app.attribute).toHaveBeenCalledWith(method, '1', expect.any(String));
+    for (const meta of [
+      META,
+      { ...META, jev: true },
+      { ...META, appCall: true },
+      { ...META, jev: true, appCall: true, meeting: { pauseSends: true } },
+    ]) {
+      const other = rpc(loop, meta);
+      expect(other.register).not.toHaveBeenCalled();
+      expect(other.attribute).not.toHaveBeenCalled();
+    }
+  });
+
+  it('cuts synchronously, reports the phone prefix, and lets VAD finish the same caller turn', async () => {
+    const h = jevLoop({ app: true });
+    const app = rpc(h.loop);
+    h.loop.onReply('r1', 'One two three four five.');
+    h.loop.onReply('r2', 'Queued.');
+    await flush();
+    h.start(h.lines[0]);
+    const reply = app.call();
+    expect(h.lines[0].signal.aborted).toBe(true);
+    expect(await reply).toEqual({ ok: true });
+    h.loop.onSpeech(true, 50);
+    h.loop.onInterim('Wait a moment');
+    h.transcription.results.push(heard('Wait a moment', 'Wait a moment.'));
+    h.loop.onSpeech(false, 500);
+    await flush();
+    expect(h.events.filter((e) => e.type === 'playback' && e.state === 'cut_off')).toEqual([
+      expect.objectContaining({ replyId: 'r2', delivered: '' }),
+      expect.objectContaining({ replyId: 'r1', delivered: 'One' }),
+    ]);
+    expect(h.transcription.begins).toHaveLength(1);
+    expect(h.kinds().filter((k) => k.startsWith('final:'))).toEqual(['final:Wait a moment.']);
+    h.loop.onReply('r3', 'Next reply.');
+    await flush();
+    h.start(h.lines[1]);
+    expect(await app.call()).toEqual({ ok: true });
+    expect(h.lines[1].signal.aborted).toBe(false);
+    h.loop.close();
+  });
+
+  it('refuses unknown and ended calls, other participants and malformed payloads without cutting', async () => {
+    const h = jevLoop({ app: true });
+    const app = rpc(h.loop);
+    expect(await app.call()).toMatchObject({ ok: false, reason: expect.any(String) });
+    h.loop.onReply('r1', 'One two.');
+    await flush();
+    h.start(h.lines[0]);
+    for (const value of [
+      '{',
+      null,
+      { ...payload, cutAtMs: -1 },
+      { ...payload, heard: 1 },
+      { ...payload, playedMs: -1 },
+      { ...payload, playedMs: undefined },
+    ]) {
+      expect(await app.call(value)).toMatchObject({ ok: false, reason: expect.any(String) });
+    }
+    expect(await app.call(payload, 'other')).toMatchObject({ ok: false, reason: expect.any(String) });
+    app.track(undefined);
+    expect(await app.call()).toMatchObject({ ok: false, reason: expect.any(String) });
+    expect(h.lines[0].signal.aborted).toBe(false);
+    h.loop.close();
+    app.track('mic');
+    expect(await app.call()).toMatchObject({ ok: false, reason: expect.any(String) });
+  });
+
+  it('uses worker playout when unknown and keeps phone words when local VAD misses them', async () => {
+    vi.useFakeTimers();
+    const h = jevLoop({ app: true });
+    const app = rpc(h.loop);
+    h.loop.onReply('r1', 'One two three four five.');
+    await vi.advanceTimersByTimeAsync(1);
+    h.start(h.lines[0]);
+    expect(await app.call({ ...payload, playedMs: null })).toEqual({ ok: true });
+    await vi.runAllTimersAsync();
+    expect(h.kinds()).toContain('final:Wait');
+    expect(h.events).toContainEqual(expect.objectContaining({ state: 'cut_off', delivered: 'One two' }));
+    h.loop.close();
+  });
+
+  it('associates a delayed first RPC with the VAD cut after another reply has started', async () => {
+    vi.useFakeTimers();
+    const h = jevLoop({ app: true });
+    const app = rpc(h.loop);
+    h.loop.onReply('r1', 'First reply.');
+    await vi.advanceTimersByTimeAsync(1);
+    h.start(h.lines[0]);
+    h.loop.onSpeech(true, 3200);
+    h.loop.onInterim('Wait');
+    h.transcription.results.push(heard('Wait'));
+    await vi.advanceTimersByTimeAsync(JEV_BARGE_MS + 1);
+    h.loop.onSpeech(false, 9600);
+    h.loop.onReply('r2', 'Next reply.');
+    await vi.advanceTimersByTimeAsync(1);
+    h.start(h.lines[1]);
+    expect(await app.call()).toEqual({ ok: true });
+    expect(h.lines[1].signal.aborted).toBe(false);
+    expect(h.kinds().filter((k) => k.startsWith('final:'))).toEqual(['final:Wait']);
+    h.loop.close();
+  });
+
+  it('acknowledges a server VAD cut once and accepts a fresh mic clock on a replacement track', async () => {
+    vi.useFakeTimers();
+    const h = jevLoop({ app: true });
+    const app = rpc(h.loop);
+    h.loop.onReply('r1', 'One two.');
+    await vi.advanceTimersByTimeAsync(1);
+    h.start(h.lines[0]);
+    h.loop.onSpeech(true, 0);
+    h.loop.onInterim('Wait');
+    await vi.advanceTimersByTimeAsync(JEV_BARGE_MS + 1);
+    expect(h.lines[0].signal.aborted).toBe(true);
+    expect(await app.call()).toEqual({ ok: true });
+    expect(h.kinds().filter((k) => k === 'r1:cut_off')).toHaveLength(1);
+    h.loop.onSpeech(false, 1000);
+    app.track('new-mic', 1000);
+    h.loop.onReply('r2', 'Second reply.');
+    await vi.advanceTimersByTimeAsync(1);
+    h.start(h.lines[1]);
+    expect(await app.call({ ...payload, cutAtMs: 10 })).toEqual({ ok: true });
+    expect(h.lines[1].signal.aborted).toBe(true);
+    h.loop.close();
+  });
+});
 
 describe('jev: the loop', () => {
   it("keeps each utterance's audio from its pre-roll to its end with what it was heard as; a noise too, marked", async () => {
@@ -7520,6 +7689,51 @@ describe('jev calls', () => {
       expect(fs.readdirSync(root)).toEqual([]);
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('clears the speech sink in the app interrupt callback and posts the cut to the host', async () => {
+    const host = fakeHostFetch();
+    const { ctx, job } = fakeJob({ ...JEV_META, appCall: true });
+    const sink = {
+      captureFrame: vi.fn(async () => undefined),
+      queuedDuration: 50,
+      waitForPlayout: vi.fn(() => new Promise<void>(() => {})),
+      clearQueue: vi.fn(),
+    };
+    const v = fakeVoice((meta, settings, events) =>
+      speechOutput({
+        meta,
+        settings,
+        sink,
+        log: silentLog,
+        started: () => events.onAgentSpeaking(true),
+        stopped: () => events.onAgentSpeaking(false),
+        changed: () => undefined,
+        build: () => fakeTts(() => ({ chunks: 3, samples: 2400 })).instance,
+      }),
+    );
+    await runCall(ctx, callDeps(host.fetchImpl, v));
+    try {
+      host.emit({ type: 'reply', replyId: 'first', text: 'One two three.' });
+      await vi.waitFor(() => expect(sink.waitForPlayout).toHaveBeenCalledOnce());
+      const frames = sink.captureFrame.mock.calls.length;
+      expect(v.events.onInterrupt!({ heard: 'Wait', cutAtMs: 100, playedMs: 100 }, { sid: 'mic', from: 0 })).toBe(true);
+      expect(sink.clearQueue).toHaveBeenCalledOnce();
+      await vi.waitFor(() =>
+        expect(jevEvents(host).flat()).toContainEqual(
+          expect.objectContaining({
+            type: 'playback',
+            state: 'cut_off',
+            replyId: 'first',
+            delivered: 'One',
+          }),
+        ),
+      );
+      expect(sink.captureFrame).toHaveBeenCalledTimes(frames);
+    } finally {
+      host.emit({ type: 'end', reason: 'done' });
+      await vi.waitFor(() => expect(job.shutdown).toHaveBeenCalled());
     }
   });
 
