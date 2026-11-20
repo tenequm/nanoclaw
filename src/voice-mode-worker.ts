@@ -4197,22 +4197,48 @@ export function speechOutput(o: SpeechOutputOptions): Pick<
   let closed = false;
   let hold: Promise<void> | undefined;
   let release: (() => void) | undefined;
-  /** The line's last frames sent, newest last, and those a pause took back from the sink to send again. */
-  let recent: Int16Array[] = [];
+  /**
+   * The line's last frames sent as synthesized, newest last, each with the gain it started at, and those a
+   * pause or a duck took back from the sink to send again.
+   */
+  let recent: Array<{ pcm: Int16Array; gain: number }> = [];
   let held: Int16Array[] = [];
   let gain = 1;
   let targetGain = 1;
   let rampSamples = 0;
   let playedText = () => '';
+  /** The capture in flight, and the sending of what a duck took back: one capture at a time keeps the order. */
+  let sending: Promise<void> | undefined;
+  let replaying: Promise<void> | undefined;
+  let replay = () => {};
   const releasePause = () => {
     hold = undefined;
     release?.();
     release = undefined;
   };
   const send = async (frame: Int16Array) => {
-    recent.push(frame);
+    recent.push({ pcm: frame, gain });
     if (recent.length > SPEECH_REPLAY_FRAMES) recent.shift();
-    await o.sink.captureFrame(new AudioFrame(frame, TTS_SAMPLE_RATE, 1, SPEECH_FRAME));
+    let out = frame;
+    if (gain !== 1 || rampSamples) {
+      out = new Int16Array(frame.length);
+      for (let i = 0; i < frame.length; i++) {
+        if (rampSamples > 0) gain += (targetGain - gain) / rampSamples--;
+        out[i] = Math.round(frame[i] * gain);
+      }
+    }
+    sending = o.sink.captureFrame(new AudioFrame(out, TTS_SAMPLE_RATE, 1, SPEECH_FRAME));
+    await sending;
+  };
+  /** What the sink has not played goes back in line, and the gain back to where that audio started. */
+  const takeBack = () => {
+    // Rounded up: the sink's count is an estimate, and a frame heard twice beats one never heard.
+    const unplayed = Math.min(recent.length, Math.ceil(o.sink.queuedDuration / SPEECH_FRAME_MS));
+    if (unplayed <= 0) return;
+    o.sink.clearQueue();
+    const back = recent.splice(recent.length - unplayed);
+    gain = back[0].gain;
+    held = [...back.map((frame) => frame.pcm), ...held];
   };
   /**
    * One line into the speech sink: streamed as it is synthesized, resolved once it has played. `signal`
@@ -4273,11 +4299,29 @@ export function speechOutput(o: SpeechOutputOptions): Pick<
     /** Waits out a pause, then sends again what it took back, so the line goes on at its next unplayed sample. */
     const resumed = async () => {
       for (;;) {
-        while (hold) await hold;
+        while (hold || replaying) await (hold ?? replaying);
         const frame = held.shift();
         if (!frame || lineSignal.aborted) return;
         await send(frame);
       }
+    };
+    // A duck does not wait for the next synthesized chunk: the sink would be silent until then.
+    replay = () => {
+      const prior = replaying;
+      const run: Promise<void> = (async () => {
+        await prior;
+        await sending?.catch(() => undefined);
+        while (!hold && !lineSignal.aborted) {
+          const frame = held.shift();
+          if (!frame) return;
+          await send(frame);
+        }
+      })()
+        .catch(() => undefined)
+        .finally(() => {
+          if (replaying === run) replaying = undefined;
+        });
+      replaying = run;
     };
     /** The sink's playout, again after each pause, until it played out unpaused or the line ended. */
     const drain = async () => {
@@ -4287,7 +4331,7 @@ export function speechOutput(o: SpeechOutputOptions): Pick<
           playout.catch(() => undefined);
           await Promise.race([playout, aborted]);
         } else await playout;
-        if (lineSignal.aborted || (!hold && !held.length)) return;
+        if (lineSignal.aborted || (!hold && !held.length && !replaying)) return;
         await resumed();
       }
     };
@@ -4296,12 +4340,6 @@ export function speechOutput(o: SpeechOutputOptions): Pick<
       await resumed();
       if (lineSignal.aborted) return;
       const frame = filter ? filter(synthesized) : synthesized;
-      if (gain !== 1 || rampSamples) {
-        for (let i = 0; i < frame.length; i++) {
-          if (rampSamples > 0) gain += (targetGain - gain) / rampSamples--;
-          frame[i] = Math.round(frame[i] * gain);
-        }
-      }
       meter.frame(frame);
       if (o.settings.recordReplies) sent.push(frame);
       audioMs += SPEECH_FRAME_MS;
@@ -4369,6 +4407,7 @@ export function speechOutput(o: SpeechOutputOptions): Pick<
       gain = targetGain = 1;
       rampSamples = 0;
       playedText = () => '';
+      replay = () => {};
       recent = [];
       held = [];
       releasePause();
@@ -4397,20 +4436,18 @@ export function speechOutput(o: SpeechOutputOptions): Pick<
     setSpeechDucked(ducked) {
       const target = ducked ? 10 ** (JEV_DUCK_DB / 20) : 1;
       if (closed || target === targetGain) return;
+      // The sink would play its queue at the old gain: the new one starts at the next unplayed sample.
+      takeBack();
       targetGain = target;
       rampSamples = Math.round((TTS_SAMPLE_RATE * (ducked ? JEV_DUCK_ATTACK_MS : JEV_DUCK_RELEASE_MS)) / 1000);
+      if (held.length) replay();
     },
     setSpeechPaused(paused) {
       if (closed || paused === !!hold) return;
       if (paused) {
         hold = new Promise<void>((resolve) => (release = resolve));
-        // The sink would play its queue on through the pause: what it has not played goes back in line.
-        // Rounded up: the sink's count is an estimate, and a frame heard twice beats one never heard.
-        const unplayed = Math.min(recent.length, Math.ceil(o.sink.queuedDuration / SPEECH_FRAME_MS));
-        if (unplayed > 0) {
-          o.sink.clearQueue();
-          held = [...recent.splice(recent.length - unplayed), ...held];
-        }
+        // The sink would play its queue on through the pause.
+        takeBack();
       } else releasePause();
       o.paused?.(paused);
     },
@@ -4492,7 +4529,7 @@ export function voiceAttribute(
   };
 }
 
-async function publishRoomTracks(local: LocalParticipant, log: WorkerLog, jevDuck: boolean) {
+async function publishRoomTracks(local: LocalParticipant, log: WorkerLog) {
   // Keep speech on the wire between lines and allow 64 kbps Opus over the SDK's 48 kbps default.
   const speech = await publishAudioTrack(
     local,
@@ -4504,7 +4541,7 @@ async function publishRoomTracks(local: LocalParticipant, log: WorkerLog, jevDuc
       red: true,
       audioEncoding: { maxBitrate: 64_000n },
     }),
-    jevDuck ? JEV_DUCK_QUEUE_MS : SPEECH_QUEUE_MS,
+    SPEECH_QUEUE_MS,
   );
   // Cues have their own short queue so speech buffering cannot delay them.
   const cue = await publishAudioTrack(
@@ -4943,8 +4980,6 @@ export const JEV_DUCK_DB = -12;
 export const JEV_DUCK_ATTACK_MS = 50;
 // Restore speech gradually so a backchannel does not cause a sudden jump.
 export const JEV_DUCK_RELEASE_MS = 400;
-// Keep only one frame ahead of the gain envelope so a full sink cannot delay ducking by a second.
-const JEV_DUCK_QUEUE_MS = SPEECH_FRAME_MS;
 // Bound the wait from the first overlap request to a local word-list decision.
 export const JEV_OVERLAP_VERDICT_TIMEOUT_MS = 1500;
 /** Quiet this long after a pausing speech, with no words of it, resumes the line (`false_interruption_timeout`). */
@@ -5502,8 +5537,7 @@ export class JevLoop {
 
   close(): void {
     this.closed = true;
-    clearTimeout(this.overlap?.timer);
-    this.overlap = undefined;
+    this.dropOverlap();
     clearTimeout(this.resumeTimer);
     clearTimeout(this.maxPauseTimer);
     clearTimeout(this.appSpeechTimer);
@@ -5545,7 +5579,7 @@ export class JevLoop {
       this.holdSpeech(true);
     }
     if (judging && this.overlap?.utterance !== utt) {
-      clearTimeout(this.overlap?.timer);
+      this.dropOverlap();
       this.overlap = { utterance: utt, pending: new Map() };
       utt.contextOnly = true;
       if (utt.text) {
@@ -5579,8 +5613,15 @@ export class JevLoop {
     clearTimeout(this.resumeTimer);
     clearTimeout(this.maxPauseTimer);
     this.pause = undefined;
-    if (this.overlap && !this.overlap.utterance.text.trim()) this.overlap.utterance.contextOnly = false;
-    clearTimeout(this.overlap?.timer);
+    this.dropOverlap();
+  }
+
+  private dropOverlap(): void {
+    const overlap = this.overlap;
+    if (!overlap) return;
+    // Words that arrive later for a speech never judged are an ordinary turn again.
+    if (!overlap.utterance.text.trim()) overlap.utterance.contextOnly = false;
+    clearTimeout(overlap.timer);
     this.overlap = undefined;
   }
 
@@ -5673,8 +5714,9 @@ export class JevLoop {
       this.cutSpeech(line);
       return;
     }
-    overlap.keepTalking = verdict === 'keep_talking';
-    if (this.deps.setSpeechDucked || (overlap.keepTalking && !this.speaking)) this.resume('backchannel');
+    // A ducked line is restored on anything short of a cut, but only at speech end, so later words are judged.
+    overlap.keepTalking = verdict === 'keep_talking' || !!this.deps.setSpeechDucked;
+    if (overlap.keepTalking && !this.speaking) this.resume('backchannel');
   }
 
   private cutSpeech(line: JevPlayout): void {
@@ -6094,11 +6136,7 @@ let callVoiceNames: VoiceCatalog | undefined;
 export async function publishCallTracks(ctx: CallJob, meta: LiveKitJobMetadata): Promise<PublishedVoiceTracks> {
   const local = ctx.room.localParticipant;
   if (!local) throw new Error('no local participant');
-  const tracks = await publishRoomTracks(
-    local,
-    workerLog(agentsLog().child({ callId: meta.callId })),
-    !!(meta.jev && meta.jevDuck && !meta.meeting),
-  );
+  const tracks = await publishRoomTracks(local, workerLog(agentsLog().child({ callId: meta.callId })));
   return {
     cueSubscribed: tracks.cue?.publication.waitForSubscription(),
     close: tracks.close,

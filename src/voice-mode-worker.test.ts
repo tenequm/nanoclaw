@@ -7109,7 +7109,38 @@ describe('Jev barge-in verdicts', () => {
     await vi.advanceTimersByTimeAsync(1);
     h.loop.onOverlap(request(h).requestId, cut ? 'keep_talking' : 'yield');
     expect(h.lines[0].signal.aborted).toBe(cut);
+    expect(h.setDucked.mock.calls).toEqual(duck ? (cut ? [[true], [false]] : [[true]]) : []);
+    h.transcription.results.push(heard('', words));
+    h.loop.onSpeech(false, 9000);
     expect(h.setDucked.mock.calls).toEqual(duck ? [[true], [false]] : []);
+    h.loop.close();
+  });
+
+  it('keeps judging words after a keep verdict on a ducked line, and restores its gain only at speech end', async () => {
+    const h = await talking();
+    h.loop.onInterim('yeah');
+    h.loop.onOverlap(request(h).requestId, 'keep_talking');
+    expect(h.setDucked.mock.calls).toEqual([[true]]);
+    h.loop.onInterim('yeah but wait');
+    const next = request(h);
+    expect(next.text).toBe('yeah but wait');
+    h.loop.onOverlap(next.requestId, 'yield');
+    expect(h.lines[0].signal.aborted).toBe(true);
+    h.loop.close();
+  });
+
+  it('gives a wordless speech whose final lands after the next speech took the pause to the word list', async () => {
+    const h = await talking(false);
+    h.transcription.hold = true;
+    h.transcription.results.push(heard('', 'Wait.'));
+    h.loop.onSpeech(false, 9000);
+    h.loop.onSpeech(true, 9600);
+    h.transcription.release();
+    await vi.advanceTimersByTimeAsync(1);
+    const final = h.events.find((e) => e.type === 'utterance' && e.final);
+    expect(final).toMatchObject({ text: 'Wait.' });
+    expect(final).not.toHaveProperty('contextOnly');
+    expect(h.lines[0].signal.aborted).toBe(true);
     h.loop.close();
   });
 
@@ -8678,7 +8709,7 @@ describe('jev calls', () => {
 });
 
 describe('jev: an abortable line in the speech output', () => {
-  it('applies both gain ramps to every successive PCM sample and never clears or replays audio', async () => {
+  it('applies both gain ramps to every successive PCM sample and, with nothing queued, never clears or replays audio', async () => {
     const frames: number[] = [];
     const sample = (n: number) => 12000 + (n % 8000);
     const frameSize = 480;
@@ -8716,6 +8747,88 @@ describe('jev: an abortable line in the speech output', () => {
     expect(frames).toEqual(expected);
     expect(sink.clearQueue).not.toHaveBeenCalled();
     expect(result).toMatchObject({ complete: true, cut: false, playedMs: framesInLine * 20 });
+    await output.close();
+  });
+
+  it('takes back what the sink has not played at each gain change and sends it again first, at the new gain', async () => {
+    const frameSize = 480;
+    const framesInLine = 20;
+    const sample = (n: number) => 12000 + (n % 8000);
+    const duckAt = frameSize * 4;
+    const releaseAt = frameSize * 10;
+    const played: number[] = [];
+    let queue: number[][] = [];
+    const sink = {
+      // Three frames stay queued: the oldest plays as each new one comes.
+      captureFrame: async (frame: AudioFrame) => {
+        queue.push([...frame.data]);
+        if (queue.length > 3) played.push(...queue.shift()!);
+        if (played.length === duckAt && sink.clearQueue.mock.calls.length === 0) output.setSpeechDucked(true);
+        if (played.length === releaseAt && sink.clearQueue.mock.calls.length === 1) output.setSpeechDucked(false);
+      },
+      clearQueue: vi.fn(() => void (queue = [])),
+      waitForPlayout: vi.fn(async () => {
+        for (const frame of queue.splice(0)) played.push(...frame);
+      }),
+      get queuedDuration() {
+        return queue.length * 20;
+      },
+    };
+    const output = speechOutput({
+      meta: META,
+      settings: { providerKeys: { gemini: 'gk' } },
+      sink,
+      log: silentLog,
+      started: vi.fn(),
+      stopped: vi.fn(),
+      changed: vi.fn(),
+      build: () => fakeTts(() => ({ chunks: framesInLine, samples: frameSize, value: sample })).instance,
+    });
+    const result = await output.speak('A complete line.', async () => {}, new AbortController().signal);
+    const target = 10 ** (JEV_DUCK_DB / 20);
+    const expected = Array.from({ length: frameSize * framesInLine }, (_, n) => {
+      let gain = 1;
+      if (n >= releaseAt) gain = target + (1 - target) * Math.min(1, (n - releaseAt + 1) / (24 * JEV_DUCK_RELEASE_MS));
+      else if (n >= duckAt) gain = 1 + (target - 1) * Math.min(1, (n - duckAt + 1) / (24 * JEV_DUCK_ATTACK_MS));
+      return Math.round(sample(n) * gain);
+    });
+    expect(played).toEqual(expected);
+    expect(sink.clearQueue).toHaveBeenCalledTimes(2);
+    expect(result).toMatchObject({ complete: true, cut: false, playedMs: framesInLine * 20 });
+    await output.close();
+  });
+
+  it('sends the queued audio again at a duck without waiting for the next synthesized chunk', async () => {
+    let queue: number[][] = [];
+    const sink = {
+      captureFrame: async (frame: AudioFrame) => void queue.push([...frame.data]),
+      clearQueue: vi.fn(() => void (queue = [])),
+      waitForPlayout: vi.fn(async () => void (queue = [])),
+      get queuedDuration() {
+        return queue.length * 20;
+      },
+    };
+    let go!: () => void;
+    const hold = new Promise<void>((resolve) => (go = resolve));
+    const output = speechOutput({
+      meta: META,
+      settings: { providerKeys: { gemini: 'gk' } },
+      sink,
+      log: silentLog,
+      started: vi.fn(),
+      stopped: vi.fn(),
+      changed: vi.fn(),
+      build: () => fakeTts(() => ({ chunks: 2, samples: 4_800, value: () => 10_000, hold })).instance,
+    });
+    const line = output.speak('A complete line.', async () => {}, new AbortController().signal);
+    await vi.waitFor(() => expect(queue).toHaveLength(10));
+    output.setSpeechDucked(true);
+    expect(sink.clearQueue).toHaveBeenCalledOnce();
+    await vi.waitFor(() => expect(queue).toHaveLength(10));
+    expect(queue[0][0]).toBeLessThan(10_000);
+    expect(queue[9].every((v) => v === Math.round(10_000 * 10 ** (JEV_DUCK_DB / 20)))).toBe(true);
+    go();
+    await line;
     await output.close();
   });
 
