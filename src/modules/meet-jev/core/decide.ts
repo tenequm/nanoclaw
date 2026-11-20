@@ -335,10 +335,11 @@ export function beforeMarker(text: string, markers: string[], ownSentence = MARK
   for (;;) {
     const end = rest.replace(/[\s\p{P}]+$/gu, '');
     const marker = markers.find(
-      (word) => word.length && new RegExp(`(?:^|[^\\p{L}\\p{M}\\p{N}_\\p{Pd}])${escapeRegExp(word)}$`, 'iu').test(end),
+      (word) => word.length && new RegExp(`(?:^|[\\s\\p{P}])${escapeRegExp(word)}$`, 'iu').test(end),
     );
     if (!marker) break;
     const before = end.slice(0, -marker.length);
+    if (/[-\u2010\u2011]$/u.test(before)) break;
     if (ownSentence && !/(^|[.!?,;:\u2013\u2014-])\s*$/u.test(before)) break;
     rest = before;
     matched = true;

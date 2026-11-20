@@ -40,7 +40,7 @@ import {
   type ReviewOp,
   type ReviewRequest,
 } from './channels/voice-mode-protocol.js';
-import { turnText, type Heard } from './voice-mode-gemini-live.js';
+import { FINAL_GRACE_MS, turnText, type Heard } from './voice-mode-gemini-live.js';
 import type { ChoiceDetails } from './channels/voice-mode-tts-catalog.js';
 import type { TtsAudio, TtsChoice, TtsInstance } from './voice-mode-tts.js';
 import {
@@ -7785,6 +7785,45 @@ describe('jev calls', () => {
     await vi.waitFor(() => expect(job.shutdown).toHaveBeenCalledWith('host: done'));
     expect(v.voice.close).toHaveBeenCalled();
     expect(host.calls.some((c) => c.url.endsWith('/ended'))).toBe(false);
+  });
+
+  it('closes a stalled listening transcriber at the grace deadline and sends the partial once', async () => {
+    vi.useFakeTimers();
+    const { ctx, job } = fakeJob({ ...JEV_META, appCall: true, overWords: ['over'] });
+    const host = fakeHostFetch();
+    const v = fakeVoice();
+    await runCall(ctx, callDeps(host.fetchImpl, v));
+    await v.rpc('settings', { listenUntilOver: true });
+    v.events.onSpeech(true, 0);
+    v.interim('Last partial');
+    v.transcription.hold = true;
+    host.emit({ type: 'end', reason: 'hangup' });
+    await vi.advanceTimersByTimeAsync(FINAL_GRACE_MS - 1);
+    expect(v.transcription.close).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(v.transcription.close).toHaveBeenCalledTimes(1);
+    expect(
+      jevEvents(host)
+        .flat()
+        .map(summary)
+        .filter((e) => e.startsWith('final:')),
+    ).toEqual(['final:Last partial']);
+    expect(job.shutdown).toHaveBeenCalledWith('host: hangup');
+  });
+
+  it('keeps version 3 settings available when an older host omits release markers', async () => {
+    const meta = { ...JEV_META, appCall: true };
+    expect(callControlAttributes(meta)[CALL_COMMANDS_ATTRIBUTE]).toBe('3');
+    const { ctx } = fakeJob(meta);
+    const host = fakeHostFetch();
+    const v = fakeVoice();
+    await runCall(ctx, callDeps(host.fetchImpl, v));
+    const reply = await v.rpc('settings', { listenUntilOver: true, typing: false });
+    expect(reply.ok).toBe(true);
+    expect(reply).not.toHaveProperty('listenUntilOver');
+    expect(reply).not.toHaveProperty('overWords');
+    expect(jevEvents(host).flat().map(summary)).not.toContain('listen:on');
+    host.endStream();
   });
 
   it.each([true, false])('waits for a final before acknowledging host hangup with listening=%s', async (on) => {

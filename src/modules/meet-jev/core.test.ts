@@ -108,6 +108,10 @@ describe('listen until over', () => {
     return call;
   }
 
+  it('displays default markers in Cyrillic then Latin', () => {
+    expect(parseOverWords()).toEqual(['прийом', 'зулу', 'овер', 'zulu', 'over']);
+  });
+
   it.each(['прийом.', 'Прийом!', 'Zulu', 'зулу?', 'OVER!', 'овер', 'оувер…', 'приём'])(
     'strips a final %s and ignores a marker alone',
     (marker) => {
@@ -167,6 +171,7 @@ describe('listen until over', () => {
     ['hand‐over', null, null],
     ['already over there.', null, null],
     ['say it. Over!', 'say it.', 'say it.'],
+    ['say it\u2014over', 'say it', 'say it'],
     ['tell me, over, over.', 'tell me', 'tell me'],
     ['Over!', '', ''],
   ])('recognizes %s in suffix and own-clause modes', (text, suffix, clause) => {
