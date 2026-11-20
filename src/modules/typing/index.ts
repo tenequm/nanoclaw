@@ -26,7 +26,8 @@
  *
  * After delivering a user-facing message, the refresh is paused for
  * POST_DELIVERY_PAUSE_MS so the client-side indicator can visually
- * clear.
+ * clear. A reply the runner wrote also ends the wake's grace: from then on
+ * typing needs a turn report or heartbeat that says the runner still works.
  *
  * Threadless chats on a thread-only platform (Slack's assistant status
  * paints only inside a thread) get a reaction ack instead: 👀 on the
@@ -46,9 +47,10 @@ import { heartbeatPath } from '../../session-manager.js';
 
 const TYPING_REFRESH_MS = 4000;
 /**
- * Grace window from startTypingRefresh: fire typing unconditionally
- * for this long regardless of turn/heartbeat state. Covers container
- * spawn/wake latency (5–12s on cold start before the first turn report).
+ * Grace window from startTypingRefresh: fire typing unconditionally for this
+ * long regardless of turn/heartbeat state, covering container spawn/wake
+ * latency (5-12s on cold start before the first turn report). The first reply
+ * the runner delivers this wake ends it early.
  */
 const TYPING_GRACE_MS = 15000;
 /**
@@ -83,7 +85,8 @@ const TYPING_CEILING_MS = 5 * 60 * 1000;
  * How long a report left by a previous run keeps plain typing alive before
  * the runner reports this wake (slow cold start). The heartbeat file cannot
  * vouch here: the host removes it at spawn and the runner reports the turn
- * before its first event touches it.
+ * before its first event touches it. Like the grace, the first reply the
+ * runner delivers this wake ends it.
  */
 const LEFTOVER_REPORT_BUDGET_MS = 60_000;
 
@@ -152,6 +155,8 @@ interface TypingTarget {
   interval: NodeJS.Timeout;
   startedAt: number;
   pausedUntil: number; // epoch ms; 0 = not paused
+  /** The runner delivered a reply since the wake: the grace and the leftover budget are over. */
+  replied: boolean;
   /** Start of the current typing stretch: the wake, or the last idle->working transition. */
   typingSince: number;
   /** The ceiling tripped: nothing is painted until the state changes or a new wake. */
@@ -374,6 +379,7 @@ export function startTypingRefresh(
     if (existing.mode === 'reaction' || moved) clearSignal(existing);
     existing.startedAt = Date.now();
     existing.pausedUntil = 0;
+    existing.replied = false;
     existing.typingSince = existing.startedAt;
     existing.capped = false;
     // Keep the stored entry self-consistent: a re-trigger can arrive from
@@ -424,10 +430,8 @@ export function startTypingRefresh(
       log.warn('typing ceiling reached, indicator stopped', { sessionId, ceilingMs: TYPING_CEILING_MS });
     }
 
-    // Within the grace window since the last inbound: fire
-    // unconditionally, covering container spawn/wake latency before the
-    // first turn report lands.
-    if (now - entry.startedAt < TYPING_GRACE_MS) {
+    const wakeBudget = leftover ? LEFTOVER_REPORT_BUDGET_MS : TYPING_GRACE_MS;
+    if (!entry.replied && now - entry.startedAt < wakeBudget) {
       refresh(entry);
       return;
     }
@@ -444,13 +448,7 @@ export function startTypingRefresh(
       return;
     }
 
-    if (leftover && now - entry.startedAt < LEFTOVER_REPORT_BUDGET_MS) {
-      refresh(entry);
-      return;
-    }
-
-    // No turn reported this wake (older runner, or the leftover budget ran
-    // out): fall back to the heartbeat file.
+    // No turn reported this wake: fall back to the heartbeat file.
     if (isHeartbeatFresh(entry.agentGroupId, sessionId)) {
       refresh(entry);
       return;
@@ -471,6 +469,7 @@ export function startTypingRefresh(
     interval,
     startedAt,
     pausedUntil: 0,
+    replied: false,
     typingSince: startedAt,
     capped: false,
   };
@@ -506,12 +505,13 @@ export function notePresence(sessionId: string, report: PresenceReport): void {
  * a user-facing message is delivered so the client-side indicator
  * has a chance to visually clear before the agent's next SDK event
  * pushes it back on. No-op if no refresh is active for this session.
- * (A delivered reply also clears a sticky status on the platform; the
- * first tick after the pause simply sends it again.)
+ * A host-written message (a command reply) says nothing about the runner, so
+ * it leaves the wake's grace running.
  */
-export function pauseTypingRefreshAfterDelivery(sessionId: string): void {
+export function pauseTypingRefreshAfterDelivery(sessionId: string, hostWritten = false): void {
   const entry = typingRefreshers.get(sessionId);
   if (!entry) return;
+  if (!hostWritten) entry.replied = true;
   // The reply IS the answer to the ack, so the reaction comes off now
   // rather than waiting for the turn to end. (The status rendering needs no
   // equivalent: the platform auto-clears it on the post.)
