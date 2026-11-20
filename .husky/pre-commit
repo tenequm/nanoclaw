@@ -3,3 +3,5 @@ pnpm run format:fix
 if [ -n "$staged" ]; then
   echo "$staged" | xargs git add
 fi
+
+bash scripts/leaks.sh

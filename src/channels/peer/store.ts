@@ -222,9 +222,22 @@ export async function revokeMachine(id: string) {
   }
   return Boolean(changed);
 }
+// Each scheme verifies only against its own prefix. amesh 0.1.5 and older sign with device auth's
+// HeyDan-Sig pair: drop it once every enrolled daemon runs a release that sends Amesh-Sig.
+export const PEER_SIGNATURE_SCHEMES = [
+  { scheme: 'Amesh-Sig', prefix: 'AMESH-SIG-V1' },
+  { scheme: 'HeyDan-Sig', prefix: 'HEYDAN-SIG-V1' },
+] as const;
+function parsePeerAuthorization(header: string | undefined) {
+  for (const { scheme, prefix } of PEER_SIGNATURE_SCHEMES) {
+    const fields = parseAuthorization(header, scheme);
+    if (fields) return { ...fields, prefix };
+  }
+  return null;
+}
 export async function verifyPeerRequest(req: IncomingMessage, now = Date.now()) {
   try {
-    const fields = parseAuthorization(req.headers.authorization);
+    const fields = parsePeerAuthorization(req.headers.authorization);
     if (!fields || !req.url?.startsWith('/peer/') || !fields.deviceId.startsWith('pm_'))
       fail(401, 'bad_signature', 'Invalid peer signature.');
     const machine = await getMachine(fields.deviceId);
@@ -240,6 +253,7 @@ export async function verifyPeerRequest(req: IncomingMessage, now = Date.now()) 
         { ...fields, method: req.method ?? '', target: req.url },
         fields.signature,
         machine.public_key,
+        fields.prefix,
       )
     )
       fail(401, 'bad_signature', 'Invalid peer signature.');

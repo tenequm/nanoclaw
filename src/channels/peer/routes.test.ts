@@ -15,7 +15,7 @@ import { canonicalSigningText, bodySHA256 } from '../app/contract.js';
 import { parseCidrs } from '../../modules/device-auth/gate.js';
 import { dispatchPeer } from './index.js';
 import { closeStreams, currentStream, openStream } from './stream.js';
-import { enrollMachine, revokeMachine } from './store.js';
+import { enrollMachine, PEER_SIGNATURE_SCHEMES, revokeMachine } from './store.js';
 import * as env from '../../env.js';
 import { eventHead, sweepPeers } from './lifecycle.js';
 import type {
@@ -60,12 +60,18 @@ const hello: HelloRequest = {
 async function machine(name: string) {
   const keys = generateKeyPairSync('ec', { namedCurve: 'P-256' });
   const id = await enrollMachine(name, keys.publicKey.export({ format: 'der', type: 'spki' }).toString('base64url'));
-  function header(method: string, path: string, body = '', ts = Math.floor(Date.now() / 1000)) {
+  function header(
+    method: string,
+    path: string,
+    body = '',
+    ts = Math.floor(Date.now() / 1000),
+    { scheme, prefix }: { scheme: string; prefix: string } = PEER_SIGNATURE_SCHEMES[0],
+  ) {
     const nonce = randomBytes(16).toString('base64url'),
       bodyHash = bodySHA256(body);
-    const text = canonicalSigningText({ method, target: path, protocol: 1, ts, nonce, bodyHash, deviceId: id });
+    const text = canonicalSigningText({ method, target: path, protocol: 1, ts, nonce, bodyHash, deviceId: id }, prefix);
     const signature = sign('sha256', Buffer.from(text), keys.privateKey).toString('base64url');
-    return ['HeyDan-Sig v=1', 'p=1', 'd=' + id, 't=' + ts, 'n=' + nonce, 'bh=' + bodyHash, 's=' + signature].join(',');
+    return [scheme + ' v=1', 'p=1', 'd=' + id, 't=' + ts, 'n=' + nonce, 'bh=' + bodyHash, 's=' + signature].join(',');
   }
   function call(method: string, path: string, data?: unknown) {
     const body = data === undefined ? undefined : JSON.stringify(data);
@@ -464,6 +470,24 @@ it('keeps the live epoch and log across a lost hello and hub restart, and retrie
   await closeDb();
   await runMigrations(await initDb(join(dir, 'another.db')));
   expect(await getDb().get('SELECT id FROM peer_log')).not.toEqual({ id: first.log });
+});
+
+it('accepts the Amesh-Sig and legacy HeyDan-Sig schemes, each only with its own prefix', async () => {
+  const a = await machine('schemes'),
+    path = '/peer/peers';
+  const signed = async (sig: { scheme: string; prefix: string }) =>
+    fetch(base + path, { headers: { authorization: a.header('GET', path, '', undefined, sig) } });
+  const [amesh, legacy] = PEER_SIGNATURE_SCHEMES;
+  expect((await signed(amesh)).status).toBe(200);
+  expect((await signed(legacy)).status).toBe(200);
+  for (const crossed of [
+    { scheme: amesh.scheme, prefix: legacy.prefix },
+    { scheme: legacy.scheme, prefix: amesh.prefix },
+  ])
+    expect(await (await signed(crossed)).json()).toMatchObject({ error: 'bad_signature' });
+  expect(await (await signed({ scheme: 'Other-Sig', prefix: amesh.prefix })).json()).toMatchObject({
+    error: 'bad_signature',
+  });
 });
 
 it('accepts signatures at both clock boundaries and rejects one second beyond each', async () => {
