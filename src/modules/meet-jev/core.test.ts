@@ -92,7 +92,7 @@ function wakeAndSpeak(call: Call, text: string, answer: string, n: number): stri
   call.feed({ kind: 'turn', key: turn.key, turnId: `t${n}` });
   const replyId = `r${n}`;
   expect(call.feed({ kind: 'reply', replyId, turnId: `t${n}`, text: answer })).toEqual([
-    { kind: 'speak', replyId, text: answer },
+    { kind: 'speak', replyId, turnId: `t${n}`, text: answer },
   ]);
   call.feed({ kind: 'playback', replyId, state: 'started' });
   return replyId;
@@ -533,7 +533,7 @@ describe('replies', () => {
     ]);
     expect(call.lastLog('reply')).toMatchObject({ reason: 'replaced' });
     expect(call.feed({ kind: 'reply', replyId: 'r2', turnId: 't2', text: 'Ten past four.' })).toEqual([
-      { kind: 'speak', replyId: 'r2', text: 'Ten past four.' },
+      { kind: 'speak', replyId: 'r2', turnId: 't2', text: 'Ten past four.' },
     ]);
   });
 
@@ -629,12 +629,85 @@ describe('the window', () => {
 });
 
 describe('a replacement wake', () => {
-  it('revokes an older answer queued but not started, and nothing of it enters the window', () => {
+  const startTwoWakes = () => {
+    const call = new Call();
+    const t = 10_000;
+    const sessionId = 'call-session';
+    const store = (turnId: string, text: string, at: number) => {
+      const [judge] = only(
+        call.feed({ kind: 'utterance', speaker: misha, uttId: turnId, text, final: true, at: at - 100 }),
+        'judge',
+      );
+      const [turn] = only(call.verdict(judge.windowVersion, 'answer'), 'turn');
+      call.feed({ kind: 'turn', key: turn.key, turnId, stored: { sessionId, at }, at });
+    };
+    store('17', 'I have a long journey and I need an alternative route.', t);
+    store('18', 'Які ще є варіанти?', t + 2400);
+    const reply = (replyId: string, text: string, producedAt: number, arrival: number, session = sessionId) =>
+      call.feed({
+        kind: 'reply',
+        replyId,
+        turnId: '17',
+        text,
+        produced: { sessionId: session, at: t + producedAt },
+        at: t + arrival,
+      });
+    return { call, reply };
+  };
+
+  it('speaks the first turn-17 reply for turn 18 and shows the second in the next wake window', () => {
+    const { call, reply } = startTwoWakes();
+    expect(reply('r1', 'Take the train.', 6500, 6500)).toEqual([
+      { kind: 'speak', replyId: 'r1', turnId: '18', text: 'Take the train.' },
+    ]);
+    expect(call.state.wakes.at(-1)?.replied).toBe(true);
+    call.feed(
+      { kind: 'playback', replyId: 'r1', state: 'started' },
+      { kind: 'playback', replyId: 'r1', state: 'completed' },
+    );
+    expect(reply('r2', 'Take the express train.', 23600, 23600)).toEqual([
+      { kind: 'show', replyId: 'r2', text: 'Take the express train.' },
+    ]);
+    expect(call.lastLog('reply')).toMatchObject({ outcome: 'shown', reason: 'replaced' });
+    const [next] = only(call.sayAnswered(misha, 'next', 'How long does it take?'), 'turn');
+    expect(next.note).toContain('Dan (you): Take the train.');
+    expect(next.note).toContain('Dan (you): Take the express train. [shown, not spoken]');
+  });
+
+  it('rechecks a reassigned reply against turn 18 when another speaker has answered', () => {
+    const { call, reply } = startTwoWakes();
+    call.say(olena, 'suggestion', 'There is also a train.');
+    const [check] = only(reply('old-tag', 'Take the train.', 6500, 6500), 'recheck');
+    expect(check.wakeKey).toBe('w2');
+    expect(check.state.trigger.text).toContain('Які ще є варіанти?');
+    expect(check.state.since.map((line) => line.text)).toEqual(['There is also a train.']);
+    expect(call.feed({ kind: 'recheck_verdict', wakeKey: check.wakeKey, verdict: null, ms: 100 })).toEqual([
+      { kind: 'speak', replyId: 'old-tag', text: 'Take the train.', turnId: '18' },
+    ]);
+  });
+
+  it.each([
+    ['a delayed delivery', 2399, 'call-session'],
+    ['an ambiguous timestamp', 2400, 'call-session'],
+    ['a different session', 6500, 'another-session'],
+  ] as const)('keeps %s shown and leaves turn 18 unanswered', (_reason, at, session) => {
+    const { call, reply } = startTwoWakes();
+    expect(reply('old', 'Earlier answer.', at, 6500, session)).toEqual([
+      { kind: 'show', replyId: 'old', text: 'Earlier answer.' },
+    ]);
+    expect(call.lastLog('reply')).toMatchObject({ reason: 'replaced' });
+    expect(call.state.wakes.at(-1)?.replied).toBe(false);
+    expect(toJevState(call.state).facts.agent_last_spoke_s_ago).toBeNull();
+    const [next] = only(call.sayAnswered(misha, 'next', 'Which route is fastest?'), 'turn');
+    expect(next.note).toContain('Dan (you): Earlier answer. [shown, not spoken]');
+  });
+
+  it('revokes an older answer queued but not started, and records it as shown once the worker confirms no audio', () => {
     const call = new Call();
     const [first] = only(call.sayAnswered(misha, 'u1', 'Dan, what day is it?'), 'turn');
     call.feed({ kind: 'turn', key: first.key, turnId: 't1' });
     expect(call.feed({ kind: 'reply', replyId: 'r1', turnId: 't1', text: 'Tuesday.' })).toEqual([
-      { kind: 'speak', replyId: 'r1', text: 'Tuesday.' },
+      { kind: 'speak', replyId: 'r1', turnId: 't1', text: 'Tuesday.' },
     ]);
     const commands = call.sayAnswered(misha, 'u2', 'Dan, actually, what time is it?');
     expect(commands.filter((c) => c.kind === 'revoke' || c.kind === 'turn').map((c) => c.kind)).toEqual([
@@ -649,7 +722,9 @@ describe('a replacement wake', () => {
     // The old line is gone, the agent still works on the new turn: never `idle` here.
     expect(call.statuses.map((s) => s.status)).toEqual(['thinking']);
     const jev = toJevState(call.state);
-    expect(jev.window.some((l) => l.agent)).toBe(false);
+    expect(jev.window.filter((l) => l.agent)).toEqual([
+      expect.objectContaining({ text: 'Tuesday.', shown_only: true }),
+    ]);
     expect(jev.facts).toMatchObject({ agent_speaking: false, pending_answer: true, cut_off_after: null });
   });
 
@@ -851,7 +926,7 @@ describe('continuing a turn before playback', () => {
     expect(only(result, 'turn').map((c) => c.message)).toEqual([merged]);
     call.feed({ kind: 'turn', key: 'w2', turnId: 't2' });
     expect(call.feed({ ...reply, turnId: 't2', replyId: 'r2', text: 'It opens at ten.' })).toEqual([
-      { kind: 'speak', replyId: 'r2', text: 'It opens at ten.' },
+      { kind: 'speak', replyId: 'r2', turnId: 't2', text: 'It opens at ten.' },
     ]);
     expect(call.feed({ kind: 'play_ready', replyId: 'r1', requestId: 'old' })).toEqual([]);
     expect(call.feed({ kind: 'play_ready', replyId: 'r2', requestId: 'new' })).toEqual([
@@ -861,7 +936,10 @@ describe('continuing a turn before playback', () => {
       { kind: 'playback', replyId: 'r2', state: 'started' },
       { kind: 'playback', replyId: 'r2', state: 'completed' },
     );
-    expect(call.state.agentLines.map((l) => l.text)).toEqual(['It opens at ten.']);
+    expect(call.state.agentLines.map((l) => [l.state, l.text])).toEqual([
+      ['shown', reply.text],
+      ['done', 'It opens at ten.'],
+    ]);
   });
 
   it('waits for outstanding finals in either order and drops held speech on stop', () => {
@@ -885,7 +963,9 @@ describe('continuing a turn before playback', () => {
     call.feed({ kind: 'turn', key: 'w1', turnId: 't1' }, { kind: 'speech', speaker, on: true, uttId: 'b' });
     expect(call.feed(reply)).toEqual([]);
     call.feed({ kind: 'speech', speaker, on: false });
-    expect(call.feed(say('b', 'угу', 3000))).toEqual([{ kind: 'speak', replyId: 'r1', text: reply.text }]);
+    expect(call.feed(say('b', 'угу', 3000))).toEqual([
+      { kind: 'speak', replyId: 'r1', turnId: 't1', text: reply.text },
+    ]);
   });
 
   it('keeps a queued reply held after stay_silent and revokes it on a later answer', () => {
@@ -931,7 +1011,7 @@ describe('the answer-ready recheck', () => {
     const [turn] = only(call.sayAnswered(misha, 'u1', 'Dan, what is the capital of Peru?'), 'turn');
     call.feed({ kind: 'turn', key: turn.key, turnId: 't1' });
     expect(call.feed({ kind: 'reply', replyId: 'r1', turnId: 't1', text: 'Lima.' })).toEqual([
-      { kind: 'speak', replyId: 'r1', text: 'Lima.' },
+      { kind: 'speak', replyId: 'r1', turnId: 't1', text: 'Lima.' },
     ]);
   });
 
@@ -959,7 +1039,9 @@ describe('the answer-ready recheck', () => {
   it('speaks unless the show is over its thresholds', () => {
     const call = new Call('meet');
     answeredMeanwhile(call, 'Hmm, good question.');
-    expect(recheckVerdict(call, 'show', 0.74, 0.9)).toEqual([{ kind: 'speak', replyId: 'r1', text: 'Lima.' }]);
+    expect(recheckVerdict(call, 'show', 0.74, 0.9)).toEqual([
+      { kind: 'speak', replyId: 'r1', turnId: 't1', text: 'Lima.' },
+    ]);
     expect(call.lastLog('recheck')).toMatchObject({ outcome: 'spoken' });
   });
 
@@ -972,7 +1054,7 @@ describe('the answer-ready recheck', () => {
   it('a failed Jev call speaks: the answer was wanted a moment ago', () => {
     const call = new Call('meet');
     answeredMeanwhile(call);
-    expect(recheckVerdict(call, null)).toEqual([{ kind: 'speak', replyId: 'r1', text: 'Lima.' }]);
+    expect(recheckVerdict(call, null)).toEqual([{ kind: 'speak', replyId: 'r1', turnId: 't1', text: 'Lima.' }]);
     expect(call.lastLog('recheck')).toMatchObject({ jev: null, outcome: 'spoken', reason: 'jev_failed' });
   });
 
@@ -1017,12 +1099,12 @@ describe('the answer-ready recheck', () => {
     answeredMeanwhile(call);
     expect(call.feed({ kind: 'reply', replyId: 'r2', turnId: 't1', text: 'In Peru.' })).toEqual([]);
     expect(recheckVerdict(call, 'speak')).toEqual([
-      { kind: 'speak', replyId: 'r1', text: 'Lima.' },
-      { kind: 'speak', replyId: 'r2', text: 'In Peru.' },
+      { kind: 'speak', replyId: 'r1', turnId: 't1', text: 'Lima.' },
+      { kind: 'speak', replyId: 'r2', turnId: 't1', text: 'In Peru.' },
     ]);
     // Nobody spoke since the check: no second Jev call.
     expect(call.feed({ kind: 'reply', replyId: 'r3', turnId: 't1', text: 'On the coast.' })).toEqual([
-      { kind: 'speak', replyId: 'r3', text: 'On the coast.' },
+      { kind: 'speak', replyId: 'r3', turnId: 't1', text: 'On the coast.' },
     ]);
   });
 });

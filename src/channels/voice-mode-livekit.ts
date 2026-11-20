@@ -83,7 +83,13 @@ import { registerPostDeliveryHook, setOutboundPresentation, type OutboundAddress
 import { log } from '../log.js';
 import { platformMessageId } from '../platform-id.js';
 import { registerTypingObserver } from '../modules/typing/index.js';
-import { createJevCall, type JevCall, type JevDeps, type JevTurnResult } from '../modules/meet-jev/index.js';
+import {
+  createJevCall,
+  type JevCall,
+  type JevDeps,
+  type JevTurnResult,
+  type SessionStamp,
+} from '../modules/meet-jev/index.js';
 import type { MessagingGroup } from '../types.js';
 import { TTS_DEFAULT_CHOICE } from '../voice-mode-tts.js';
 
@@ -400,6 +406,7 @@ interface TurnOutcome {
   body: string;
   /** On a 202: the host's utterance id for the turn. */
   id?: string;
+  stored?: SessionStamp;
 }
 
 export interface LiveKitVoice {
@@ -428,6 +435,7 @@ export interface LiveKitVoice {
     agentGroupId: string,
     text: string,
     replyTo?: { callId: string; utteranceId: string } | null,
+    produced?: SessionStamp,
   ): void;
   /** Whether `chatMessage` with the same arguments would speak it on a live call right now; changes nothing. */
   speaksChat(chat: ChatAddress, agentGroupId: string, replyTo: { callId: string; utteranceId: string } | null): boolean;
@@ -505,14 +513,16 @@ function chatTarget(
 
 /** Delivery tap: an agent message reached a chat; a live call talking there speaks it. */
 export function liveKitChatDelivered(
-  msg: ChatMessageAddress & { id: string; kind: string; content: string },
+  msg: ChatMessageAddress & { id: string; kind: string; content: string; timestamp?: string },
   agentGroupId: string,
+  sessionId?: string,
 ): void {
   if (engines.size === 0) return;
   const text = spokenText(msg);
   const target = text ? chatTarget(msg, agentGroupId) : null;
   if (!text || !target) return;
-  for (const engine of engines) engine.chatMessage(target.chat, agentGroupId, text, target.replyTo);
+  const produced = sessionId && msg.timestamp ? { sessionId, at: Date.parse(msg.timestamp) } : undefined;
+  for (const engine of engines) engine.chatMessage(target.chat, agentGroupId, text, target.replyTo, produced);
 }
 
 export const CALLER_MARK = '\u{1F399} ';
@@ -546,7 +556,7 @@ export function liveKitChatTyping(chat: ChatAddress, agentGroupId: string, worki
   for (const engine of engines) engine.chatTyping(chat, agentGroupId, working);
 }
 
-registerPostDeliveryHook((msg, session) => liveKitChatDelivered(msg, session.agent_group_id));
+registerPostDeliveryHook((msg, session) => liveKitChatDelivered(msg, session.agent_group_id, session.id));
 setOutboundPresentation((msg, content, session) => liveKitChatPresentation(msg, content, session.agent_group_id));
 registerTypingObserver(({ agentGroupId, working, ...chat }) => liveKitChatTyping(chat, agentGroupId, working));
 
@@ -1199,7 +1209,17 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
         isMention: true,
         isGroup: chat.group.is_group !== 0,
       };
-      routed = host.routeTurn({ ...turnRoute(call, chat), message }, { callerId: sender.id, chat: chat.group });
+      // A session can answer while the router is still finishing its wake and fan-out.
+      let onStored: InboundEvent['onStored'];
+      const committed =
+        jev &&
+        new Promise<SessionStamp>((resolve) => {
+          onStored = (session) => resolve({ sessionId: session.id, at: host.now() });
+        });
+      routed = host.routeTurn(
+        { ...turnRoute(call, chat), message, onStored },
+        { callerId: sender.id, chat: chat.group },
+      );
       // Shown once the agent has it, even when that comes after the worker was told it timed out.
       void routed.then(
         (stored) => {
@@ -1211,9 +1231,10 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
       const fields = { callId: call.callId, utteranceId };
       try {
         const budgetMs = Math.max(0, routeTimeoutMs - (host.now() - receivedAt));
-        const stored = jev
-          ? await untilAborted(routed, jev.signal)
-          : await settleWithin(routed, budgetMs, 'timeout' as const);
+        const stored =
+          jev && committed
+            ? await untilAborted(Promise.race([committed, routed]), jev.signal)
+            : await settleWithin(routed, budgetMs, 'timeout' as const);
         if (stored === 'aborted') return { status: 409, body: 'The turn was superseded' };
         if (stored === 'timeout') {
           log.warn('livekit-voice-mode: a turn did not reach the agent in time', fields);
@@ -1234,7 +1255,12 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
           log.warn('livekit-voice-mode: the router did not hand a turn to the agent', fields);
           return { status: 422, body: 'The agent did not take the turn' };
         }
-        return { status: 202, body: JSON.stringify({ id: utteranceId }), id: utteranceId };
+        return {
+          status: 202,
+          body: JSON.stringify({ id: utteranceId }),
+          id: utteranceId,
+          stored: typeof stored === 'object' ? stored : undefined,
+        };
       } catch {
         return { status: 500, body: 'Routing the turn failed' };
       }
@@ -1255,7 +1281,9 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     const admitted = admitTurn(call);
     if (!admitted.ok) return { ok: false, reason: admitted.body };
     const outcome = await takeTurn(call, message, admitted.t, undefined, { note, signal });
-    return outcome.id ? { ok: true, turnId: outcome.id } : { ok: false, reason: `${outcome.status}: ${outcome.body}` };
+    return outcome.id
+      ? { ok: true, turnId: outcome.id, stored: outcome.stored }
+      : { ok: false, reason: `${outcome.status}: ${outcome.body}` };
   };
 
   const openJev = (call: LiveKitCall, kind: 'voice' | 'meet'): JevCall =>
@@ -1373,14 +1401,14 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
       return call && !call.ended && call.state === 'live' ? call.jev : undefined;
     },
 
-    chatMessage(chat, agentGroupId, text, replyTo) {
+    chatMessage(chat, agentGroupId, text, replyTo, produced) {
       for (const call of calls.values()) {
         const at = speechChat(call, chat, agentGroupId, replyTo ?? null);
         if (!at) continue;
         if (at === 'previous' && call.previousChat) call.previousChat.active = true;
-        // The loop decides whether it is spoken; its own lines enter its window from playback reports.
+        // The loop owns the decision and records how the caller received the line.
         if (call.jev) {
-          call.jev.reply(text, replyTo ? replyTo.utteranceId : null);
+          call.jev.reply(text, replyTo ? replyTo.utteranceId : null, produced);
           continue;
         }
         push(call, { type: 'reply', text, turn: replyTo ? replyTo.utteranceId : null });

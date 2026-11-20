@@ -3,7 +3,16 @@
  * the bookkeeping the decisions need (wakes, replies in playout, the stop mark), and the
  * renderings of it for Jev (`toJevState`) and for the agent's turn note (`renderWindow`).
  */
-import type { CallEvent, CallPolicy, Command, JevLine, JevState, RecheckAction, RecheckState } from './types.js';
+import type {
+  CallEvent,
+  CallPolicy,
+  Command,
+  JevLine,
+  JevState,
+  RecheckAction,
+  RecheckState,
+  SessionStamp,
+} from './types.js';
 
 export interface Utterance {
   speakerId: string;
@@ -14,11 +23,11 @@ export interface Utterance {
   at: number;
 }
 
-/** A line the agent got out, from playback reports only. */
+/** An agent line and how the caller received it. */
 export interface AgentLine {
   replyId: string;
   text: string;
-  state: 'playing' | 'done' | 'cut_off';
+  state: 'playing' | 'done' | 'cut_off' | 'shown';
   at: number;
 }
 
@@ -63,6 +72,7 @@ export interface Wake {
   seq: number;
   at: number;
   turnId: string | null;
+  stored?: SessionStamp;
   /** Refused, or replaced before delivery: no answer will come. */
   dropped: boolean;
   replied: boolean;
@@ -190,7 +200,10 @@ export function openTurn(state: CallState, speakerId: string): Utterance[] {
   if (!current) return [];
   const pieces = [current];
   if (humansInRoom(state) > 1) return pieces;
-  const closedAt = Math.max(state.speakers[speakerId]?.closedAt ?? 0, ...state.agentLines.map((line) => line.at));
+  const closedAt = Math.max(
+    state.speakers[speakerId]?.closedAt ?? 0,
+    ...state.agentLines.filter((line) => line.state !== 'shown').map((line) => line.at),
+  );
   const earlier = state.utterances
     .filter((u) => u.speakerId === speakerId && u.startedAt < current.startedAt && hasWords(u.text))
     .sort((a, b) => b.startedAt - a.startedAt);
@@ -350,6 +363,7 @@ export function applyWindow(state: CallState, event: CallEvent): void {
       // Failed, or dropped before it started (a stop, a revoke): nothing got out.
       if (event.state === 'failed' || (!line && !delivered)) {
         state.agentLines = state.agentLines.filter((l) => l.replyId !== event.replyId);
+        if (!line) recordShown(state, event.replyId, playing.text);
         break;
       }
       if (line) Object.assign(line, { text: delivered, state: event.state === 'cut_off' ? 'cut_off' : 'done' });
@@ -395,6 +409,11 @@ function touchSpeaker(state: CallState, id: string, name: string): SpeakerState 
   return speaker;
 }
 
+export function recordShown(state: CallState, replyId: string, text: string): void {
+  state.agentLines.push({ replyId, text, state: 'shown', at: state.now });
+  trim(state);
+}
+
 const utf8 = new TextEncoder();
 
 /** Keep `windowMs` of history and at most `windowBytes` of text, dropping the oldest lines first. */
@@ -427,6 +446,7 @@ interface Line {
   speaker: string;
   text: string;
   agent?: true;
+  shown_only?: true;
   cut_off?: true;
   partial?: true;
 }
@@ -448,6 +468,7 @@ function lines(state: CallState): Line[] {
       speaker: state.policy.agentName,
       text: l.text,
       agent: true as const,
+      ...(l.state === 'shown' ? { shown_only: true as const } : {}),
       ...(l.state === 'cut_off' ? { cut_off: true as const } : {}),
       ...(l.state === 'playing' ? { partial: true as const } : {}),
     })),
@@ -608,7 +629,13 @@ export function renderWindow(state: CallState): string {
   return lines(state)
     .map((line) => {
       const who = line.agent ? `${line.speaker} (you)` : line.speaker;
-      const mark = line.cut_off ? ' [cut off here]' : line.partial ? ' [still speaking]' : '';
+      const mark = line.shown_only
+        ? ' [shown, not spoken]'
+        : line.cut_off
+          ? ' [cut off here]'
+          : line.partial
+            ? ' [still speaking]'
+            : '';
       return `${who}: ${line.text}${mark}`;
     })
     .join('\n');

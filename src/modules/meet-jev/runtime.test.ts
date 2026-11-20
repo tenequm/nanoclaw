@@ -84,7 +84,9 @@ describe('createCallRuntime', () => {
     const order: string[] = [];
     const core = scriptedCore((event) => {
       order.push(`decide:${event.kind === 'utterance' ? event.text : event.kind}`);
-      return event.kind === 'utterance' && event.text === 'a' ? [{ kind: 'speak', replyId: 'r1', text: 'x' }] : [];
+      return event.kind === 'utterance' && event.text === 'a'
+        ? [{ kind: 'speak', replyId: 'r1', turnId: 't1', text: 'x' }]
+        : [];
     });
     const runtime = createCallRuntime(core, POLICY, {
       ...fakePorts().ports,
@@ -104,7 +106,7 @@ describe('createCallRuntime', () => {
   it('runs speak, show, drop, stop and log commands through their ports and records every event', () => {
     const { ports, calls } = fakePorts();
     const core = scriptedCore(() => [
-      { kind: 'speak', replyId: 'r1', text: 'hi' },
+      { kind: 'speak', replyId: 'r1', turnId: 't1', text: 'hi' },
       { kind: 'show', replyId: 'r2', text: 'later' },
       { kind: 'drop', replyId: 'r3' },
       { kind: 'stop_playback' },
@@ -265,7 +267,7 @@ describe('createCallRuntime', () => {
     });
     const core = scriptedCore((event) => {
       if (event.kind === 'utterance' && event.text === 'bad') throw new Error('bug');
-      return [{ kind: 'speak', replyId: 'r', text: 't' }, { kind: 'stop_playback' }];
+      return [{ kind: 'speak', replyId: 'r', turnId: 't1', text: 't' }, { kind: 'stop_playback' }];
     });
     const runtime = createCallRuntime(core, POLICY, ports);
     runtime.feed(utt('bad'));

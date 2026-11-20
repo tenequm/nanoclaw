@@ -19,16 +19,15 @@ import { DataPacket_Kind, RoomServiceClient } from 'livekit-server-sdk';
 import type { LiveKitHostEvent } from '../../channels/voice-mode-protocol.js';
 import { log } from '../../log.js';
 import { callCore } from './core/index.js';
-import type { CallCore, CallEvent, CallKind } from './core/types.js';
+import type { CallCore, CallEvent, CallKind, SessionStamp } from './core/types.js';
 import { createWorkerIngress } from './ingress/worker.js';
 import { askAction, askStillWanted, judgeQuestions } from './judge.js';
 import { policyFor } from './policy.js';
 import { createCallRuntime, type CallRuntime, type JevTurnResult } from './runtime.js';
 
+export type { SessionStamp } from './core/types.js';
 export type { JevTurnResult } from './runtime.js';
 
-/** Replies a call remembers the turn of, for the `reply` push that speaks one. */
-const MAX_REMEMBERED_REPLIES = 64;
 /**
  * Jev requests (judges and answer-ready rechecks) one call may make per rolling minute; past it a judge is a
  * null verdict (silence, or a wake on a vocative) and a recheck speaks unchecked.
@@ -71,7 +70,7 @@ export interface JevCall {
   /** A participant's words arrived: while the agent's line plays, the worker's reflex hears of it. */
   words(): void;
   /** An agent message for this call: `turnId` is the turn it answers, null when unprompted. */
-  reply(text: string, turnId: string | null): void;
+  reply(text: string, turnId: string | null, produced?: SessionStamp): void;
   end(reason: string): void;
 }
 
@@ -82,7 +81,6 @@ export function createJevCall(host: JevCallHost, deps: Partial<JevDeps> = {}): J
   const kind = host.kind ?? 'voice';
   const policy = policyFor(kind, host.agentName, [...host.agentAliases]);
   const ingress = createWorkerIngress({ name: host.callerName }, host.maxTextBytes);
-  const replyTurns = new Map<string, string | null>();
   let replies = 0;
   const fields = { callId: host.callId };
   log.info('meet-jev: questions', { ...fields, questions: judgeQuestions(host.agentName) });
@@ -166,8 +164,7 @@ export function createJevCall(host: JevCallHost, deps: Partial<JevDeps> = {}): J
       return { verdict: null, ms: 0 };
     },
     turn: ({ message, note }, signal) => host.submitTurn(message, note, signal),
-    speak: (replyId, text) => {
-      const turn = replyTurns.get(replyId) ?? null;
+    speak: (replyId, text, turn) => {
       host.push({ type: 'reply', text, turn, replyId });
     },
     allowPlay: (replyId, requestId) => host.push({ type: 'allow_play', replyId, requestId }),
@@ -215,14 +212,8 @@ export function createJevCall(host: JevCallHost, deps: Partial<JevDeps> = {}): J
     words() {
       if (playing.size > 0 && !runtime.ended) host.push({ type: 'words' });
     },
-    reply(text, turnId) {
-      const replyId = `r${++replies}`;
-      replyTurns.set(replyId, turnId);
-      for (const key of replyTurns.keys()) {
-        if (replyTurns.size <= MAX_REMEMBERED_REPLIES) break;
-        replyTurns.delete(key);
-      }
-      runtime.feed({ kind: 'reply', replyId, turnId, text, at: host.now() });
+    reply(text, turnId, produced) {
+      runtime.feed({ kind: 'reply', replyId: `r${++replies}`, turnId, text, produced, at: host.now() });
     },
     end: (reason) => runtime.end(reason),
   };

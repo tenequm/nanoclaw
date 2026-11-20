@@ -322,6 +322,14 @@ it for the next boundary, and a stop drops it. An acknowledgement alone keeps
 the original answer. Before its first audio, each queued line waits for the
 host to confirm it can play. Fresh caller speech invalidates that confirmation.
 
+An agent processing two wakes in the same session can answer both under the
+earlier turn's tag. If its reply was written after the session stored the
+latest wake, that first reply answers the still-open request and goes through
+the usual speech check. Once the latest wake has an answer, further replies
+tagged to the older turn stay in chat. An earlier reply delayed in chat
+delivery stays there too. The agent's call window labels chat-only replies
+`[shown, not spoken]`.
+
 With one human in the room (a jev voice call, or a meeting down to one
 person) the loop answers more readily, by the `oneCaller` block in
 `src/modules/meet-jev/policy.ts`. Jev gets the one-person policy paragraph.
