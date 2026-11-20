@@ -269,8 +269,8 @@ export interface CallDraft {
  * turn now, a discard phrase there drops it, and with the wake switch `on` nothing is kept or sent until `hey <agent>`, or the
  * worker's acoustic wake word (`CallWakeState.phrase`), is heard (`waiting` until then). After the
  * wake phrase only a spoken send sends, unless `pauseSends` lets the closing silence send too. The
- * worker's participant attribute is CALL_COMMANDS_VERSION when it understands them and the
- * `settings` RPC; a page offers the commands only for the values it knows. The worker starts
+ * worker advertises CALL_COMMANDS_VERSION for the `settings` RPC. App Jev calls also accept settings
+ * but leave CALL_COMMAND_WORDS_ATTRIBUTE empty since the host directs their turns. A plain worker starts
  * wake-gated until a client's `settings` say otherwise, so a page that does not know its value sends
  * none and leaves it waiting for words the page never names: reload the page with the worker.
  */
