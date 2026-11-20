@@ -152,12 +152,12 @@ it('renames an open endpoint on live streams and reconnect while preserving queu
     dispatch({ id: 'test', command, args: { id, address } }, { caller: 'host' });
   expect(await mesh('mesh-add', remote)).toMatchObject({
     ok: false,
-    error: { message: expect.stringContaining('already in use') },
+    error: { message: expect.stringContaining('Invalid mesh address') },
   });
   expect(await mesh('mesh-add', 'lead')).toMatchObject({ ok: true });
   expect(await mesh('mesh-update', remote)).toMatchObject({
     ok: false,
-    error: { message: expect.stringContaining('already in use') },
+    error: { message: expect.stringContaining('Invalid mesh address') },
   });
   const send = async (to: SendRequest['to']) => {
     const response = await sender.call('POST', '/peer/messages', sender.send(to));

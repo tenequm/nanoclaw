@@ -299,19 +299,11 @@ async function writeMemberAddress(agentId: string, operation: 'add' | 'update', 
   if (operation === 'add' && agent.address !== null && requested === undefined) return;
 
   const input = requested ?? label(agent.name);
-  const valid = /^[a-z0-9][a-z0-9._-]{0,39}$/i.test(input);
-  const address = valid ? label(input) : input.toLowerCase();
-  if (
-    await db.get(
-      `SELECT 1 FROM mesh_members WHERE address=? AND agent_group_id<>?
-       UNION ALL SELECT 1 FROM peer_sessions WHERE address=? AND status<>'ended' LIMIT 1`,
-      address,
-      agentId,
-      address,
-    )
-  )
+  if (!/^[a-z0-9][a-z0-9._-]{0,39}$/i.test(input))
+    fail(400, 'bad_address', 'Invalid mesh address. Use a peer label of up to 40 characters.');
+  const address = label(input);
+  if (await db.get('SELECT 1 FROM mesh_members WHERE address=? AND agent_group_id<>?', address, agentId))
     fail(409, 'ambiguous', 'Mesh address is already in use.');
-  if (!valid) fail(400, 'bad_address', 'Invalid mesh address. Use a peer label of up to 40 characters.');
   if (agent.address === address) return;
   if (agent.address === null) {
     await db.run('INSERT INTO mesh_members(agent_group_id,address) VALUES (?,?)', agentId, address);
