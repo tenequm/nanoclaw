@@ -1321,6 +1321,8 @@ export interface CallVoiceEvents {
   onSpeech(speaking: boolean, at: number): void;
   /** The VAD analyzed the audio through stream position `at`, its last window with speech ending at `quietFrom`. */
   onVad(at: number, quietFrom: number): void;
+  /** Each VAD window's speech probability, the window ending at stream position `at`. */
+  onVadWindow?(at: number, probability: number): void;
   /** The agent's audio started or stopped playing. */
   onAgentSpeaking(speaking: boolean): void;
   onClosed(reason: string): void;
@@ -4037,6 +4039,7 @@ export class Outbox {
 const VAD_ACTIVATION = 0.5;
 /** Silero's window at 16 kHz: audio short of a whole one waits for the next frames before it is analyzed. */
 const VAD_WINDOW = 512;
+const VAD_WINDOW_MS = (VAD_WINDOW * 1000) / INPUT_SAMPLE_RATE;
 
 /** A VAD stream as CallerInput uses it: Silero's, or a test's. */
 export interface VadStream extends AsyncIterable<{
@@ -4063,7 +4066,7 @@ export class CallerInput {
 
   constructor(
     private readonly newVad: () => VadStream,
-    private readonly events: Pick<CallVoiceEvents, 'onAudio' | 'onSpeech' | 'onVad' | 'onClosed'>,
+    private readonly events: Pick<CallVoiceEvents, 'onAudio' | 'onSpeech' | 'onVad' | 'onVadWindow' | 'onClosed'>,
     private readonly log: Pick<Console, 'error'>,
   ) {}
 
@@ -4113,6 +4116,7 @@ export class CallerInput {
           const at = vad.from + ev.samplesIndex;
           if ((ev.probability ?? 0) > VAD_ACTIVATION) vad.quietFrom = at;
           this.events.onVad(at, vad.quietFrom);
+          this.events.onVadWindow?.(at, ev.probability ?? 0);
         } else if (ev.type === VADEventType.START_OF_SPEECH) {
           vad.speaking = true;
           this.events.onSpeech(true, vad.from + ev.samplesIndex - samplesOf(ev.speechDuration));
@@ -4982,6 +4986,72 @@ export const JEV_DUCK_ATTACK_MS = 50;
 export const JEV_DUCK_RELEASE_MS = 400;
 // Bound the wait from the first overlap request to a local word-list decision.
 export const JEV_OVERLAP_VERDICT_TIMEOUT_MS = 1500;
+/** Silero's window probability that counts as evidence of real speech: STT phantoms on noise stayed under it. */
+export const JEV_EVIDENCE_P = 0.95;
+/** Evidence windows a whole segment needs to be the caller's words: every real one had 6 or more, word-producing noise 0. */
+export const JEV_SPEECH_EVIDENCE_WINDOWS = 3;
+/** Evidence windows a partial needs to cut or ask Jev: wordless noise reached 3, the shortest real first partial 6. */
+export const JEV_BARGE_EVIDENCE_WINDOWS = 4;
+/** Evidence windows a known STT phantom (the whole text) needs, and a partial needs to be shown or sent at all. */
+export const JEV_PHANTOM_EVIDENCE_WINDOWS = 10;
+/** What speech recognition writes on noise and silence, matched against the whole normalized text only. */
+export const JEV_PHANTOM_PHRASES: ReadonlySet<string> = new Set([
+  'you are welcome',
+  'youre welcome',
+  'you re welcome',
+  'thanks for watching',
+  'thank you for watching',
+  'thanks for watching bye',
+  'subtitles by',
+  'дякую за перегляд',
+  'продолжение следует',
+  'спасибо за просмотр',
+  'субтитры',
+  'okay',
+  'ok',
+  'bye',
+  'bye bye',
+  'thank you',
+  'thank you very much',
+  'thanks',
+  'you',
+  'дякую',
+  'спасибо',
+]);
+/** How far back the VAD's windows are kept: the transcription's pre-roll counts toward a segment's evidence. */
+const JEV_VAD_HISTORY_MS = PRE_ROLL_MS + 200;
+
+/** Silero's evidence of real speech in one caller segment, pre-roll included. */
+export interface SpeechEvidence {
+  /** Windows at or over JEV_EVIDENCE_P. */
+  strong: number;
+  peak: number;
+  /** Windows over Silero's activation, each one VAD window long. */
+  voiced: number;
+}
+
+const evidenceOf = (utterance: { evidence?: SpeechEvidence }): SpeechEvidence =>
+  (utterance.evidence ??= { strong: 0, peak: 0, voiced: 0 });
+
+/** A whole text that is one of JEV_PHANTOM_PHRASES, ignoring case, punctuation and a trailing "subtitles by ..." credit. */
+export function isSttPhantom(text: string): boolean {
+  const words = text
+    .toLowerCase()
+    .replace(/[\u2019']/g, '')
+    .match(/[\p{L}\p{N}]+/gu);
+  if (!words) return false;
+  const whole = words.join(' ');
+  return JEV_PHANTOM_PHRASES.has(whole) || whole.startsWith('subtitles by ') || whole.startsWith('субтитры ');
+}
+
+/**
+ * Whether a caller segment's words are real speech by Silero's evidence: `windows` at or over JEV_EVIDENCE_P
+ * against `need`, and against JEV_PHANTOM_EVIDENCE_WINDOWS when the whole text is a known STT phantom.
+ */
+export function heardAsSpeech(text: string, windows: number, need = JEV_SPEECH_EVIDENCE_WINDOWS): boolean {
+  return windows >= (isSttPhantom(text) ? Math.max(need, JEV_PHANTOM_EVIDENCE_WINDOWS) : need);
+}
+
 /** Quiet this long after a pausing speech, with no words of it, resumes the line (`false_interruption_timeout`). */
 export const JEV_FALSE_INTERRUPTION_TIMEOUT_MS = 2_000;
 /**
@@ -5189,6 +5259,8 @@ export interface JevLoopDeps {
   setSpeechPaused(paused: boolean): void;
   setSpeechDucked?(ducked: boolean): void;
   overlapPlayedText?(): string;
+  /** The VAD's windows reach `onVadWindow`: the caller's words need Silero's evidence of real speech. */
+  speechEvidence?: boolean;
   /** One event for the host, in order. */
   report(event: JevWorkerEvent): void;
   /** The caller's caption for the utterance numbered `segment`. */
@@ -5207,6 +5279,11 @@ interface JevUtterance {
   keptText?: string;
   /** Cut for these words: the pump releases them once the line's cut is reported. */
   releasing?: boolean;
+  evidence?: SpeechEvidence;
+  /** Its latest partial went to the host and the captions (it had the evidence). */
+  shown?: boolean;
+  /** Its final had no evidence of real speech: never a turn, a caption or a cut. */
+  noise?: boolean;
   phoneWords?: string;
   needsPhoneFinal?: boolean;
   uttId: string;
@@ -5270,7 +5347,11 @@ export class JevLoop {
     askedAt?: number;
     /** The last decision short of a cut: for which words, and whether it lets the line go on. */
     kept?: { text: string; keepTalking: boolean };
+    /** Words held back from Jev until they have the evidence of real speech. */
+    blocked?: string;
   };
+  /** The VAD's recent windows, for a new speech's pre-roll evidence. */
+  private readonly vadWindows: Array<{ at: number; p: number }> = [];
   private resumeTimer?: ReturnType<typeof setTimeout>;
   private maxPauseTimer?: ReturnType<typeof setTimeout>;
   /** This speech's pause ran out at JEV_MAX_PAUSE_MS: it does not pause the line again. */
@@ -5322,6 +5403,11 @@ export class JevLoop {
         this.capture?.start(preRoll);
         // The next activity's socket, set up while this one runs: no connect latency at the next speech.
         void transcriber.prepare();
+
+        // The pre-roll's windows count toward the speech's evidence, as its audio goes to the transcription.
+        const opened = this.utterance;
+        const from = Math.max(preRollFloor, at - samplesOf(PRE_ROLL_MS));
+        if (opened) for (const w of this.vadWindows) if (w.at > from) this.countWindow(opened, w.p);
       }
       if (this.pause && this.deps.overlapPlayedText) this.reflex();
       clearTimeout(this.bargeTimer);
@@ -5368,6 +5454,11 @@ export class JevLoop {
           }
           return;
         }
+        if (!this.heardSpeech(utterance, text || utterance.text)) {
+          if (audio) this.deps.recorded?.(utterance.segment, audio, text || utterance.text, 'noise');
+          this.ignoreNoise(utterance, text || utterance.text);
+          return;
+        }
         // Recorded even when the call ended first: the last words before a hang-up are worth keeping.
         if (audio) this.deps.recorded?.(utterance.segment, audio, text || utterance.text);
         this.finishUtterance(utterance, text);
@@ -5405,10 +5496,86 @@ export class JevLoop {
     if (this.deps.overlapPlayedText) this.reflex();
     utterance.text = text;
     utterance.worded = takesTurn(text);
-    this.reportTranscript(utterance, text, false);
-    this.deps.caption?.(utterance.segment, text, false);
+    this.showPartial(utterance);
     if (this.overlap?.utterance === utterance) this.checkOverlap(utterance);
     else if (utterance.worded) this.reflex();
+  }
+
+  /** One VAD window's speech probability: kept for the next speech's pre-roll, and counted for the open one. */
+  onVadWindow(at: number, probability: number): void {
+    if (this.closed || !this.deps.speechEvidence) return;
+    this.vadWindows.push({ at, p: probability });
+    while (this.vadWindows.length && this.vadWindows[0].at <= at - samplesOf(JEV_VAD_HISTORY_MS))
+      this.vadWindows.shift();
+    const utterance = this.utterance;
+    if (!utterance) return;
+    const before = evidenceOf(utterance).strong;
+    this.countWindow(utterance, probability);
+    const now = evidenceOf(utterance).strong;
+    // Words held for want of evidence act once it arrives: a real interruption is delayed, never lost.
+    if (now !== before && (now === JEV_BARGE_EVIDENCE_WINDOWS || now === JEV_PHANTOM_EVIDENCE_WINDOWS))
+      this.evidenceArrived(utterance);
+  }
+
+  private countWindow(utterance: JevUtterance, p: number): void {
+    const e = evidenceOf(utterance);
+    e.peak = Math.max(e.peak, p);
+    if (p > VAD_ACTIVATION) e.voiced++;
+    if (p >= JEV_EVIDENCE_P) e.strong++;
+  }
+
+  private evidenceArrived(utterance: JevUtterance): void {
+    if (!utterance.text) return;
+    if (!utterance.shown) this.showPartial(utterance);
+    const overlap = this.overlap;
+    if (overlap?.utterance === utterance) {
+      if (overlap.blocked !== undefined && overlap.blocked === utterance.text.trim()) this.checkOverlap(utterance);
+    } else if (utterance.worded) this.reflex();
+  }
+
+  /**
+   * Without the gate every text counts; with it, a whole segment needs `need` windows of evidence. Words the
+   * phone heard (its interrupt) come with its own VAD's say-so and no windows here.
+   */
+  private heardSpeech(utterance: JevUtterance, text: string, need = JEV_SPEECH_EVIDENCE_WINDOWS): boolean {
+    if (!this.deps.speechEvidence || utterance.phoneWords) return true;
+    return heardAsSpeech(text, evidenceOf(utterance).strong, need);
+  }
+
+  /** What a barge-in may act on: a partial needs more evidence than a final. */
+  private bargeHeard(utterance: JevUtterance): boolean {
+    const need = utterance.final ? JEV_SPEECH_EVIDENCE_WINDOWS : JEV_BARGE_EVIDENCE_WINDOWS;
+    return this.heardSpeech(utterance, utterance.text, need);
+  }
+
+  /**
+   * The latest partial to the host and the captions, once it has the phantom bar's evidence: by then any final
+   * passes too, so nothing shown ever needs taking back (the clients drop an empty caption, not a shown one).
+   */
+  private showPartial(utterance: JevUtterance): void {
+    utterance.shown = this.heardSpeech(utterance, utterance.text, JEV_PHANTOM_EVIDENCE_WINDOWS);
+    if (!utterance.shown) return;
+    this.reportTranscript(utterance, utterance.text, false);
+    this.deps.caption?.(utterance.segment, utterance.text, false);
+  }
+
+  /** A segment whose words had no evidence of real speech: logged for tuning, and otherwise a wordless sound. */
+  private ignoreNoise(utterance: JevUtterance, text: string): void {
+    utterance.noise = true;
+    utterance.needsPhoneFinal = false;
+    const { strong, peak, voiced } = evidenceOf(utterance);
+    this.deps.log.info('voice-mode worker: noise segment ignored', {
+      text,
+      peak: Math.round(peak * 1000) / 1000,
+      windows: strong,
+      voicedMs: voiced * VAD_WINDOW_MS,
+    });
+    const overlap = this.overlap;
+    if (overlap?.utterance !== utterance) return;
+    clearTimeout(overlap.timer);
+    overlap.timer = overlap.latestId = overlap.retryAfter = undefined;
+    overlap.pending.clear();
+    overlap.keepTalking = false;
   }
 
   /** The host's `words`: a participant's words arrived (the reflex's confirmation where the worker has no transcript). */
@@ -5585,7 +5752,7 @@ export class JevLoop {
     if (judging && this.speechOver !== line) return;
     // After a wordless pause expires, the first late words still belong to the interrupted line.
     const useWordList = !judging || (this.pauseSpent && !utt.contextOnly);
-    if (useWordList && (utt?.worded || this.wordsHeard)) {
+    if (useWordList && ((utt?.worded && this.bargeHeard(utt)) || this.wordsHeard)) {
       this.deps.log.info('voice-mode worker: the caller talks over the agent; the line is cut', {
         replyId: line.replyId,
         speechMs: this.now() - this.speechSince,
@@ -5611,7 +5778,7 @@ export class JevLoop {
       this.overlap = { utterance: utt, pending: new Map() };
       utt.contextOnly = true;
       if (utt.text) {
-        this.reportTranscript(utt, utt.text, false);
+        if (utt.shown) this.reportTranscript(utt, utt.text, false);
         this.checkOverlap(utt);
       }
     }
@@ -5675,6 +5842,16 @@ export class JevLoop {
       if (this.overlap?.utterance !== utterance && !utterance.releasing && utterance.keptText !== spokenKey(text))
         utterance.contextOnly = false;
     }
+    if (this.deps.speechEvidence) {
+      const { strong, peak, voiced } = evidenceOf(utterance);
+      this.deps.log.info('voice-mode worker: utterance evidence', {
+        segment: utterance.segment,
+        windows: strong,
+        peak: Math.round(peak * 1000) / 1000,
+        voicedMs: voiced * VAD_WINDOW_MS,
+        chars: text.length,
+      });
+    }
     this.reportTranscript(utterance, text, true);
     this.checkOverlap(utterance);
     if (text) this.deps.caption?.(utterance.segment, text, true);
@@ -5708,9 +5885,17 @@ export class JevLoop {
     overlap.keepTalking = false;
     overlap.latestId = undefined;
     overlap.retryAfter = undefined;
+    overlap.blocked = undefined;
     if (!/[\p{L}\p{N}]/u.test(text)) {
       clearTimeout(overlap.timer);
       overlap.timer = undefined;
+      return;
+    }
+    // Not yet heard as real speech: the line stays held, and the words are asked about once the evidence comes.
+    if (!this.bargeHeard(utt)) {
+      clearTimeout(overlap.timer);
+      overlap.timer = undefined;
+      overlap.blocked = text;
       return;
     }
     // Revisions share one deadline, so a stream of partials cannot postpone the fallback.
@@ -5765,6 +5950,8 @@ export class JevLoop {
     overlap.latestId = undefined;
     overlap.retryAfter = undefined;
     const utt = overlap.utterance;
+    // Words not heard as real speech decide nothing: the line stays held until evidence, or quiet, comes.
+    if (utt.noise || !this.bargeHeard(utt)) return;
     const cut = verdict === 'yield' || (verdict === null && takesTurn(utt.text));
     this.deps.log.info('voice-mode worker: the overlap is decided', {
       replyId: line.replyId,
@@ -5804,7 +5991,8 @@ export class JevLoop {
           const utt = line.releaseTurn;
           if (utt && !this.closed) {
             utt.contextOnly = utt.releasing = false;
-            this.reportTranscript(utt, utt.text, !!utt.final);
+            // A partial without the evidence to be shown waits for its final, which the gate decides.
+            if (!utt.noise && (utt.final || utt.shown)) this.reportTranscript(utt, utt.text, !!utt.final);
           }
         }
       } finally {
@@ -5827,7 +6015,7 @@ export class JevLoop {
       const paused = !!this.pause;
       const words = this.overlap?.utterance;
       // A line that ended (stop, revoke, failure) before its pause decided leaves the words an ordinary turn.
-      if (words && spokenKey(words.text) && words.keptText === undefined && !line.releaseTurn) {
+      if (words && !words.noise && spokenKey(words.text) && words.keptText === undefined && !line.releaseTurn) {
         line.releaseTurn = words;
         words.releasing = true;
       }
@@ -5983,6 +6171,7 @@ async function runJevCall(s: JevCallSetup): Promise<void> {
     appCall: !!meta.appCall && voiceCall,
     ...(meta.jevOverlapVerdict && voiceCall ? { overlapPlayedText: () => callVoice?.playedText() ?? '' } : {}),
     ...(meta.jevDuck && voiceCall ? { setSpeechDucked: (on: boolean) => callVoice?.setSpeechDucked(on) } : {}),
+    ...(transcriber ? { speechEvidence: true } : {}),
     speak: async (text, ready, signal, replyId) => {
       if (!callVoice) return { heard: false, failed: true, cut: false, audioMs: 0, playedMs: 0, complete: false };
       speakingReplyId = replyId;
@@ -6086,6 +6275,7 @@ async function runJevCall(s: JevCallSetup): Promise<void> {
           callRecording?.push(pcm);
         },
         onVad: () => undefined,
+        onVadWindow: (at, probability) => loop.onVadWindow(at, probability),
         onSpeech: (speaking, at) => loop.onSpeech(speaking, at),
         onAgentSpeaking: (speaking) => {
           agentSpeaking = speaking;
