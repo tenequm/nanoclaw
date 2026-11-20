@@ -46,9 +46,7 @@ import { heartbeatPath } from '../../session-manager.js';
 
 const TYPING_REFRESH_MS = 4000;
 /**
- * Grace window from startTypingRefresh: fire typing unconditionally
- * for this long regardless of turn/heartbeat state. Covers container
- * spawn/wake latency (5–12s on cold start before the first turn report).
+ * Covers cold starts before the runner reports its turn. A delivery ends this grace early.
  */
 const TYPING_GRACE_MS = 15000;
 /**
@@ -151,7 +149,7 @@ interface TypingTarget {
   painted: boolean;
   interval: NodeJS.Timeout;
   startedAt: number;
-  pausedUntil: number; // epoch ms; 0 = not paused
+  pausedUntil: number; // Zero until the first delivery for this wake.
   /** Start of the current typing stretch: the wake, or the last idle->working transition. */
   typingSince: number;
   /** The ceiling tripped: nothing is painted until the state changes or a new wake. */
@@ -424,10 +422,9 @@ export function startTypingRefresh(
       log.warn('typing ceiling reached, indicator stopped', { sessionId, ceilingMs: TYPING_CEILING_MS });
     }
 
-    // Within the grace window since the last inbound: fire
-    // unconditionally, covering container spawn/wake latency before the
-    // first turn report lands.
-    if (now - entry.startedAt < TYPING_GRACE_MS) {
+    // A delivered reply proves the runner woke, even if its first presence report never arrived.
+    const wakeBudget = leftover ? LEFTOVER_REPORT_BUDGET_MS : TYPING_GRACE_MS;
+    if (entry.pausedUntil === 0 && now - entry.startedAt < wakeBudget) {
       refresh(entry);
       return;
     }
@@ -444,13 +441,7 @@ export function startTypingRefresh(
       return;
     }
 
-    if (leftover && now - entry.startedAt < LEFTOVER_REPORT_BUDGET_MS) {
-      refresh(entry);
-      return;
-    }
-
-    // No turn reported this wake (older runner, or the leftover budget ran
-    // out): fall back to the heartbeat file.
+    // No turn reported this wake: fall back to the heartbeat file.
     if (isHeartbeatFresh(entry.agentGroupId, sessionId)) {
       refresh(entry);
       return;
@@ -506,8 +497,6 @@ export function notePresence(sessionId: string, report: PresenceReport): void {
  * a user-facing message is delivered so the client-side indicator
  * has a chance to visually clear before the agent's next SDK event
  * pushes it back on. No-op if no refresh is active for this session.
- * (A delivered reply also clears a sticky status on the platform; the
- * first tick after the pause simply sends it again.)
  */
 export function pauseTypingRefreshAfterDelivery(sessionId: string): void {
   const entry = typingRefreshers.get(sessionId);

@@ -128,7 +128,6 @@ import {
   type TurnTakingDeps,
   deliveredText,
   JEV_BARGE_MS,
-  THINKING_HOLD_MS,
   JEV_WORDS_WINDOW_MS,
   serveAppInterrupt,
   JevLoop,
@@ -7744,7 +7743,7 @@ describe('jev calls', () => {
     await vi.waitFor(() => expect(job.shutdown).toHaveBeenCalledWith('host: done'));
   });
 
-  it("holds the your-turn cue while the agent's typing ticks say it still works, and while the caller talks", async () => {
+  it('plays the turn cue despite late typing ticks but holds it while the caller talks', async () => {
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
     const { ctx } = fakeJob({ ...JEV_META });
     const host = fakeHostFetch();
@@ -7755,19 +7754,16 @@ describe('jev calls', () => {
     await vi.advanceTimersByTimeAsync(10);
     expect(v.voice.playCue.mock.calls.map(([kind]) => kind)).toEqual(['listening']);
 
-    // An interim line, as the host sends it: the agent types on while it plays.
+    // A host typing tick can still arrive after the reply.
     host.emit({ type: 'status', status: 'thinking' });
     host.emit({ type: 'reply', text: 'One moment.', replyId: 'r1' });
     host.emit({ type: 'thinking' });
     host.emit({ type: 'status', status: 'speaking' });
-    host.emit({ type: 'status', status: 'idle' });
     await vi.advanceTimersByTimeAsync(TURN_CUE_DELAY_MS + 100);
     expect(v.voice.speak).toHaveBeenCalledTimes(1);
-    expect(v.voice.playCue.mock.calls.map(([kind]) => kind)).toEqual(['listening']);
-    expect(typing.at(-1)).toBe(true);
-    // No more ticks: the agent is done, and the typing ends by itself.
-    await vi.advanceTimersByTimeAsync(THINKING_HOLD_MS);
+    expect(v.voice.playCue.mock.calls.map(([kind]) => kind)).toEqual(['listening', 'turn']);
     expect(typing.at(-1)).toBe(false);
+    v.voice.playCue.mockClear();
 
     // A line that played out, and the caller already talking when its cue is due: no cue.
     host.emit({ type: 'reply', text: 'Done.', replyId: 'r2' });
@@ -7775,13 +7771,13 @@ describe('jev calls', () => {
     expect(v.voice.speak).toHaveBeenCalledTimes(2);
     v.events.onSpeech(true, v.position);
     await vi.advanceTimersByTimeAsync(TURN_CUE_DELAY_MS + 100);
-    expect(v.voice.playCue.mock.calls.map(([kind]) => kind)).toEqual(['listening']);
+    expect(v.voice.playCue.mock.calls.map(([kind]) => kind)).toEqual([]);
     // The same with the caller quiet: the cue.
     v.events.onSpeech(false, v.position);
     await vi.advanceTimersByTimeAsync(3_100);
     host.emit({ type: 'reply', text: 'Anything else?', replyId: 'r3' });
     await vi.advanceTimersByTimeAsync(TURN_CUE_DELAY_MS + 100);
-    expect(v.voice.playCue.mock.calls.map(([kind]) => kind)).toEqual(['listening', 'turn']);
+    expect(v.voice.playCue.mock.calls.map(([kind]) => kind)).toEqual(['turn']);
     host.endStream();
   });
 
@@ -7852,7 +7848,7 @@ describe('jev calls', () => {
     host.endStream();
   });
 
-  it('thinking ends by itself after a wake with no reply, and typing ticks keep it up', async () => {
+  it('accepts typing ticks only while awaiting a Jev reply and clears both holds on idle', async () => {
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
     const { ctx } = fakeJob({ ...JEV_META });
     const host = fakeHostFetch();
@@ -7866,20 +7862,22 @@ describe('jev calls', () => {
     await vi.advanceTimersByTimeAsync(200);
     expect(v.voice.setThinking.mock.calls).toEqual([[true], [false]]);
 
-    // A long turn: the agent's ticks, every few seconds, hold it well past both waits.
+    host.emit({ type: 'thinking' });
+    await vi.advanceTimersByTimeAsync(1);
+    expect(v.voice.setThinking.mock.calls).toEqual([[true], [false]]);
+
     host.emit({ type: 'status', status: 'thinking' });
-    for (let waited = 0; waited < 3 * AWAIT_REPLY_MS; waited += 4_000) {
-      host.emit({ type: 'thinking' });
-      await vi.advanceTimersByTimeAsync(4_000);
-    }
+    await vi.advanceTimersByTimeAsync(AWAIT_REPLY_MS - 100);
+    host.emit({ type: 'thinking' });
+    await vi.advanceTimersByTimeAsync(200);
     expect(v.voice.setThinking.mock.calls).toEqual([[true], [false], [true]]);
-    // The loop's `idle` does not end what the ticks say; the reply does.
+
     host.emit({ type: 'status', status: 'idle' });
-    await vi.advanceTimersByTimeAsync(10);
-    expect(v.voice.setThinking).toHaveBeenLastCalledWith(true);
-    host.emit({ type: 'reply', text: 'Here it is.', replyId: 'r1' });
-    await vi.advanceTimersByTimeAsync(10);
-    expect(v.voice.setThinking).toHaveBeenLastCalledWith(false);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(v.voice.setThinking.mock.calls).toEqual([[true], [false], [true], [false]]);
+    host.emit({ type: 'thinking' });
+    await vi.advanceTimersByTimeAsync(1);
+    expect(v.voice.setThinking.mock.calls).toEqual([[true], [false], [true], [false]]);
     host.endStream();
   });
 

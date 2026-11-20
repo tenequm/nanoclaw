@@ -207,6 +207,44 @@ describe('typing follows the runner turn state', () => {
     expect(clears).toHaveLength(1);
   });
 
+  it.each(['idle', 'leftover', 'unreported'] as const)('an early reply ends wake grace (%s)', async (state) => {
+    const { sets, clears } = captureSetAndClear();
+    startTypingRefresh(SESS, AG, 'slack', 'C1', 'T1');
+    await vi.advanceTimersByTimeAsync(2_000);
+    pauseTypingRefreshAfterDelivery(SESS);
+    if (state !== 'unreported') {
+      notePresence(SESS, { turn: 'idle', updatedAtMs: Date.now() - (state === 'leftover' ? 3_000 : 0) });
+    }
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(sets).toHaveLength(1);
+    expect(clears).toHaveLength(1);
+  });
+
+  it.each(['working report', 'heartbeat'])('resumes after an early reply with a fresh %s', async (signal) => {
+    const { sets, clears } = captureSetAndClear();
+    startTypingRefresh(SESS, AG, 'slack', 'C1', 'T1');
+    await vi.advanceTimersByTimeAsync(2_000);
+    pauseTypingRefreshAfterDelivery(SESS);
+    await vi.advanceTimersByTimeAsync(9_000);
+    expect(sets).toHaveLength(1);
+    if (signal === 'heartbeat') touchHeartbeat(AG, SESS);
+    else notePresence(SESS, { turn: 'working', updatedAtMs: Date.now() });
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(sets).toHaveLength(2);
+    expect(clears).toHaveLength(0);
+  });
+
+  it('starts a new wake grace when another inbound arrives during the delivery pause', async () => {
+    const { sets } = captureSetAndClear();
+    startTypingRefresh(SESS, AG, 'slack', 'C1', 'T1');
+    await vi.advanceTimersByTimeAsync(2_000);
+    pauseTypingRefreshAfterDelivery(SESS);
+    await vi.advanceTimersByTimeAsync(1_000);
+    startTypingRefresh(SESS, AG, 'slack', 'C1', 'T1');
+    await vi.advanceTimersByTimeAsync(13_000);
+    expect(sets).toHaveLength(6);
+  });
+
   it('multi-message turn: two deliveries pause and resume, then a single clear at idle', async () => {
     const { sets, clears } = captureSetAndClear();
     startTypingRefresh(SESS, AG, 'slack', 'C1', 'T1', 'slack-inst');
