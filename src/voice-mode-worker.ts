@@ -209,7 +209,7 @@ const RING_MS = 10_000;
 export const TURN_CUE_DELAY_MS = 600;
 /** A your-turn cue this soon after the last one is the same hand-over, and stays silent. */
 const TURN_CUE_REPEAT_MS = 3_000;
-/** The listening cue waits this long for the page's settings (`?cues=0` turns cues off), then plays. */
+/** After admission and RPC registration, a missing subscription or settings RPC can delay the cue only this long. */
 export const READY_CUE_WAIT_MS = 2_000;
 /** Waits on the global timers (which tests can fake). */
 const pause = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
@@ -1979,28 +1979,34 @@ export function loadTypingSound(file = getBuiltinAudioPath(BuiltinAudioClip.KEYB
   return typingSound;
 }
 
-/**
- * Publish the cue track (CALL_CUE_TRACK) on its own source. DTX off: the track never goes quiet on
- * the wire, so the first milliseconds of a cue are never spent waking it up.
- */
-async function publishCueTrack(
+async function publishAudioTrack(
   local: LocalParticipant,
-  log: WorkerLog,
-): Promise<{ feed: CueFeed; close(): Promise<void> }> {
-  const source = new AudioSource(CUE_SAMPLE_RATE, 1, CUE_QUEUE_MS);
-  const track = LocalAudioTrack.createAudioTrack(CALL_CUE_TRACK, source);
-  const publication = await local.publishTrack(track, new TrackPublishOptions({ dtx: false }));
-  const feed = new CueFeed(source, (err) => log.warn('voice-mode worker: the cue track stopped', { err }));
-  return {
-    feed,
-    async close() {
-      feed.stop();
-      await feed.running;
-      if (publication.sid) await local.unpublishTrack(publication.sid).catch(() => undefined);
-      await track.close().catch(() => undefined);
-      await source.close().catch(() => undefined);
-    },
+  name: string,
+  sampleRate: number,
+  options: TrackPublishOptions,
+  queueMs?: number,
+) {
+  const source = new AudioSource(sampleRate, 1, queueMs);
+  let track: LocalAudioTrack | undefined;
+  const closeAudio = async () => {
+    await track?.close(false).catch(() => undefined);
+    await source.close().catch(() => undefined);
   };
+  try {
+    track = LocalAudioTrack.createAudioTrack(name, source);
+    const publication = await local.publishTrack(track, options);
+    return {
+      source,
+      publication,
+      async close() {
+        if (publication.sid) await local.unpublishTrack(publication.sid).catch(() => undefined);
+        await closeAudio();
+      },
+    };
+  } catch (err) {
+    await closeAudio();
+    throw err;
+  }
 }
 
 /** Cyrillic letters as Latin sounds, so a name matches in either script (`Енді` and `Andy`). */
@@ -3857,16 +3863,17 @@ export interface VoiceModeSettings {
   voiceDetails?(choice: TtsChoice): Promise<ChoiceDetails>;
 }
 
+interface PublishedVoiceTracks {
+  cueSubscribed?: Promise<void>;
+  open(settings: VoiceModeSettings, events: CallVoiceEvents): Promise<CallVoice>;
+  close(): Promise<void>;
+}
+
 export interface RunCallDeps {
   /** The worker's settings; read from .env in the job process, so secrets stay out of argv and process.env. */
   env: Record<string, string | undefined>;
   fetchImpl?: typeof fetch;
-  createVoice(
-    ctx: CallJob,
-    meta: LiveKitJobMetadata,
-    settings: VoiceModeSettings,
-    events: CallVoiceEvents,
-  ): Promise<CallVoice>;
+  publishTracks(ctx: CallJob, meta: LiveKitJobMetadata): Promise<PublishedVoiceTracks>;
   /** The call's transcription. */
   transcriber(options: TranscriberOptions): Transcription;
   /** Where turn recordings are written; NanoClaw's data directory by default. */
@@ -4392,30 +4399,12 @@ export function voiceAttribute(
   };
 }
 
-/**
- * The real room: the caller's microphone at 16 kHz into Silero and the call's turns, the agent's
- * speech track fed by the call's speech output, the cue track, and what the page reads (captions, attributes,
- * topics, RPCs).
- */
-async function roomVoice(
-  ctx: JobContext,
-  meta: LiveKitJobMetadata,
-  settings: VoiceModeSettings,
-  events: CallVoiceEvents,
-): Promise<CallVoice> {
-  const log = workerLog(agentsLog().child({ callId: meta.callId }));
-  const userData = ctx.proc.userData as WorkerUserData;
-  userData.vad ??= await loadVad();
-  const room = ctx.room;
-  const local = room.localParticipant;
-  if (!local) throw new Error('no local participant');
-  let closed = false;
-  const speechSource = new AudioSource(TTS_SAMPLE_RATE, 1);
-  const speechTrack = LocalAudioTrack.createAudioTrack(SPEECH_TRACK, speechSource);
-  const speechPublication = await local.publishTrack(
-    speechTrack,
-    // Hi-fi speech: DTX off so a line's first milliseconds are never spent waking the track, and a
-    // 64 kbps Opus cap over the SDK's 48 kbps default. RED is the SDK default, kept explicit.
+async function publishRoomTracks(local: LocalParticipant, log: WorkerLog) {
+  // Keep speech on the wire between lines and allow 64 kbps Opus over the SDK's 48 kbps default.
+  const speech = await publishAudioTrack(
+    local,
+    SPEECH_TRACK,
+    TTS_SAMPLE_RATE,
     new TrackPublishOptions({
       source: TrackSource.SOURCE_MICROPHONE,
       dtx: false,
@@ -4423,13 +4412,49 @@ async function roomVoice(
       audioEncoding: { maxBitrate: 64_000n },
     }),
   );
-  // The cues' own track: never the speech track, so a cue is never the agent speaking. Without it
-  // the call runs silent of cues.
-  const cueTrack = await publishCueTrack(local, log).catch((err: unknown) => {
+  // Cues have their own short queue so speech buffering cannot delay them.
+  const cue = await publishAudioTrack(
+    local,
+    CALL_CUE_TRACK,
+    CUE_SAMPLE_RATE,
+    new TrackPublishOptions({ dtx: false }),
+    CUE_QUEUE_MS,
+  ).catch((err: unknown) => {
     log.warn('voice-mode worker: could not publish the cue track', { err });
     return undefined;
   });
+  return {
+    local,
+    log,
+    speech,
+    cue,
+    async close() {
+      await Promise.all([speech.close(), cue?.close()]);
+    },
+  };
+}
 
+export function callControlAttributes(meta: LiveKitJobMetadata) {
+  // The app uses the commands version to negotiate settings even on a host-directed call.
+  return {
+    [CALL_COMMANDS_ATTRIBUTE]: !meta.jev || (meta.appCall && !meta.meeting) ? CALL_COMMANDS_VERSION : '',
+    [CALL_COMMAND_WORDS_ATTRIBUTE]: meta.jev ? '' : COMMAND_WORDS_JSON,
+    [CALL_REVIEW_ATTRIBUTE]: meta.jev ? '' : '1',
+  };
+}
+
+async function roomVoice(
+  ctx: JobContext,
+  meta: LiveKitJobMetadata,
+  settings: VoiceModeSettings,
+  events: CallVoiceEvents,
+  tracks: Awaited<ReturnType<typeof publishRoomTracks>>,
+): Promise<CallVoice> {
+  const { local, log, speech } = tracks;
+  const userData = ctx.proc.userData as WorkerUserData;
+  userData.vad ??= await loadVad();
+  const room = ctx.room;
+  let closed = false;
   const outbox = new Outbox(log);
   const post = (what: string, job: () => Promise<unknown>, key?: string) => outbox.post(what, job, key);
   const sendJson = (topic: string, value: unknown, what: string) =>
@@ -4500,7 +4525,7 @@ async function roomVoice(
   const speaker = speechOutput({
     meta,
     settings,
-    sink: speechSource,
+    sink: speech.source,
     log,
     started: (text) => {
       setAttr(AGENT_STATE_ATTRIBUTE, 'speaking', 'the agent state');
@@ -4512,7 +4537,7 @@ async function roomVoice(
           attributes: {
             [SEGMENT_ID]: `SG_${randomUUID()}`,
             [TRANSCRIPTION_FINAL]: 'true',
-            ...(speechPublication.sid ? { [TRANSCRIBED_TRACK]: speechPublication.sid } : {}),
+            ...(speech.publication.sid ? { [TRANSCRIBED_TRACK]: speech.publication.sid } : {}),
           },
         }),
       );
@@ -4524,6 +4549,9 @@ async function roomVoice(
     changed: publishVoice,
   });
 
+  const feed =
+    tracks.cue &&
+    new CueFeed(tracks.cue.source, (err) => log.warn('voice-mode worker: the cue track stopped', { err }));
   // The first `listening` goes out with the review attributes, from review.serve: a page takes
   // `listening` as the call being live, so what the call offers is known with it.
   return {
@@ -4555,14 +4583,14 @@ async function roomVoice(
         final ? undefined : `caption ${segment}`,
       ),
     async playCue(kind, started) {
-      await cueTrack?.feed.play(cueFrames(kind), started);
+      await feed?.play(cueFrames(kind), started);
     },
     setTyping(on) {
       typing = on;
-      if (!on) return cueTrack?.feed.setBed(undefined);
+      if (!on) return feed?.setBed(undefined);
       loadTypingSound().then(
         (frames) => {
-          if (typing && !closed) cueTrack?.feed.setBed(frames);
+          if (typing && !closed) feed?.setBed(frames);
         },
         (err: unknown) =>
           log.warn('voice-mode worker: no typing sound', { err: err instanceof Error ? err.message : err }),
@@ -4577,15 +4605,12 @@ async function roomVoice(
         }
         const state = speaker.speech.state;
         log.info('voice-mode.voice', { voice: state });
-        // Unkeyed: a `speaking` posted after it queues behind it instead of replacing it. A jev call
-        // offers neither review mode nor spoken commands: the host decides when the agent speaks.
+        // Unkeyed so a subsequent speaking state queues behind the capabilities.
         post('the agent state and the review attributes', () =>
           local.setAttributes({
             [AGENT_STATE_ATTRIBUTE]: 'listening',
             [CALL_PROTOCOL_ATTRIBUTE]: String(LIVEKIT_PROTOCOL_VERSION),
-            [CALL_REVIEW_ATTRIBUTE]: meta.jev ? '' : '1',
-            [CALL_COMMANDS_ATTRIBUTE]: meta.jev ? '' : CALL_COMMANDS_VERSION,
-            [CALL_COMMAND_WORDS_ATTRIBUTE]: meta.jev ? '' : COMMAND_WORDS_JSON,
+            ...callControlAttributes(meta),
             [CALL_VOICE_ATTRIBUTE]: JSON.stringify(state),
           }),
         );
@@ -4609,10 +4634,9 @@ async function roomVoice(
       };
       await quietly(() => callerAudio?.cancel());
       await quietly(() => input.close());
-      await quietly(() => cueTrack?.close());
-      await quietly(() => speechPublication.sid && local.unpublishTrack(speechPublication.sid));
-      await quietly(() => speechTrack.close());
-      await quietly(() => speechSource.close());
+      feed?.stop();
+      await quietly(() => feed?.running);
+      await quietly(tracks.close);
       await quietly(() => speechClosed);
     },
   };
@@ -4732,10 +4756,14 @@ export class CallTelemetry {
 export function callCues(o: {
   play(kind: CueKind, started?: () => void): Promise<void> | undefined;
   muted(): boolean;
-  log: Pick<Console, 'warn'>;
+  readyOn: 'settings' | 'subscribe' | 'both';
+  subscribed?: Promise<void>;
+  log: Pick<Console, 'info' | 'warn'>;
 }) {
   let chain: Promise<void> = Promise.resolve();
   let readyCued = false;
+  let hasSettings = false;
+  let hasSubscription = false;
   let readyTimer: ReturnType<typeof setTimeout> | undefined;
   let turnTimer: ReturnType<typeof setTimeout> | undefined;
   let turnCuedAt = 0;
@@ -4747,20 +4775,32 @@ export function callCues(o: {
       })
       .catch((err: unknown) => o.log.warn('voice-mode worker: a cue did not play', { err, kind }));
   };
-  /** The listening cue, once: when the page has said whether it wants cues, or after a wait for that. */
-  const ready = () => {
+  const ready = (
+    trigger: 'subscribe' | 'settings' | 'settings-after-subscribe' | 'subscribe-after-settings' | 'fallback',
+  ) => {
     clearTimeout(readyTimer);
     if (readyCued) return;
     readyCued = true;
-    cue('listening');
+    cue('listening', () => o.log.info('voice-mode.ready-cue', { trigger, sentAt: new Date().toISOString() }));
   };
   const cancelTurn = () => clearTimeout(turnTimer);
   return {
     cue,
-    ready,
-    /** A page says whether it wants cues first; a call with no page to ask gets them after a moment. */
+    settings() {
+      hasSettings = true;
+      if (o.readyOn === 'settings') ready('settings');
+      if (o.readyOn === 'both' && hasSubscription) ready('settings-after-subscribe');
+    },
     armReady() {
-      readyTimer = setTimeout(ready, READY_CUE_WAIT_MS);
+      if (readyCued) return;
+      if (o.readyOn !== 'settings') {
+        void o.subscribed?.then(() => {
+          hasSubscription = true;
+          if (o.readyOn === 'subscribe') ready('subscribe');
+          else if (hasSettings) ready('subscribe-after-settings');
+        });
+      }
+      readyTimer = setTimeout(() => ready('fallback'), READY_CUE_WAIT_MS);
       readyTimer.unref?.();
     },
     /** Over to the caller; lines that end close together are one hand-over, so one cue. */
@@ -4775,6 +4815,7 @@ export function callCues(o: {
     },
     cancelTurn,
     close() {
+      readyCued = true;
       clearTimeout(readyTimer);
       cancelTurn();
     },
@@ -5377,6 +5418,7 @@ interface JevCallSetup {
   host: HostLink;
   meta: LiveKitJobMetadata;
   telemetry: CallTelemetry;
+  tracks: PublishedVoiceTracks;
   abandon(reason: string, fields?: Record<string, unknown>): Promise<void>;
   geminiKey: string;
   providerKeys: ProviderKeys;
@@ -5443,7 +5485,9 @@ async function runJevCall(s: JevCallSetup): Promise<void> {
   /** A line played out since the queue last drained: the caller heard something to answer. */
   let heardLine = false;
   const cues = callCues({
-    play: (kind) => callVoice?.playCue(kind),
+    readyOn: meta.appCall ? 'both' : 'subscribe',
+    subscribed: s.tracks.cueSubscribed,
+    play: (kind, started) => callVoice?.playCue(kind, started),
     muted: () => !voiceCall || ending || !cuesOn || agentSpeaking,
     log: callLog,
   });
@@ -5533,9 +5577,7 @@ async function runJevCall(s: JevCallSetup): Promise<void> {
     );
   }
   try {
-    callVoice = await deps.createVoice(
-      ctx,
-      meta,
+    callVoice = await s.tracks.open(
       {
         providerKeys: s.providerKeys,
         ...(s.record ? { recordReplies: true } : {}),
@@ -5602,15 +5644,10 @@ async function runJevCall(s: JevCallSetup): Promise<void> {
         if (req.typing !== undefined) typingWanted = req.typing;
         updateTyping();
         callLog.info('voice-mode worker: settings', { typing: typingWanted, cues: cuesOn });
-        cues.ready();
+        cues.settings();
         if (req.tts) error = voice.selectTts ? voice.selectTts(req.tts, req.gen) : 'tts_unavailable';
       }
-      voice.review.publishReview({
-        seq: ++seq,
-        mode: 'auto',
-        draft: null,
-        wake: { on: false, pauseSends: true, waiting: false },
-      });
+      voice.review.publishReview({ seq: ++seq, mode: 'auto', draft: null });
       const reply: ReviewReply = { gen: req.gen, ok: !error, seq, ...(error ? { error } : {}) };
       return JSON.stringify(reply);
     });
@@ -5693,6 +5730,17 @@ let callEnv: Record<string, string | undefined> | undefined;
 /** The names of the voices this job process's calls use, kept in its memory. */
 let callVoiceNames: VoiceCatalog | undefined;
 
+export async function publishCallTracks(ctx: CallJob, meta: LiveKitJobMetadata): Promise<PublishedVoiceTracks> {
+  const local = ctx.room.localParticipant;
+  if (!local) throw new Error('no local participant');
+  const tracks = await publishRoomTracks(local, workerLog(agentsLog().child({ callId: meta.callId })));
+  return {
+    cueSubscribed: tracks.cue?.publication.waitForSubscription(),
+    close: tracks.close,
+    open: (settings, events) => roomVoice(ctx as JobContext, meta, settings, events, tracks),
+  };
+}
+
 function defaultDeps(): RunCallDeps {
   const env = (callEnv ??= workerEnv([
     'VOICE_MODE_GEMINI_API_KEY',
@@ -5719,7 +5767,7 @@ function defaultDeps(): RunCallDeps {
       lazy: true,
       log: workerLog(agentsLog()),
     })),
-    createVoice: (ctx, meta, settings, events) => roomVoice(ctx as JobContext, meta, settings, events),
+    publishTracks: publishCallTracks,
     transcriber: (options) => new GeminiLiveTranscriber(options),
     markUpdating: async (ctx) => {
       await ctx.room.localParticipant?.setAttributes({ [CALL_UPDATING_ATTRIBUTE]: '1' });
@@ -5736,11 +5784,12 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
   const telemetry = new CallTelemetry({ info: (msg, fields) => log.info(msg, { ...callFields, ...fields }) });
   /** The host, once its URL is known; before that there is no one to tell. */
   let link: HostLink | undefined = undefined;
+  let tracks: PublishedVoiceTracks | undefined;
   /** Ends the call from this side: the host hears why when there is one to tell, then the room goes. */
   const abandon = async (reason: string, fields: Record<string, unknown> = {}): Promise<void> => {
     log.warn('voice-mode worker: ending the call', { ...callFields, ...fields, reason });
     telemetry.ended(reason);
-    await link?.tell('ended', { reason });
+    await Promise.all([link?.tell('ended', { reason }), tracks?.close()]);
     await ctx.deleteRoom().catch(() => undefined);
     ctx.shutdown(reason);
   };
@@ -5792,12 +5841,17 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
 
   await ctx.connect(undefined, AutoSubscribe.AUDIO_ONLY);
   try {
+    tracks = await deps.publishTracks(ctx, meta);
+  } catch (err) {
+    return abandon('could not publish the call audio', { err });
+  }
+  try {
     await withTimeout(ctx.waitForParticipant(meta.callerIdentity), meta.joinTimeoutMs, 'caller never joined');
   } catch (err) {
     return abandon((err as Error).message);
   }
   const joined = await host.tell('joined');
-  // The host starts billing here; without its yes, nothing is published or transcribed.
+  // Billing, audio capture and playout start only after the host accepts the caller.
   if (!joined?.ok) return abandon(`host refused the call (${joined?.status ?? 'unreachable'})`, { hostUrl });
   if (meta.jev) {
     return runJevCall({
@@ -5806,6 +5860,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
       host,
       meta,
       telemetry,
+      tracks,
       abandon,
       geminiKey,
       providerKeys,
@@ -5841,6 +5896,8 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
   };
   let callerSpeaking = false;
   const cues = callCues({
+    readyOn: meta.appCall ? 'both' : 'settings',
+    subscribed: tracks.cueSubscribed,
     play: (kind, started) => callVoice?.playCue(kind, started),
     muted: () => ending || !cuesOn || agentSpeaking,
     log: callLog,
@@ -6129,9 +6186,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
     );
   }
   try {
-    callVoice = await deps.createVoice(
-      ctx,
-      meta,
+    callVoice = await tracks.open(
       {
         providerKeys,
         ...(record ? { recordReplies: true } : {}),
@@ -6268,7 +6323,7 @@ export async function runCall(ctx: CallJob, deps: RunCallDeps = defaultDeps()): 
         callTurns.configure(req.wake ?? callTurns.state.on, req.pauseSends ?? callTurns.state.pauseSends);
         const { on: wake, pauseSends } = callTurns.state;
         callLog.info('voice-mode worker: settings', { wake, pauseSends, typing: typingWanted, cues: cuesOn });
-        cues.ready();
+        cues.settings();
         if (!req.tts) return undefined;
         return callVoice?.selectTts ? callVoice.selectTts(req.tts, req.gen) : 'tts_unavailable';
       },

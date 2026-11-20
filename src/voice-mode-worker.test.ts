@@ -11,11 +11,23 @@ import { getEventListeners } from 'node:events';
 import { fileURLToPath } from 'node:url';
 
 import { AgentServer, InferenceRunner, initializeLogger, ServerOptions, VADEventType } from '@livekit/agents';
-import { AudioFrame, AudioResampler, DisconnectReason, type LocalParticipant } from '@livekit/rtc-node';
+import {
+  AudioFrame,
+  AudioResampler,
+  AudioSource,
+  DisconnectReason,
+  LocalAudioTrack,
+  type LocalParticipant,
+} from '@livekit/rtc-node';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
+  CALL_CUE_TRACK,
   CALL_COMMAND_WORDS,
+  CALL_COMMANDS_ATTRIBUTE,
+  CALL_COMMANDS_VERSION,
+  CALL_COMMAND_WORDS_ATTRIBUTE,
+  CALL_REVIEW_ATTRIBUTE,
   LIVEKIT_PROTOCOL_VERSION,
   liveKitCallSecret,
   liveKitHostUrl,
@@ -36,6 +48,9 @@ import {
   AudioRing,
   CALLER_REJOIN_MS,
   callerRejoinWaitMs,
+  callCues,
+  callControlAttributes,
+  publishCallTracks,
   callLanguages,
   type CallRecord,
   CallRecording,
@@ -821,7 +836,7 @@ function fakeVoice(
     publishUnheard: vi.fn(),
     setPending: vi.fn(),
     caption: vi.fn(),
-    playCue: vi.fn(async (_kind: CueKind) => undefined),
+    playCue: vi.fn(async (_kind: CueKind, started?: () => void) => started?.()),
     review: {
       publishReview: vi.fn((state: CallReviewState) => void states.push(state)),
       serve: vi.fn((h: typeof handle) => {
@@ -912,7 +927,11 @@ const deps = (
 ) => ({
   env: ENV as Record<string, string | undefined>,
   fetchImpl,
-  createVoice,
+  publishTracks: vi.fn(async (ctx: CallJob, meta: LiveKitJobMetadata) => ({
+    cueSubscribed: Promise.resolve(),
+    close: vi.fn(async () => undefined),
+    open: (settings: VoiceModeSettings, events: CallVoiceEvents) => createVoice(ctx, meta, settings, events),
+  })),
   transcriber: () => transcription,
   markUpdating: vi.fn(async () => undefined),
   log: silentLog,
@@ -1241,11 +1260,30 @@ describe('runCall', () => {
     expect(job.shutdown).toHaveBeenCalledWith('host refused the call (unreachable)');
   });
 
+  it('abandons a failed track publication before waiting for or admitting the caller', async () => {
+    const { job, ctx } = fakeJob();
+    const host = fakeHostFetch();
+    const v = fakeVoice();
+    const worker = callDeps(host.fetchImpl, v);
+    worker.publishTracks.mockRejectedValue(new Error('publication failed'));
+    await runCall(ctx, worker);
+    expect(job.waitForParticipant).not.toHaveBeenCalled();
+    expect(v.createVoice).not.toHaveBeenCalled();
+    expect(host.calls.map((c) => c.url.endsWith('/ended'))).toEqual([true]);
+    expect(job.deleteRoom).toHaveBeenCalledOnce();
+    expect(job.shutdown).toHaveBeenCalledWith('could not publish the call audio');
+  });
+
   it('starts no session when the host refuses the call', async () => {
     const { job, ctx } = fakeJob();
     const host = fakeHostFetch(409);
     const v = fakeVoice();
-    await runCall(ctx, callDeps(host.fetchImpl, v));
+    const worker = callDeps(host.fetchImpl, v);
+    await runCall(ctx, worker);
+    expect(job.connect).toHaveBeenCalledBefore(worker.publishTracks);
+    expect(worker.publishTracks).toHaveBeenCalledBefore(job.waitForParticipant);
+    const tracks = await worker.publishTracks.mock.results[0].value;
+    expect(tracks.close).toHaveBeenCalledOnce();
     expect(v.createVoice).not.toHaveBeenCalled();
     expect(host.calls.at(-1)).toMatchObject({ body: { callId: 'call-1', reason: 'host refused the call (409)' } });
     expect(job.deleteRoom).toHaveBeenCalled();
@@ -1257,7 +1295,12 @@ describe('runCall', () => {
     job.waitForParticipant.mockImplementation(() => new Promise(() => undefined));
     const host = fakeHostFetch();
     const v = fakeVoice();
-    await runCall(ctx, callDeps(host.fetchImpl, v));
+    const worker = callDeps(host.fetchImpl, v);
+    await runCall(ctx, worker);
+    expect(job.connect).toHaveBeenCalledBefore(worker.publishTracks);
+    expect(worker.publishTracks).toHaveBeenCalledBefore(job.waitForParticipant);
+    const tracks = await worker.publishTracks.mock.results[0].value;
+    expect(tracks.close).toHaveBeenCalledOnce();
     expect(v.createVoice).not.toHaveBeenCalled();
     expect(job.shutdown).toHaveBeenCalledWith('caller never joined');
   });
@@ -4282,6 +4325,122 @@ describe('CallTurns, review', () => {
   });
 });
 
+describe('listening cue', () => {
+  it('advertises settings on app jev calls and reserves spoken commands and review for plain calls', () => {
+    const plain = callControlAttributes(META);
+    expect(plain).toEqual({
+      [CALL_COMMANDS_ATTRIBUTE]: CALL_COMMANDS_VERSION,
+      [CALL_COMMAND_WORDS_ATTRIBUTE]: COMMAND_WORDS_JSON,
+      [CALL_REVIEW_ATTRIBUTE]: '1',
+    });
+    const jev = { ...META, jev: true };
+    const page = callControlAttributes(jev);
+    expect(page).toEqual({
+      [CALL_COMMANDS_ATTRIBUTE]: '',
+      [CALL_COMMAND_WORDS_ATTRIBUTE]: '',
+      [CALL_REVIEW_ATTRIBUTE]: '',
+    });
+    expect(callControlAttributes({ ...jev, meeting: { pauseSends: true } })).toEqual(page);
+    expect(callControlAttributes({ ...jev, appCall: true })).toEqual({
+      ...page,
+      [CALL_COMMANDS_ATTRIBUTE]: CALL_COMMANDS_VERSION,
+    });
+  });
+
+  it('uses the cue publication for readiness, advertises app settings and releases both tracks', async () => {
+    const { ctx, room } = fakeJob();
+    const meta = { ...META, jev: true, appCall: true };
+    const speechSubscribed = new Promise<void>(() => undefined);
+    const local = {
+      publishTrack: vi.fn(async (track: LocalAudioTrack) => ({
+        sid: track.name,
+        waitForSubscription: () => (track.name === CALL_CUE_TRACK ? Promise.resolve() : speechSubscribed),
+      })),
+      unpublishTrack: vi.fn(async () => undefined),
+      setAttributes: vi.fn(async () => undefined),
+      registerRpcMethod: vi.fn(),
+    };
+    Object.assign(ctx, { proc: { userData: { vad: {} } } });
+    Object.assign(room, { localParticipant: local, off: vi.fn() });
+    room.remoteParticipants.clear();
+    const trackClose = vi.spyOn(LocalAudioTrack.prototype, 'close');
+    const sourceClose = vi.spyOn(AudioSource.prototype, 'close');
+    const capture = vi.spyOn(AudioSource.prototype, 'captureFrame').mockResolvedValue();
+    try {
+      const tracks = await publishCallTracks(ctx, meta);
+      let voice: CallVoice | undefined;
+      try {
+        await expect(tracks.cueSubscribed).resolves.toBeUndefined();
+        voice = await tracks.open(
+          { providerKeys: {} },
+          {
+            onAudio: vi.fn(),
+            onSpeech: vi.fn(),
+            onVad: vi.fn(),
+            onAgentSpeaking: vi.fn(),
+            onClosed: vi.fn(),
+          },
+        );
+        voice.review.serve(vi.fn());
+        expect(local.setAttributes).toHaveBeenCalledWith(
+          expect.objectContaining({
+            'lk.agent.state': 'listening',
+            ...callControlAttributes(meta),
+          }),
+        );
+      } finally {
+        if (voice) await voice.close();
+        else await tracks.close();
+      }
+      expect(local.unpublishTrack.mock.calls).toEqual([['roomio_audio'], [CALL_CUE_TRACK]]);
+      expect(trackClose).toHaveBeenCalledTimes(2);
+      expect(sourceClose).toHaveBeenCalledTimes(2);
+    } finally {
+      capture.mockRestore();
+      sourceClose.mockRestore();
+      trackClose.mockRestore();
+    }
+  });
+
+  it.each([
+    ['both', 'settings', 'subscribe-after-settings'],
+    ['both', 'subscribe', 'settings-after-subscribe'],
+    ['both', 'settings', 'fallback'],
+    ['both', 'subscribe', 'fallback'],
+    ['both', 'neither', 'fallback'],
+    ['both', 'close', 'silent'],
+    ['subscribe', 'settings', 'subscribe'],
+    ['subscribe', 'settings', 'fallback'],
+  ] as const)('%s cue with %s first ends on %s', async (readyOn, first, trigger) => {
+    vi.useFakeTimers();
+    let subscribe!: () => void;
+    const subscribed = new Promise<void>((resolve) => {
+      subscribe = resolve;
+    });
+    const play = vi.fn(async (_kind: CueKind, started?: () => void) => started?.());
+    const log = { info: vi.fn(), warn: vi.fn() };
+    const cues = callCues({ readyOn, subscribed, play, muted: () => false, log });
+    cues.armReady();
+    if (first === 'settings') cues.settings();
+    if (first === 'subscribe') subscribe();
+    if (first === 'close') cues.close();
+    await vi.advanceTimersByTimeAsync(READY_CUE_WAIT_MS - 1);
+    expect(play).not.toHaveBeenCalled();
+    if (trigger !== 'fallback') {
+      subscribe();
+      cues.settings();
+    }
+    await vi.advanceTimersByTimeAsync(trigger === 'fallback' ? 1 : 0);
+    if (trigger !== 'silent') {
+      expect(log.info).toHaveBeenCalledWith('voice-mode.ready-cue', { trigger, sentAt: new Date().toISOString() });
+    }
+    subscribe();
+    cues.settings();
+    await vi.advanceTimersByTimeAsync(READY_CUE_WAIT_MS);
+    expect(play).toHaveBeenCalledTimes(trigger === 'silent' ? 0 : 1);
+  });
+});
+
 describe('cue audio', () => {
   it('is 20 ms frames of 48 kHz mono: 150-250 ms of tone held near its level, with soft edges', () => {
     for (const kind of ['listening', 'wake', 'sent', 'discard', 'turn', 'nope', 'draft', 'sleep'] as const) {
@@ -5150,8 +5309,11 @@ describe('acoustic wake word in a call', () => {
       const v = fakeVoice();
       await runCall(ctx, {
         ...callDeps(host.fetchImpl, v, { env: { ...ENV, VOICE_MODE_CALL_RECORDING: '1' }, recordingsRoot: root }),
-        createVoice: vi.fn(async () => {
-          throw new Error('no room audio');
+        publishTracks: async () => ({
+          open: async () => {
+            throw new Error('no room audio');
+          },
+          close: async () => undefined,
         }),
       });
       await vi.waitFor(() => expect(job.shutdown).toHaveBeenCalled());
@@ -7379,6 +7541,49 @@ describe('jev calls', () => {
         ? `speech:${e.on ? 'on' : 'off'}`
         : `${e.final ? 'final' : 'partial'}:${e.text}`;
 
+  it.each([
+    { client: 'plain app', meta: { appCall: true }, trigger: 'settings-after-subscribe' },
+    { client: 'jev app', meta: { appCall: true, jev: true }, trigger: 'settings-after-subscribe' },
+    { client: 'plain page', meta: {}, trigger: 'settings' },
+    { client: 'jev page', meta: { jev: true }, trigger: 'subscribe' },
+  ])('uses the $client readiness signals', async ({ meta, trigger }) => {
+    vi.useFakeTimers();
+    const { ctx } = fakeJob({ ...META, ...meta });
+    const host = fakeHostFetch();
+    const v = fakeVoice();
+    v.voice.review.serve.mockImplementation(() => undefined);
+    const log = { info: vi.fn(), warn: vi.fn() };
+    await runCall(ctx, callDeps(host.fetchImpl, v, { log }));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(v.voice.playCue).toHaveBeenCalledTimes(trigger === 'subscribe' ? 1 : 0);
+    const [settings] = v.voice.review.serve.mock.calls[0];
+    for (const gen of [1, 2]) {
+      const reply = await settings('settings', JSON.stringify({ gen, typing: false }), META.callerIdentity);
+      expect(JSON.parse(reply)).toMatchObject({ ok: true });
+    }
+    await vi.advanceTimersByTimeAsync(READY_CUE_WAIT_MS);
+    expect(log.info).toHaveBeenCalledWith('voice-mode.ready-cue', expect.objectContaining({ trigger }));
+    expect(v.voice.playCue).toHaveBeenCalledTimes(1);
+    if (meta.jev) expect(v.states).toEqual([1, 2].map((seq) => ({ seq, mode: 'auto', draft: null })));
+    host.endStream();
+  });
+
+  it('honours cues off in the first app settings after subscription', async () => {
+    vi.useFakeTimers();
+    const { ctx } = fakeJob({ ...JEV_META, appCall: true });
+    const host = fakeHostFetch();
+    const v = fakeVoice();
+    v.voice.review.serve.mockImplementation(() => undefined);
+    await runCall(ctx, callDeps(host.fetchImpl, v));
+    const [settings] = v.voice.review.serve.mock.calls[0];
+    await settings('settings', JSON.stringify({ gen: 1, cues: false }), META.callerIdentity);
+    await vi.advanceTimersByTimeAsync(READY_CUE_WAIT_MS);
+    await settings('settings', JSON.stringify({ gen: 2, cues: true }), META.callerIdentity);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(v.voice.playCue).not.toHaveBeenCalled();
+    host.endStream();
+  });
+
   it('runs the loop: no turns, no spotter; words and marks go to agent/jev in order, replies are spoken by replyId', async () => {
     const { ctx, job } = fakeJob({ ...JEV_META });
     const host = fakeHostFetch();
@@ -7391,7 +7596,7 @@ describe('jev calls', () => {
     // The page's settings are answered (its speech choice would apply); review mode is not on offer.
     expect(await v.rpc('settings', { cues: false })).toMatchObject({ ok: true });
     expect(await v.rpc('talk')).toMatchObject({ ok: false, error: 'not_review' });
-    expect(v.states.at(-1)).toMatchObject({ mode: 'auto', draft: null, wake: { on: false } });
+    expect(v.states.at(-1)).toEqual({ seq: expect.any(Number), mode: 'auto', draft: null });
 
     v.transcription.results.push(heard('Book a table', 'Book a table.'));
     v.audio(600);
@@ -7430,9 +7635,9 @@ describe('jev calls', () => {
     expect(v.voice.speak).toHaveBeenCalledTimes(1);
     expect(v.voice.say).not.toHaveBeenCalled();
     // The page asked for cues as it joined, then turned them off: the listening cue, and none after it.
-    expect(v.voice.playCue.mock.calls).toEqual([['listening']]);
+    expect(v.voice.playCue.mock.calls.map(([kind]) => kind)).toEqual(['listening']);
     await new Promise((r) => setTimeout(r, TURN_CUE_DELAY_MS + 100));
-    expect(v.voice.playCue.mock.calls).toEqual([['listening']]);
+    expect(v.voice.playCue.mock.calls.map(([kind]) => kind)).toEqual(['listening']);
     // The one spoken reply was the agent at work from its arrival to its first audio.
     expect(v.voice.setThinking.mock.calls).toEqual([[true], [false]]);
     expect(v.voice.publishReply).not.toHaveBeenCalled();
@@ -7450,7 +7655,7 @@ describe('jev calls', () => {
     const typing: boolean[] = [];
     Object.assign(v.voice, { setTyping: vi.fn((on: boolean) => void typing.push(on)) });
     await runCall(ctx, callDeps(host.fetchImpl, v));
-    await vi.waitFor(() => expect(v.voice.playCue.mock.calls).toEqual([['listening']]));
+    await vi.waitFor(() => expect(v.voice.playCue.mock.calls.map(([kind]) => kind)).toEqual(['listening']));
 
     host.emit({ type: 'status', status: 'thinking' });
     await vi.waitFor(() => expect(typing).toEqual([true]));
@@ -7473,7 +7678,9 @@ describe('jev calls', () => {
 
     // A line that played out hands over to the caller; one cue, a moment after it.
     host.emit({ type: 'reply', text: 'Booked.', replyId: 'r1' });
-    await vi.waitFor(() => expect(v.voice.playCue.mock.calls).toEqual([['listening'], ['turn']]), { timeout: 2_000 });
+    await vi.waitFor(() => expect(v.voice.playCue.mock.calls.map(([kind]) => kind)).toEqual(['listening', 'turn']), {
+      timeout: 2_000,
+    });
 
     host.emit({ type: 'end', reason: 'done' });
     await vi.waitFor(() => expect(job.shutdown).toHaveBeenCalledWith('host: done'));
@@ -7488,7 +7695,7 @@ describe('jev calls', () => {
     Object.assign(v.voice, { setTyping: vi.fn((on: boolean) => void typing.push(on)) });
     await runCall(ctx, callDeps(host.fetchImpl, v));
     await vi.advanceTimersByTimeAsync(10);
-    expect(v.voice.playCue.mock.calls).toEqual([['listening']]);
+    expect(v.voice.playCue.mock.calls.map(([kind]) => kind)).toEqual(['listening']);
 
     // An interim line, as the host sends it: the agent types on while it plays.
     host.emit({ type: 'status', status: 'thinking' });
@@ -7498,7 +7705,7 @@ describe('jev calls', () => {
     host.emit({ type: 'status', status: 'idle' });
     await vi.advanceTimersByTimeAsync(TURN_CUE_DELAY_MS + 100);
     expect(v.voice.speak).toHaveBeenCalledTimes(1);
-    expect(v.voice.playCue.mock.calls).toEqual([['listening']]);
+    expect(v.voice.playCue.mock.calls.map(([kind]) => kind)).toEqual(['listening']);
     expect(typing.at(-1)).toBe(true);
     // No more ticks: the agent is done, and the typing ends by itself.
     await vi.advanceTimersByTimeAsync(THINKING_HOLD_MS);
@@ -7510,13 +7717,13 @@ describe('jev calls', () => {
     expect(v.voice.speak).toHaveBeenCalledTimes(2);
     v.events.onSpeech(true, v.position);
     await vi.advanceTimersByTimeAsync(TURN_CUE_DELAY_MS + 100);
-    expect(v.voice.playCue.mock.calls).toEqual([['listening']]);
+    expect(v.voice.playCue.mock.calls.map(([kind]) => kind)).toEqual(['listening']);
     // The same with the caller quiet: the cue.
     v.events.onSpeech(false, v.position);
     await vi.advanceTimersByTimeAsync(3_100);
     host.emit({ type: 'reply', text: 'Anything else?', replyId: 'r3' });
     await vi.advanceTimersByTimeAsync(TURN_CUE_DELAY_MS + 100);
-    expect(v.voice.playCue.mock.calls).toEqual([['listening'], ['turn']]);
+    expect(v.voice.playCue.mock.calls.map(([kind]) => kind)).toEqual(['listening', 'turn']);
     host.endStream();
   });
 
@@ -7595,7 +7802,13 @@ describe('jev calls', () => {
     v.voice.review.serve = vi.fn();
     const setTyping = vi.fn();
     Object.assign(v.voice, { setTyping });
-    await runCall(ctx, callDeps(host.fetchImpl, v));
+    const timer = vi.spyOn(globalThis, 'setTimeout');
+    try {
+      await runCall(ctx, callDeps(host.fetchImpl, v));
+      expect(timer.mock.calls.map(([, delay]) => delay)).not.toContain(READY_CUE_WAIT_MS);
+    } finally {
+      timer.mockRestore();
+    }
     host.emit({ type: 'status', status: 'thinking' });
     host.emit({ type: 'thinking' });
     host.emit({ type: 'reply', text: 'Booked.', replyId: 'r1' });

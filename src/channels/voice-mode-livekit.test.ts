@@ -738,18 +738,6 @@ describe('livekit voice path (fake LiveKit, real webhook server)', () => {
     expect(h.lk.dispatches.at(-1)!.metadata.tts).toEqual(gone);
   });
 
-  it('marks only app-originated jobs for the worker on jev calls', async () => {
-    const page = await post(`${h.base}/livekit/token?v=${LIVEKIT_PROTOCOL_VERSION}&t=tok123&jev=1`);
-    expect(page.status).toBe(200);
-    const browser = h.lk.dispatches.at(-1)!.metadata;
-    expect(browser.jev).toBe(true);
-    expect(browser.appCall).toBeUndefined();
-    await h.adapter.endAppCall(LINE, browser.callId, 'hangup');
-    const app = await h.adapter.startAppCall(LINE, 'wss://example.test', true, async () => true);
-    expect(app.ok).toBe(true);
-    expect(h.lk.dispatches.at(-1)!.metadata).toMatchObject({ jev: true, appCall: true });
-  });
-
   it('opens a unique room, dispatches the worker with the call metadata and mints a room-only caller token', async () => {
     const res = await post(`${h.base}/livekit/token?v=6&t=tok123&jev=0`);
     expect(res.status).toBe(200);
@@ -2507,6 +2495,14 @@ describe('/voice jev on the call core', () => {
       if (!hit) throw new Error(`no turn event for ${key}`);
       return hit;
     });
+
+  it('marks app jobs for the settings handshake and leaves browser jobs unmarked', async () => {
+    expect((await h.adapter.startAppCall(LINE, h.base, true, async () => true)).ok).toBe(true);
+    expect(h.lk.dispatches.at(-1)!.metadata).toMatchObject({ jev: true, appCall: true });
+    const page = await startJevCall();
+    expect(page.meta.appCall).toBeUndefined();
+    page.close();
+  });
 
   it('runs jev by default; jev=0 makes a plain call, which has none in its job', async () => {
     const plain = await post(`${h.base}/livekit/token?v=6&t=tok123&jev=0`);
