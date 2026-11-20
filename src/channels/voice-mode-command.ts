@@ -448,13 +448,17 @@ export const jevCallReplyNote = (languageNote: string): string =>
   `conversation has moved on. ${CALL_SPEECH_FORMAT_NOTE} ${languageNote}`;
 
 /** The `/voice` call: the caller's own page joins the room, as the line's caller. `jev`: it runs the jev loop. */
-function pageCallKind(maxCallDurationMs: number, jev = false): CallKind {
+function pageCallKind(maxCallDurationMs: number, jev: boolean, client: 'app' | 'page'): CallKind {
   return {
     roomPrefix: 'voice',
     joinTimeoutMs: CALL_JOIN_TIMEOUT_MS,
     maxDurationMs: maxCallDurationMs,
     room: { emptyTimeout: 60, departureTimeout: 10, maxParticipants: 2 },
-    job: ({ callId }) => ({ callerIdentity: `caller-${callId.slice(0, 8)}`, ...(jev ? { jev: true } : {}) }),
+    job: ({ callId }) => ({
+      callerIdentity: `caller-${callId.slice(0, 8)}`,
+      ...(jev ? { jev: true } : {}),
+      ...(client === 'app' ? { appCall: true } : {}),
+    }),
     // Always the line's own caller, wherever the call talks: the line is that person's, not whoever ran /voice.
     sender: (line) => line.caller,
     turnNote: jev ? jevCallReplyNote : callChatReplyNote,
@@ -473,8 +477,6 @@ export interface CallPageConfig {
 /** The `/voice` page call over the call core: its kind and the page's `livekit`, `livekit/token` and `livekit/end` routes. */
 export function createCallPage(core: Pick<LiveKitVoice, 'openCall' | 'endCall' | 'isLive'>, config: CallPageConfig) {
   const { lineForToken } = config;
-  const pageCall = pageCallKind(config.maxCallDurationMs);
-  const jevPageCall = pageCallKind(config.maxCallDurationMs, true);
   let page: string | undefined;
 
   /** The page call's token: it joins that room only, as the caller the worker waits for. */
@@ -550,6 +552,7 @@ export function createCallPage(core: Pick<LiveKitVoice, 'openCall' | 'endCall' |
     } as const;
   };
   const start = async (
+    client: 'app' | 'page',
     platformId: string,
     url: string,
     jev: boolean,
@@ -560,7 +563,7 @@ export function createCallPage(core: Pick<LiveKitVoice, 'openCall' | 'endCall' |
       if (!core.isLive(opened.call.platformId, id)) grants.delete(id);
     }
     const opened = await core.openCall(platformId, {
-      ...(jev ? jevPageCall : pageCall),
+      ...pageCallKind(config.maxCallDurationMs, jev, client),
       ...(bindChat ? { bindChat } : {}),
     });
     if (!opened.ok) return opened;
@@ -576,7 +579,7 @@ export function createCallPage(core: Pick<LiveKitVoice, 'openCall' | 'endCall' |
     return grant(platformId, opened, url);
   };
   const startPageCall = async (res: http.ServerResponse, platformId: string, jev: boolean): Promise<void> => {
-    const result = await start(platformId, config.livekit.url, jev, undefined, () => res.destroyed);
+    const result = await start('page', platformId, config.livekit.url, jev, undefined, () => res.destroyed);
     if (res.destroyed) return;
     if (result.ok) return reply(res, 200, JSON.stringify(result.grant), JSON_HEADERS);
     const refusal: CallRefusal = result;
@@ -655,5 +658,5 @@ export function createCallPage(core: Pick<LiveKitVoice, 'openCall' | 'endCall' |
     reply(res, 404, 'Not found');
   };
 
-  return { handle: handleCallPage, start, resume, end: core.endCall };
+  return { handle: handleCallPage, start: start.bind(null, 'app'), resume, end: core.endCall };
 }

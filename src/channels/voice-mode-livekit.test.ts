@@ -2496,6 +2496,14 @@ describe('/voice jev on the call core', () => {
       return hit;
     });
 
+  it('marks app jobs for the settings handshake and leaves browser jobs unmarked', async () => {
+    expect((await h.adapter.startAppCall(LINE, h.base, true, async () => true)).ok).toBe(true);
+    expect(h.lk.dispatches.at(-1)!.metadata).toMatchObject({ jev: true, appCall: true });
+    const page = await startJevCall();
+    expect(page.meta.appCall).toBeUndefined();
+    page.close();
+  });
+
   it('runs jev by default; jev=0 makes a plain call, which has none in its job', async () => {
     const plain = await post(`${h.base}/livekit/token?v=6&t=tok123&jev=0`);
     expect(plain.status).toBe(200);
