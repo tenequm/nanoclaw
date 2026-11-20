@@ -176,6 +176,25 @@ export function turnText(heard: Pick<Heard, 'final' | 'interim'>): { text: strin
   return { text: final, source: 'final' };
 }
 
+/**
+ * What a listener says over the agent to show they follow, not to take the turn: never enough to cut
+ * the agent off. Lowercase; English, Ukrainian, Russian and Latin transliterations, a few others.
+ */
+const ACKNOWLEDGEMENTS = new Set([
+  ...['uh', 'huh', 'um', 'ah', 'oh', 'yeah', 'yes', 'yep', 'yup', 'ok', 'okay', 'right', 'sure', 'i', 'see'],
+  ...['ага', 'угу', 'так', 'ок', 'добре', 'зрозуміло', 'да', 'хорошо', 'понятно'],
+  ...['aga', 'ugu', 'tak', 'da', 'ja', 'genau', 'oui', 'si', 'sí', 'vale'],
+]);
+/** Hums of any length: `m`, `mm`, `hmm`, `mhm`, `mm-hmm`'s parts, `uhh`, `umm`, `ahh`, `ohh`. */
+const HUM = /^(?:h*m+(?:h+m+)*|u+[hm]+|a+h+|o+h+)$/u;
+
+/** `text` has a word besides acknowledgements and hums: the caller takes the turn from the agent. */
+export function takesTurn(text: string): boolean {
+  return (text.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? []).some(
+    (word) => !ACKNOWLEDGEMENTS.has(word) && !HUM.test(word),
+  );
+}
+
 /** A run of two or more quoted items in a list (`'Ava', 'Max', 'send it'`); the last may be cut off. */
 const QUOTED_LIST = /(?<=^|[\s([])(?:['‘’"“”«][^'‘’"“”«»,\n]{1,60}(?:['‘’"“”»]|(?=\s*$))[\s.]*(?:,[\s]*|$)){2,}/gu;
 const QUOTED_ITEM = /['‘’"“”«]([^'‘’"“”«»,\n]{1,60})/gu;

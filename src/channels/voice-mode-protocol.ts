@@ -529,8 +529,9 @@ export type CallEndReason = (typeof CALL_END_REASONS)[number];
  * On a jev call the host sends only replies to speak, each with a `replyId` its playback reports
  * name; `stop` aborts the line playing and drops the queue; `revoke` drops one queued line that has
  * not started (a newer wake replaced its turn; reported `cut_off` with nothing delivered, and a line
- * already playing plays on); `words` says a participant's words arrived, the reflex's text
- * confirmation where the worker has no transcript of its own. A jev voice call also gets the loop's
+ * already playing plays on unless the reflex paused it, which cuts it); `words` says a participant's
+ * words beyond acknowledgements arrived (`takesTurn`), the reflex's text confirmation where the
+ * worker has no transcript of its own. A jev voice call also gets the loop's
  * `status` and the agent's `thinking` ticks, which its worker plays its cues and typing sound from.
  */
 export type LiveKitHostEvent =
