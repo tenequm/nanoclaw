@@ -33,7 +33,7 @@ import { fanOutboundMessage } from './modules/cross-session-context/index.js';
 import { platformMessageId } from './platform-id.js';
 import { log } from './log.js';
 import { normalizeOptions } from './channels/ask-question.js';
-import { clearOutbox, readOutboxFiles, withExistingMailboxSession } from './session-manager.js';
+import { clearOutbox, isHostWrittenOutbound, readOutboxFiles, withExistingMailboxSession } from './session-manager.js';
 import { pauseTypingRefreshAfterDelivery, setTypingAdapter } from './modules/typing/index.js';
 import type { OutboundFile } from './channels/adapter.js';
 import type { AgentGroup, PendingApproval, Session } from './types.js';
@@ -446,7 +446,7 @@ async function completeDelivery(
   );
   await clearAttemptRow(msg.id);
   if (msg.kind !== 'system' && msg.channelType !== 'agent' && msg.channelType !== 'peer') {
-    pauseTypingRefreshAfterDelivery(session.id);
+    pauseTypingRefreshAfterDelivery(session.id, isHostWrittenOutbound(msg.id));
     if (msg.kind !== 'task_log') {
       // Cross-session context: echo the delivered reply into the
       // conversation's recently active sibling sessions. Unawaited — the
