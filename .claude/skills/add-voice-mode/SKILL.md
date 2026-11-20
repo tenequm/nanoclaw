@@ -325,6 +325,11 @@ seconds. The agent answers when Jev gives `answer` a probability of at least
 and `continue` takes 0.5. The agent's name alone ("Dan", "Hey Dan.") wakes it
 without a Jev call unless an answer is already on its way.
 
+On a jev call, 300 ms of caller speech over the agent's line pauses it, and
+words of that speech cut it. Two seconds of quiet with no words resume the
+line where it stopped (LiveKit's `false_interruption_timeout`), so a cough or
+"mm" does not cost the answer.
+
 A jev voice call plays three cues, by the plain call's `cues` and `typing`
 switches: listening once at call start; the typing sound and the "working"
 indicator while the host's loop reports `thinking` (a `status` event to the
@@ -367,7 +372,7 @@ keeps the jev loop's transcript lines and decisions (who said what), to tune it.
 
 Verify one real call after both processes start. A jev call (the default with
 `JEV_API_KEY`): a question answered, a remark to someone else left silent, a
-talk-over cut and "go on" continued. A `/voice plain` call: wake, send, manual
+talk-over cut, a cough over a line paused and resumed, and "go on" continued. A `/voice plain` call: wake, send, manual
 draft, discard, reply, captions, mute, reconnect and hangup. This skill's tests use
 fake LiveKit/Gemini boundaries and cannot prove the microphone or media route.
 

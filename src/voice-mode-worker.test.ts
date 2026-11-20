@@ -7560,7 +7560,7 @@ describe('jev: the loop', () => {
     expect(cut()).toBe(1);
     expect(h.kinds().at(-1)).toBe('r1:cut_off');
 
-    // Too late: words past the window after the speech ended leave the line.
+    // Too late: words after the quiet resumed the line leave it.
     h.loop.onReply('r2', 'Two.');
     await tick(1);
     h.start(h.lines[1]);
@@ -8009,19 +8009,26 @@ describe('jev calls', () => {
     const samples = 7_319;
     const chunks = 4;
 
-    async function pausedCall() {
+    async function pausedCall(queuedFrames = 0) {
       vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
       const { ctx, job } = fakeJob({ ...JEV_META });
       const host = fakeHostFetch();
       const info = vi.fn();
       const pcm: number[] = [];
+      let queued = queuedFrames;
       const sink = {
         captureFrame: async (frame: AudioFrame) => {
           pcm.push(...frame.data);
           await new Promise((resolve) => setTimeout(resolve, 20));
         },
-        queuedDuration: 0,
-        clearQueue: vi.fn(),
+        get queuedDuration() {
+          return queued * 20;
+        },
+        // The frames the sink still held never played.
+        clearQueue: vi.fn(() => {
+          pcm.splice(pcm.length - queued * 480);
+          queued = 0;
+        }),
         waitForPlayout: async () => undefined,
       };
       const v = fakeVoice((meta, settings, events) =>
@@ -8059,41 +8066,45 @@ describe('jev calls', () => {
       return { host, v, job, info, pcm, sink, cursor, playbacks, end };
     }
 
-    it('resumes every remaining sample after continuous silence and ignores a late final and host words', async () => {
-      const { host, v, info, pcm, cursor, playbacks, end } = await pausedCall();
-      try {
-        host.emit({ type: 'thinking' });
-        await tick(2_100);
-        expect(v.voice.setThinking).toHaveBeenLastCalledWith(false);
-        v.transcription.hold = true;
-        v.transcription.results.push(heard('', 'wait'));
-        v.events.onSpeech(false, 38_400);
-        await tick(1_000);
-        v.events.onSpeech(true, 54_400);
-        await tick(100);
-        v.events.onSpeech(false, 56_000);
-        await tick(JEV_FALSE_INTERRUPTION_TIMEOUT_MS - 1);
-        expect(pcm.length).toBe(cursor);
-        expect(v.voice.setSpeechPaused.mock.calls).toEqual([[true]]);
-        expect(v.voice.playCue.mock.calls.map(([kind]) => kind)).toEqual(['listening']);
-        await tick(1);
-        expect(pcm.length).toBeGreaterThan(cursor);
-        expect(v.voice.setSpeechPaused.mock.calls).toEqual([[true], [false]]);
-        v.transcription.release();
-        host.emit({ type: 'words' });
-        await tick(2_000);
-        const expected = new Int16Array(Math.ceil((samples * chunks) / 480) * 480);
-        for (let n = 0; n < samples * chunks; n++) expected[n] = n + 1;
-        expect(Int16Array.from(pcm)).toEqual(expected);
-        expect(playbacks().map(summary)).toEqual(['r1:started', 'r1:completed']);
-        expect(info).toHaveBeenCalledWith(
-          'voice-mode worker: false barge-in; the line resumes',
-          expect.objectContaining({ replyId: 'r1', pauseMs: 5_200 }),
-        );
-      } finally {
-        await end();
-      }
-    });
+    it.each([0, 3])(
+      'resumes every remaining sample (%i frames queued at the pause) after continuous silence and ignores a late final and host words',
+      async (queuedFrames) => {
+        const { host, v, info, pcm, sink, cursor, playbacks, end } = await pausedCall(queuedFrames);
+        expect(sink.clearQueue).toHaveBeenCalledTimes(queuedFrames ? 1 : 0);
+        try {
+          host.emit({ type: 'thinking' });
+          await tick(2_100);
+          expect(v.voice.setThinking).toHaveBeenLastCalledWith(false);
+          v.transcription.hold = true;
+          v.transcription.results.push(heard('', 'wait'));
+          v.events.onSpeech(false, 38_400);
+          await tick(1_000);
+          v.events.onSpeech(true, 54_400);
+          await tick(100);
+          v.events.onSpeech(false, 56_000);
+          await tick(JEV_FALSE_INTERRUPTION_TIMEOUT_MS - 1);
+          expect(pcm.length).toBe(cursor);
+          expect(v.voice.setSpeechPaused.mock.calls).toEqual([[true]]);
+          expect(v.voice.playCue.mock.calls.map(([kind]) => kind)).toEqual(['listening']);
+          await tick(1);
+          expect(pcm.length).toBeGreaterThan(cursor);
+          expect(v.voice.setSpeechPaused.mock.calls).toEqual([[true], [false]]);
+          v.transcription.release();
+          host.emit({ type: 'words' });
+          await tick(2_000);
+          const expected = new Int16Array(Math.ceil((samples * chunks) / 480) * 480);
+          for (let n = 0; n < samples * chunks; n++) expected[n] = n + 1;
+          expect(Int16Array.from(pcm)).toEqual(expected);
+          expect(playbacks().map(summary)).toEqual(['r1:started', 'r1:completed']);
+          expect(info).toHaveBeenCalledWith(
+            'voice-mode worker: false barge-in; the line resumes',
+            expect.objectContaining({ replyId: 'r1', pauseMs: 5_200 }),
+          );
+        } finally {
+          await end();
+        }
+      },
+    );
 
     it.each(['partial', 'final', 'words', 'stop', 'revoke', 'end'] as const)(
       'discards the paused tail on %s',

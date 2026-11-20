@@ -1264,6 +1264,7 @@ export interface CallVoice {
    * outcome says how much of it played.
    */
   speak(text: string, ready: () => Promise<void>, signal: AbortSignal): Promise<LineOutcome>;
+  /** Holds the playing line at its next unplayed sample, or lets it go on from there. */
   setSpeechPaused(paused: boolean): void;
   /** The `nanoclaw.voice-mode.thinking` attribute. */
   setThinking(thinking: boolean): void;
@@ -3949,6 +3950,11 @@ const workerLog = (logger: ReturnType<typeof agentsLog>): WorkerLog => ({
 const SPEECH_TRACK = 'roomio_audio';
 /** The speech track's audio goes out in 20 ms frames. */
 const SPEECH_FRAME = TTS_SAMPLE_RATE / 50;
+const SPEECH_FRAME_MS = (SPEECH_FRAME * 1000) / TTS_SAMPLE_RATE;
+/** The speech track's native queue (the SDK's default); a pause takes back from it what has not played. */
+const SPEECH_QUEUE_MS = 1_000;
+/** The last frames sent that a pause may take back: the queue's worth, and the one a capture still waits on. */
+const SPEECH_REPLAY_FRAMES = SPEECH_QUEUE_MS / SPEECH_FRAME_MS + 1;
 /** What the page reads, in the shapes agents-js's AgentSession published them. */
 const AGENT_STATE_ATTRIBUTE = 'lk.agent.state';
 const TRANSCRIPTION_TOPIC = 'lk.transcription';
@@ -4150,6 +4156,7 @@ export interface SpeechOutputOptions {
   log: Pick<Console, 'info' | 'warn'>;
   /** A line's first audio plays: the agent speaks it. */
   started(text: string): void;
+  /** The playing line was paused or goes on. */
   paused?(paused: boolean): void;
   /** A line that played is over. */
   stopped(): void;
@@ -4181,10 +4188,18 @@ export function speechOutput(o: SpeechOutputOptions): Pick<CallVoice, 'say' | 's
   let closed = false;
   let hold: Promise<void> | undefined;
   let release: (() => void) | undefined;
+  /** The line's last frames sent, newest last, and those a pause took back from the sink to send again. */
+  let recent: Int16Array[] = [];
+  let held: Int16Array[] = [];
   const releasePause = () => {
     hold = undefined;
     release?.();
     release = undefined;
+  };
+  const send = async (frame: Int16Array) => {
+    recent.push(frame);
+    if (recent.length > SPEECH_REPLAY_FRAMES) recent.shift();
+    await o.sink.captureFrame(new AudioFrame(frame, TTS_SAMPLE_RATE, 1, SPEECH_FRAME));
   };
   /**
    * One line into the speech sink: streamed as it is synthesized, resolved once it has played. `signal`
@@ -4220,13 +4235,14 @@ export function speechOutput(o: SpeechOutputOptions): Pick<CallVoice, 'say' | 's
     // The abort silences the line at once, not at the next provider chunk or after the queue drained.
     const cutNow = () => {
       if (closed || cutPlayedMs !== undefined) return;
-      cutPlayedMs = Math.max(0, audioMs - o.sink.queuedDuration);
+      cutPlayedMs = Math.max(0, audioMs - o.sink.queuedDuration - held.length * SPEECH_FRAME_MS);
       o.sink.clearQueue();
     };
     let abortedResolve!: () => void;
     const aborted = new Promise<void>((resolve) => (abortedResolve = resolve));
     const onAbort = () => {
       cutNow();
+      held = [];
       releasePause();
       abortedResolve();
     };
@@ -4239,15 +4255,36 @@ export function speechOutput(o: SpeechOutputOptions): Pick<CallVoice, 'say' | 's
         said: false,
       };
     };
+    /** Waits out a pause, then sends again what it took back, so the line goes on at its next unplayed sample. */
+    const resumed = async () => {
+      for (;;) {
+        while (hold) await hold;
+        const frame = held.shift();
+        if (!frame || lineSignal.aborted) return;
+        await send(frame);
+      }
+    };
+    /** The sink's playout, again after each pause, until it played out unpaused or the line ended. */
+    const drain = async () => {
+      for (;;) {
+        const playout = o.sink.waitForPlayout();
+        if (signal) {
+          playout.catch(() => undefined);
+          await Promise.race([playout, aborted]);
+        } else await playout;
+        if (lineSignal.aborted || (!hold && !held.length)) return;
+        await resumed();
+      }
+    };
     const capture = async (synthesized: Int16Array) => {
       // Holding the current chunk backpressures the TTS iterator and preserves the next sample.
-      while (hold) await hold;
+      await resumed();
       if (lineSignal.aborted) return;
       const frame = filter ? filter(synthesized) : synthesized;
       meter.frame(frame);
       if (o.settings.recordReplies) sent.push(frame);
-      audioMs += (SPEECH_FRAME * 1000) / TTS_SAMPLE_RATE;
-      await o.sink.captureFrame(new AudioFrame(frame, TTS_SAMPLE_RATE, 1, SPEECH_FRAME));
+      audioMs += SPEECH_FRAME_MS;
+      await send(frame);
     };
     const play = async (pcm: Int16Array) => {
       let data = pcm;
@@ -4290,14 +4327,7 @@ export function speechOutput(o: SpeechOutputOptions): Pick<CallVoice, 'say' | 's
         rest = undefined;
         await capture(tail);
       }
-      if (heard && !signal?.aborted) {
-        const playout = o.sink.waitForPlayout();
-        if (signal) {
-          playout.catch(() => undefined);
-          await Promise.race([playout, aborted]);
-        } else await playout;
-      }
-      while (hold) await hold;
+      if (heard && !signal?.aborted) await drain();
       // Cut while its last audio drained: the share that played is delivered, not the whole line.
       if (cut()) return cutResult();
       playedMs = audioMs;
@@ -4309,13 +4339,14 @@ export function speechOutput(o: SpeechOutputOptions): Pick<CallVoice, 'say' | 's
       o.log.warn('voice-mode worker: a line could not be synthesized', {
         err: err instanceof Error ? err.message : err,
       });
-      if (heard) await o.sink.waitForPlayout().catch(() => undefined);
-      while (hold) await hold;
+      if (heard) await drain().catch(() => undefined);
       if (cut()) return cutResult();
       playedMs = audioMs;
       return { outcome: { heard, failed, cut: false, audioMs, playedMs, complete }, said: false };
     } finally {
       lineSignal.removeEventListener('abort', onAbort);
+      recent = [];
+      held = [];
       releasePause();
       resample.close();
       if (heard && !closed) o.stopped();
@@ -4340,8 +4371,15 @@ export function speechOutput(o: SpeechOutputOptions): Pick<CallVoice, 'say' | 's
     speak,
     setSpeechPaused(paused) {
       if (closed || paused === !!hold) return;
-      if (paused) hold = new Promise<void>((resolve) => (release = resolve));
-      else releasePause();
+      if (paused) {
+        hold = new Promise<void>((resolve) => (release = resolve));
+        // The sink would play its queue on through the pause: what it has not played goes back in line.
+        const unplayed = Math.min(recent.length, Math.round(o.sink.queuedDuration / SPEECH_FRAME_MS));
+        if (unplayed > 0) {
+          o.sink.clearQueue();
+          held = [...recent.splice(recent.length - unplayed), ...held];
+        }
+      } else releasePause();
       o.paused?.(paused);
     },
     selectTts: (tts, gen) => speech.select(tts, gen),
@@ -4422,7 +4460,7 @@ export function voiceAttribute(
   };
 }
 
-async function publishRoomTracks(local: LocalParticipant, log: WorkerLog, jev: boolean) {
+async function publishRoomTracks(local: LocalParticipant, log: WorkerLog) {
   // Keep speech on the wire between lines and allow 64 kbps Opus over the SDK's 48 kbps default.
   const speech = await publishAudioTrack(
     local,
@@ -4434,8 +4472,7 @@ async function publishRoomTracks(local: LocalParticipant, log: WorkerLog, jev: b
       red: true,
       audioEncoding: { maxBitrate: 64_000n },
     }),
-    // On Jev, only a frame of native buffering should remain when the worker pauses capture.
-    jev ? (SPEECH_FRAME * 1000) / TTS_SAMPLE_RATE : undefined,
+    SPEECH_QUEUE_MS,
   );
   // Cues have their own short queue so speech buffering cannot delay them.
   const cue = await publishAudioTrack(
@@ -4860,7 +4897,12 @@ export function callCues(o: {
 // playback, and the reflex's words come from the host's `words`.
 // ---------------------------------------------------------------------------------------------
 
+/**
+ * The reflex: caller speech this long over a playing line pauses it (LiveKit's `min_duration`); words
+ * of that speech (a non-empty partial or final, or the host's `words`) cut it.
+ */
 export const JEV_BARGE_MS = 300;
+/** Quiet this long after a pausing speech, with no words of it, resumes the line (`false_interruption_timeout`). */
 export const JEV_FALSE_INTERRUPTION_TIMEOUT_MS = 2_000;
 /**
  * How far the host's `words` (a meeting's) may miss the worker's VAD: the host's partial and the local
@@ -5039,6 +5081,7 @@ export interface JevLoopDeps {
   appCall?: boolean;
   /** One line into the room; `ready` is awaited before its first audio, `signal` aborts its playout. */
   speak(text: string, ready: () => Promise<void>, signal: AbortSignal, replyId: string): Promise<LineOutcome>;
+  /** Holds the playing line where it is, or lets it go on from there. */
   setSpeechPaused(paused: boolean): void;
   /** One event for the host, in order. */
   report(event: JevWorkerEvent): void;
@@ -5099,6 +5142,7 @@ export class JevLoop {
     over?: JevPlayout;
     resumed?: boolean;
   };
+  /** The line the reflex paused, until words cut it or JEV_FALSE_INTERRUPTION_TIMEOUT_MS of quiet resumes it. */
   private pause?: { line: JevPlayout; since: number };
   private resumeTimer?: ReturnType<typeof setTimeout>;
   private lastAppCut?: { track: string; at: number };
@@ -5318,8 +5362,8 @@ export class JevLoop {
    * The host's `revoke`: the line, superseded before it was heard, never plays. Queued, it is dropped;
    * taken but its first audio not out (synthesizing, or waiting for the caller's quiet), it is aborted,
    * which the speech output checks right before that audio. Either way it is reported `cut_off` with
-   * nothing delivered. A paused line is cut. A line still speaking plays on: the host revokes only lines it has not
-   * seen start, so this is a revoke that crossed the line's `started`.
+   * nothing delivered. A line already heard plays on, unless the reflex paused it, which cuts it: the host
+   * revokes only lines it has not seen start, so this is a revoke that crossed the line's `started`.
    */
   onRevoke(replyId: string): void {
     if (this.closed) return;
@@ -5379,6 +5423,7 @@ export class JevLoop {
     }
   }
 
+  /** Caller speech past JEV_BARGE_MS over a playing line: VAD alone pauses it, words cut it, paused or not. */
   private reflex(): void {
     const line = this.playing;
     if (!line?.started || !this.speaking || line.abort.signal.aborted) return;
@@ -5802,7 +5847,7 @@ let callVoiceNames: VoiceCatalog | undefined;
 export async function publishCallTracks(ctx: CallJob, meta: LiveKitJobMetadata): Promise<PublishedVoiceTracks> {
   const local = ctx.room.localParticipant;
   if (!local) throw new Error('no local participant');
-  const tracks = await publishRoomTracks(local, workerLog(agentsLog().child({ callId: meta.callId })), !!meta.jev);
+  const tracks = await publishRoomTracks(local, workerLog(agentsLog().child({ callId: meta.callId })));
   return {
     cueSubscribed: tracks.cue?.publication.waitForSubscription(),
     close: tracks.close,
