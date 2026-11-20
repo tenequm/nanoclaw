@@ -280,25 +280,55 @@ export async function withInboundDelivery<T>(action: () => Promise<T>): Promise<
     release();
   }
 }
-export async function setMeshMembership(agentId: string, member: boolean) {
-  if (member) await updateMembership(agentId, true);
-  else await withInboundDelivery(() => updateMembership(agentId, false));
+export function setMeshMembership(agentId: string, member: boolean, address?: string) {
+  if (member) return updateMembership(agentId, 'add', address);
+  return withInboundDelivery(() => updateMembership(agentId, 'remove'));
 }
-async function updateMembership(agentId: string, member: boolean) {
+export function updateMeshAddress(agentId: string, address: string) {
+  return updateMembership(agentId, 'update', address);
+}
+
+async function writeMemberAddress(agentId: string, operation: 'add' | 'update', requested?: string) {
+  const db = getDb();
+  const agent = await db.get<{ name: string; address: string | null }>(
+    'SELECT a.name,m.address FROM agent_groups a LEFT JOIN mesh_members m ON m.agent_group_id=a.id WHERE a.id=?',
+    agentId,
+  );
+  if (!agent) fail(404, 'not_found', 'Agent is not registered.');
+  if (operation === 'update' && agent.address === null) fail(404, 'not_member', 'Agent is not a mesh member.');
+  if (operation === 'add' && agent.address !== null && requested === undefined) return;
+
+  const input = requested ?? label(agent.name);
+  const valid = /^[a-z0-9][a-z0-9._-]{0,39}$/i.test(input);
+  const address = valid ? label(input) : input.toLowerCase();
+  if (
+    await db.get(
+      `SELECT 1 FROM mesh_members WHERE address=? AND agent_group_id<>?
+       UNION ALL SELECT 1 FROM peer_sessions WHERE address=? AND status<>'ended' LIMIT 1`,
+      address,
+      agentId,
+      address,
+    )
+  )
+    fail(409, 'ambiguous', 'Mesh address is already in use.');
+  if (!valid) fail(400, 'bad_address', 'Invalid mesh address. Use a peer label of up to 40 characters.');
+  if (agent.address === address) return;
+  if (agent.address === null) {
+    await db.run('INSERT INTO mesh_members(agent_group_id,address) VALUES (?,?)', agentId, address);
+  } else {
+    if (operation === 'add') fail(409, 'ambiguous', 'Group already has a mesh address. Use mesh update to change it.');
+    await db.run('UPDATE mesh_members SET address=? WHERE agent_group_id=?', address, agentId);
+  }
+}
+async function updateMembership(agentId: string, operation: 'add' | 'update' | 'remove', address?: string) {
   const db = getDb();
   await db.transaction(async () => {
-    if (member) {
-      const agent = await db.get<{ name: string }>('SELECT name FROM agent_groups WHERE id=?', agentId);
-      if (!agent) fail(404, 'not_found', 'Agent is not registered.');
-      await db.run(
-        'INSERT INTO mesh_members(agent_group_id,address) VALUES (?,?) ON CONFLICT(agent_group_id) DO NOTHING',
-        agentId,
-        label(agent.name),
-      );
-    } else {
+    if (operation === 'remove') {
       await db.run('DELETE FROM mesh_members WHERE agent_group_id=?', agentId);
       const { dropAgentQueue } = await import('./lifecycle.js');
       await dropAgentQueue(agentId);
+    } else {
+      await writeMemberAddress(agentId, operation, address);
     }
     const endpoints = await db.all<{ id: string }>(
       'SELECT e.id FROM peer_endpoints e JOIN sessions s ON s.id=e.actor WHERE s.agent_group_id=?',

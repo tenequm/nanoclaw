@@ -7,6 +7,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { beforeEach, afterEach, expect, it, vi } from 'vitest';
 import { initDb, closeDb, getDb } from '../../db/connection.js';
+import { createAgentGroup } from '../../db/agent-groups.js';
+import { dispatch } from '../../cli/dispatch.js';
+import '../../cli/resources/peers.js';
 import { runMigrations } from '../../db/migrations/index.js';
 import { canonicalSigningText, bodySHA256 } from '../app/contract.js';
 import { parseCidrs } from '../../modules/device-auth/gate.js';
@@ -138,6 +141,74 @@ async function machine(name: string) {
   }
   return { id, call, header, key, epoch, putSession, register, send, replay };
 }
+
+it('renames an open endpoint on live streams and reconnect while preserving queued messages and hops', async () => {
+  const sender = await machine('sender');
+  const observer = await machine('observer');
+  const remote = await sender.register();
+  const id = 'worker';
+  await createAgentGroup({ id, name: id, folder: id, agent_provider: null, created_at: new Date().toISOString() });
+  const mesh = (command: string, address: string) =>
+    dispatch({ id: 'test', command, args: { id, address } }, { caller: 'host' });
+  expect(await mesh('mesh-add', remote)).toMatchObject({
+    ok: false,
+    error: { message: expect.stringContaining('already in use') },
+  });
+  expect(await mesh('mesh-add', 'lead')).toMatchObject({ ok: true });
+  expect(await mesh('mesh-update', remote)).toMatchObject({
+    ok: false,
+    error: { message: expect.stringContaining('already in use') },
+  });
+  const send = async (to: SendRequest['to']) => {
+    const response = await sender.call('POST', '/peer/messages', sender.send(to));
+    expect(response.status).toBe(200);
+    return ((await response.json()) as SendResponse).message;
+  };
+  const first = await send({ address: 'lead' });
+  const queue = () => getDb().all('SELECT * FROM peer_inbound ORDER BY id');
+  const queued = await queue();
+  expect(queued).toHaveLength(1);
+  const conversation = () => getDb().all('SELECT * FROM peer_conversations');
+  const before = await conversation();
+  expect(before).toMatchObject([{ hops: 1 }]);
+  const stream = await sender.replay(await eventHead());
+  const watching = await observer.replay(await eventHead());
+  const endpoint = (address: string) => ({
+    kind: 'endpoint',
+    id: first.endpoint.id,
+    state: 'open',
+    peer: { address, kind: 'agent' },
+    name: address,
+    sessions: [sender.key],
+  });
+  expect(await stream.through('synchronized')).toContainEqual(expect.objectContaining(endpoint('lead')));
+  await watching.through('synchronized');
+  expect(await mesh('mesh-update', 'coordinator')).toMatchObject({ ok: true });
+  expect(await queue()).toEqual(queued);
+  expect(await conversation()).toEqual(before);
+  expect(await stream.through('endpoint')).toContainEqual(expect.objectContaining(endpoint('coordinator')));
+  for (const connection of [stream, watching]) {
+    expect((await connection.through('status')).at(-1)).toMatchObject({ listed: false, peer: { address: 'lead' } });
+    expect((await connection.through('status')).at(-1)).toMatchObject({
+      listed: true,
+      peer: { address: 'coordinator' },
+    });
+    await connection.close();
+  }
+  const reconnect = await sender.replay(await eventHead());
+  expect((await reconnect.through('synchronized')).filter((e) => e.kind === 'endpoint')).toMatchObject([
+    endpoint('coordinator'),
+  ]);
+  await reconnect.close();
+  expect(await send({ endpoint: first.endpoint.id })).toMatchObject({
+    hop: { count: 2 },
+    endpoint: { id: first.endpoint.id, peer: 'coordinator' },
+  });
+  expect(await send({ address: 'coordinator' })).toMatchObject({
+    hop: { count: 3 },
+    endpoint: { id: first.endpoint.id },
+  });
+});
 
 it('routes between two enrolled machines and authorizes a reply only from the addressed session', async () => {
   const a = await machine('one'),
