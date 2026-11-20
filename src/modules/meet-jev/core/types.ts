@@ -32,6 +32,9 @@ export interface Choice<A extends string> {
 /** Jev's answer to the `action` Choice; null when the call failed or timed out (silence, or a wake on a vocative). */
 export type Verdict = Choice<Action>;
 
+/** Whether the agent goes on with its line or yields the turn, when the caller talks over it. */
+export type OverlapAction = 'yield' | 'keep_talking';
+
 /** Whether a landed answer is still wanted, asked when people spoke after its trigger. */
 export type RecheckAction = 'speak' | 'show';
 export const RECHECK_ACTIONS: readonly RecheckAction[] = ['speak', 'show'];
@@ -40,7 +43,8 @@ export type RecheckVerdict = Choice<RecheckAction>;
 export type CallEvent =
   | { kind: 'presence'; speaker: Speaker; joined: boolean; at: number }
   /** A participant's words: partials update the utterance, the final replaces it. */
-  | { kind: 'utterance'; speaker: Speaker; uttId: string; text: string; final: boolean; at: number }
+  | { kind: 'utterance'; speaker: Speaker; uttId: string; text: string; final: boolean; contextOnly?: true; at: number }
+  | { kind: 'overlap'; speaker: Speaker; requestId: string; replyId: string; played: string; text: string; at: number }
   /** A participant started or stopped speaking (the worker's VAD, or a meeting participant's own). */
   | { kind: 'speech'; speaker: Speaker; on: boolean; at: number }
   /** A typed chat line (Meet chat): context only, never a boundary. */
@@ -70,6 +74,7 @@ export type CallEvent =
     };
 
 export type Command =
+  | { kind: 'overlap'; requestId: string; state: JevState; windowVersion: number }
   | { kind: 'status'; status: CallStatus }
   /** Ask Jev about the window as of `windowVersion`; the answer comes back as a `verdict`. */
   | { kind: 'judge'; windowVersion: number; state: JevState }

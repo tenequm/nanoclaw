@@ -10,18 +10,19 @@
  * its VAD marks (the meeting's mixed audio) are logged, never a boundary.
  *
  * On a jev call the host pushes the worker only what the core says to: a `reply` (with its `replyId`)
- * for `speak`, a `revoke` for `revoke`, a `stop` for `stop_playback`, and on a voice call each `status`.
+ * for `speak`, a `revoke` for `revoke`, a `stop` for `stop_playback`, and on a voice call each `status`
+ * and the answer to each of the worker's `overlap` requests.
  * `show` and `drop` push nothing: the agent's message is
  * already in the call chat, since a reply reaches this module from the post-delivery hook.
  */
 import { DataPacket_Kind, RoomServiceClient } from 'livekit-server-sdk';
 
-import type { LiveKitHostEvent } from '../../channels/voice-mode-protocol.js';
+import type { LiveKitHostEvent, OverlapFallback } from '../../channels/voice-mode-protocol.js';
 import { log } from '../../log.js';
 import { callCore } from './core/index.js';
 import type { CallCore, CallEvent, CallKind } from './core/types.js';
 import { createWorkerIngress } from './ingress/worker.js';
-import { askAction, askStillWanted, judgeQuestions } from './judge.js';
+import { askAction, askOverlap, askStillWanted, judgeQuestions } from './judge.js';
 import { policyFor } from './policy.js';
 import { createCallRuntime, type CallRuntime, type JevTurnResult } from './runtime.js';
 
@@ -34,6 +35,11 @@ const MAX_REMEMBERED_REPLIES = 64;
  * null verdict (silence, or a wake on a vocative) and a recheck speaks unchecked.
  */
 export const MAX_JUDGES_PER_MINUTE = 30;
+/**
+ * Barge-in requests one call may make per rolling minute, apart from the judges' so a talkative caller cannot
+ * starve them; past it the worker decides with its word list.
+ */
+export const MAX_OVERLAPS_PER_MINUTE = 30;
 const MINUTE_MS = 60_000;
 
 /** What a jev call needs of the voice channel. */
@@ -42,6 +48,9 @@ export interface JevCallHost {
   statusRoom?: { name: string; url: string; apiKey: string; apiSecret: string };
   /** Which call this is; `voice` when left out. */
   kind?: CallKind;
+  jevOverlapVerdict?: boolean;
+  /** The worker lowers the line's gain during a barge-in instead of pausing it. */
+  jevDuck?: boolean;
   callerName: string;
   agentName: string;
   /** Other names the agent goes by (the vocabulary file's wake names). */
@@ -59,6 +68,7 @@ export interface JevCallHost {
 export interface JevDeps {
   core: CallCore<unknown>;
   judge: typeof askAction;
+  overlap: typeof askOverlap;
   recheck: typeof askStillWanted;
 }
 
@@ -80,21 +90,24 @@ export function createJevCall(host: JevCallHost, deps: Partial<JevDeps> = {}): J
   const judge = deps.judge ?? askAction;
   const recheck = deps.recheck ?? askStillWanted;
   const kind = host.kind ?? 'voice';
+  const judgeOverlap = kind === 'voice' && host.jevOverlapVerdict !== false;
   const policy = policyFor(kind, host.agentName, [...host.agentAliases]);
   const ingress = createWorkerIngress({ name: host.callerName }, host.maxTextBytes);
   const replyTurns = new Map<string, string | null>();
   let replies = 0;
   const fields = { callId: host.callId };
-  log.info('meet-jev: questions', { ...fields, questions: judgeQuestions(host.agentName) });
+  const overlapQuestion = judgeOverlap ? (host.jevDuck ? 'ducked' : 'paused') : undefined;
+  log.info('meet-jev: questions', { ...fields, questions: judgeQuestions(host.agentName, overlapQuestion) });
   const judgedAt: number[] = [];
+  const overlapsAt: number[] = [];
   /** Lines the worker reported started and not yet over: `words` reaches it only while one plays. */
   const playing = new Set<string>();
 
-  const capped = (): boolean => {
+  const capped = (asked = judgedAt, max = MAX_JUDGES_PER_MINUTE): boolean => {
     const now = host.now();
-    while (judgedAt.length > 0 && judgedAt[0] <= now - MINUTE_MS) judgedAt.shift();
-    if (judgedAt.length >= MAX_JUDGES_PER_MINUTE) return true;
-    judgedAt.push(now);
+    while (asked.length > 0 && asked[0] <= now - MINUTE_MS) asked.shift();
+    if (asked.length >= max) return true;
+    asked.push(now);
     return false;
   };
 
@@ -129,6 +142,26 @@ export function createJevCall(host: JevCallHost, deps: Partial<JevDeps> = {}): J
             err: err instanceof Error ? err.message : String(err),
           }),
         );
+    },
+    overlap: async ({ requestId, state, windowVersion }, signal) => {
+      let verdict: Awaited<ReturnType<typeof askOverlap>>['verdict'] = null;
+      let reason: OverlapFallback | undefined;
+      if (capped(overlapsAt, MAX_OVERLAPS_PER_MINUTE)) {
+        reason = 'cap';
+        log.warn('meet-jev: Jev barge-in rate cap reached, the worker decides with its word list', {
+          ...fields,
+          perMinute: MAX_OVERLAPS_PER_MINUTE,
+        });
+      } else {
+        const result = await (deps.overlap ?? askOverlap)(
+          state,
+          { signal, ...fields, windowVersion },
+          overlapQuestion === 'ducked',
+        ).catch(() => null);
+        verdict = result?.verdict ?? null;
+        if (!verdict) reason = result?.reason ?? 'error';
+      }
+      if (!signal.aborted) host.push({ type: 'overlap', requestId, verdict, ...(reason ? { reason } : {}) });
     },
     judge: async (state, signal, windowVersion) => {
       if (!capped()) return judge(state, { signal, ...fields, windowVersion });
@@ -202,6 +235,12 @@ export function createJevCall(host: JevCallHost, deps: Partial<JevDeps> = {}): J
         } else if (kind === 'meet') {
           // The meeting's mixed audio, not a participant: its VAD times go to the log, to read the pipelines' against.
           if (event.kind === 'speech') log.info('meet-jev: worker vad', { ...fields, on: event.on, at: event.at });
+          continue;
+        }
+        if (event.kind === 'overlap' && (!judgeOverlap || !playing.has(event.replyId))) {
+          // An answer at once: the worker would otherwise wait out its deadline before its word list decides.
+          const reason = judgeOverlap ? 'not_playing' : 'off';
+          host.push({ type: 'overlap', requestId: event.requestId, verdict: null, reason });
           continue;
         }
         runtime.feed(event);
