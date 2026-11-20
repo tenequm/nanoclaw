@@ -232,6 +232,8 @@ export interface SpeechSettings {
 
 export interface LiveKitVoiceConfig {
   jevOverlapVerdict?: boolean;
+  /** Caller words on a Jev voice call need Silero's evidence of real speech; on unless false. */
+  jevSpeechGate?: boolean;
   jevDuck?: boolean;
   /** The wake phrase's name (wakePhraseName): what a jev call's people call the agent, over the line's agent name. */
   wakeName?: string;
@@ -980,6 +982,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
       callerName: line.caller.name,
       ...job,
       ...(job.jev && !job.meeting && config.jevOverlapVerdict !== false ? { jevOverlapVerdict: true } : {}),
+      ...(job.jev && !job.meeting && config.jevSpeechGate !== false ? { jevSpeechGate: true } : {}),
       ...(job.jev && !job.meeting && config.jevDuck ? { jevDuck: true } : {}),
       vocabulary: [...(line.agent.vocabulary ?? [])],
       languages,

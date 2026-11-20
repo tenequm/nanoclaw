@@ -7354,8 +7354,10 @@ describe('Jev speech evidence gate', () => {
 
   it.each([
     ['Угу.', 6, true],
-    ['Thank you.', 5, false],
-    ['Thank you.', 12, true],
+    ['Okay.', 6, true],
+    ['Thank you.', 5, true],
+    ['Thanks for watching!', 5, false],
+    ['Thanks for watching!', 12, true],
     ['Thank you for the help.', 5, true],
   ] as const)('a segment "%s" with %i windows is the caller\'s words: %s', async (words, windows, passes) => {
     const h = jevLoop({ evidence: true });
@@ -7470,10 +7472,15 @@ describe('isSttPhantom and heardAsSpeech', () => {
     ['Subtitles by the Amara.org community', true],
     ['Дякую за перегляд!', true],
     ['Продолжение следует...', true],
-    ['Okay.', true],
-    ['Bye.', true],
+    ['Thank you for watching.', true],
     ['you', true],
-    ['Дякую.', true],
+    ['Okay.', false],
+    ['Ok', false],
+    ['Bye.', false],
+    ['Thank you.', false],
+    ['Thanks!', false],
+    ['Дякую.', false],
+    ['Спасибо.', false],
     ['I said you are welcome to join us', false],
     ['Thank you, Dan, that helps.', false],
     ['Угу.', false],
@@ -7486,8 +7493,9 @@ describe('isSttPhantom and heardAsSpeech', () => {
     expect(heardAsSpeech('Угу.', JEV_SPEECH_EVIDENCE_WINDOWS)).toBe(true);
     expect(heardAsSpeech('Угу.', JEV_SPEECH_EVIDENCE_WINDOWS - 1)).toBe(false);
     expect(heardAsSpeech('Wait', JEV_BARGE_EVIDENCE_WINDOWS - 1, JEV_BARGE_EVIDENCE_WINDOWS)).toBe(false);
-    expect(heardAsSpeech('Okay.', JEV_PHANTOM_EVIDENCE_WINDOWS - 1)).toBe(false);
-    expect(heardAsSpeech('Okay.', JEV_PHANTOM_EVIDENCE_WINDOWS)).toBe(true);
+    expect(heardAsSpeech('Okay.', JEV_SPEECH_EVIDENCE_WINDOWS)).toBe(true);
+    expect(heardAsSpeech('Thanks for watching!', JEV_PHANTOM_EVIDENCE_WINDOWS - 1)).toBe(false);
+    expect(heardAsSpeech('Thanks for watching!', JEV_PHANTOM_EVIDENCE_WINDOWS)).toBe(true);
   });
 });
 
@@ -8182,9 +8190,9 @@ describe('jev calls', () => {
           ? `speech:${e.on ? 'on' : 'off'}`
           : `${e.final ? 'final' : 'partial'}:${e.text}`;
 
-  it('ignores a noise segment over a playing line end to end: no cut, no words to the host, no caption', async () => {
+  it.each([true, false])('a noise segment over a playing line end to end, with the speech gate=%s', async (gate) => {
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
-    const { ctx, job } = fakeJob({ ...JEV_META, jevOverlapVerdict: true });
+    const { ctx, job } = fakeJob({ ...JEV_META, jevOverlapVerdict: true, ...(gate ? { jevSpeechGate: true } : {}) });
     const host = fakeHostFetch();
     const sink = {
       captureFrame: async () => {
@@ -8220,10 +8228,20 @@ describe('jev calls', () => {
       v.events.onSpeech(false, 16000);
       await vi.advanceTimersByTimeAsync(JEV_FALSE_INTERRUPTION_TIMEOUT_MS + 10);
       const events = jevEvents(host).flat();
-      expect(events.filter((e) => e.type === 'utterance' || e.type === 'overlap')).toEqual([]);
-      expect(events.some((e) => e.type === 'playback' && e.state === 'cut_off')).toBe(false);
-      expect(v.voice.caption).not.toHaveBeenCalled();
-      expect(v.voice.setSpeechPaused.mock.calls).toEqual([[true], [false]]);
+      if (gate) {
+        // No cut, no words to the host or Jev, no caption: the line resumes as after a wordless sound.
+        expect(events.filter((e) => e.type === 'utterance' || e.type === 'overlap')).toEqual([]);
+        expect(events.some((e) => e.type === 'playback' && e.state === 'cut_off')).toBe(false);
+        expect(v.voice.caption).not.toHaveBeenCalled();
+        expect(v.voice.setSpeechPaused.mock.calls).toEqual([[true], [false]]);
+      } else {
+        // Switched off: the words count as they did before the gate, and Jev is asked about them.
+        expect(events).toContainEqual(expect.objectContaining({ type: 'overlap', text: 'You are welcome.' }));
+        expect(events).toContainEqual(
+          expect.objectContaining({ type: 'utterance', text: 'You are welcome.', final: true, contextOnly: true }),
+        );
+        expect(v.voice.caption).toHaveBeenCalledWith(expect.any(Number), 'You are welcome.', true);
+      }
     } finally {
       host.emit({ type: 'end', reason: 'done' });
       await vi.advanceTimersByTimeAsync(30);

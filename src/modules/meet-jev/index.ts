@@ -20,7 +20,7 @@ import { DataPacket_Kind, RoomServiceClient } from 'livekit-server-sdk';
 import type { LiveKitHostEvent, OverlapFallback } from '../../channels/voice-mode-protocol.js';
 import { log } from '../../log.js';
 import { callCore } from './core/index.js';
-import type { CallCore, CallEvent, CallKind, OverlapAction } from './core/types.js';
+import type { CallCore, CallEvent, CallKind } from './core/types.js';
 import { createWorkerIngress } from './ingress/worker.js';
 import { askAction, askOverlap, askStillWanted, judgeQuestions } from './judge.js';
 import { policyFor } from './policy.js';
@@ -144,7 +144,7 @@ export function createJevCall(host: JevCallHost, deps: Partial<JevDeps> = {}): J
         );
     },
     overlap: async ({ requestId, state, windowVersion }, signal) => {
-      let verdict: OverlapAction | null = null;
+      let verdict: Awaited<ReturnType<typeof askOverlap>>['verdict'] = null;
       let reason: OverlapFallback | undefined;
       if (capped(overlapsAt, MAX_OVERLAPS_PER_MINUTE)) {
         reason = 'cap';

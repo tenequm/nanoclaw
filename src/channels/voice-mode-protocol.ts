@@ -121,6 +121,8 @@ export interface LiveKitJobMetadata {
    */
   jev?: boolean;
   jevOverlapVerdict?: boolean;
+  /** The worker drops caller words without Silero's evidence of real speech (VOICE_MODE_JEV_SPEECH_GATE). */
+  jevSpeechGate?: boolean;
   jevDuck?: boolean;
 }
 

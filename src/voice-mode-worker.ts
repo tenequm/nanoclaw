@@ -4994,7 +4994,10 @@ export const JEV_SPEECH_EVIDENCE_WINDOWS = 3;
 export const JEV_BARGE_EVIDENCE_WINDOWS = 4;
 /** Evidence windows a known STT phantom (the whole text) needs, and a partial needs to be shown or sent at all. */
 export const JEV_PHANTOM_EVIDENCE_WINDOWS = 10;
-/** What speech recognition writes on noise and silence, matched against the whole normalized text only. */
+/**
+ * What speech recognition writes on noise and silence, matched against the whole normalized text only. Words a
+ * caller really says ("okay", "thank you", "bye") stay off it: they keep the ordinary segment bar.
+ */
 export const JEV_PHANTOM_PHRASES: ReadonlySet<string> = new Set([
   'you are welcome',
   'youre welcome',
@@ -5002,21 +5005,13 @@ export const JEV_PHANTOM_PHRASES: ReadonlySet<string> = new Set([
   'thanks for watching',
   'thank you for watching',
   'thanks for watching bye',
+  'thank you for watching bye',
   'subtitles by',
   'дякую за перегляд',
   'продолжение следует',
   'спасибо за просмотр',
   'субтитры',
-  'okay',
-  'ok',
-  'bye',
-  'bye bye',
-  'thank you',
-  'thank you very much',
-  'thanks',
   'you',
-  'дякую',
-  'спасибо',
 ]);
 /** How far back the VAD's windows are kept: the transcription's pre-roll counts toward a segment's evidence. */
 const JEV_VAD_HISTORY_MS = PRE_ROLL_MS + 200;
@@ -6171,7 +6166,7 @@ async function runJevCall(s: JevCallSetup): Promise<void> {
     appCall: !!meta.appCall && voiceCall,
     ...(meta.jevOverlapVerdict && voiceCall ? { overlapPlayedText: () => callVoice?.playedText() ?? '' } : {}),
     ...(meta.jevDuck && voiceCall ? { setSpeechDucked: (on: boolean) => callVoice?.setSpeechDucked(on) } : {}),
-    ...(transcriber ? { speechEvidence: true } : {}),
+    ...(transcriber && meta.jevSpeechGate ? { speechEvidence: true } : {}),
     speak: async (text, ready, signal, replyId) => {
       if (!callVoice) return { heard: false, failed: true, cut: false, audioMs: 0, playedMs: 0, complete: false };
       speakingReplyId = replyId;

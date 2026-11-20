@@ -32,12 +32,13 @@ export interface Choice<A extends string> {
 /** Jev's answer to the `action` Choice; null when the call failed or timed out (silence, or a wake on a vocative). */
 export type Verdict = Choice<Action>;
 
+/** Whether the agent goes on with its line or yields the turn, when the caller talks over it. */
+export type OverlapAction = 'yield' | 'keep_talking';
+
 /** Whether a landed answer is still wanted, asked when people spoke after its trigger. */
 export type RecheckAction = 'speak' | 'show';
 export const RECHECK_ACTIONS: readonly RecheckAction[] = ['speak', 'show'];
 export type RecheckVerdict = Choice<RecheckAction>;
-
-export type OverlapAction = 'yield' | 'keep_talking';
 
 export type CallEvent =
   | { kind: 'presence'; speaker: Speaker; joined: boolean; at: number }

@@ -2397,6 +2397,7 @@ describe("/meet <link> jev: the loop on each participant's own audio", () => {
     const meta = h.lk.dispatches.at(-1)!.metadata;
     expect(meta).not.toHaveProperty('jevDuck');
     expect(meta).not.toHaveProperty('jevOverlapVerdict');
+    expect(meta).not.toHaveProperty('jevSpeechGate');
     expect(meta).toMatchObject({ jev: true, meeting: { pauseSends: false } });
     // The meeting's people call it by the wake phrase's name; the line's agent name is an alias, and the bot keeps it.
     expect(policies).toEqual([
@@ -2598,6 +2599,7 @@ describe('/voice jev on the call core', () => {
     expect(worker.meta.jev).toBe(true);
     expect(worker.meta).not.toHaveProperty('jevDuck');
     expect(worker.meta.jevOverlapVerdict).toBe(true);
+    expect(worker.meta.jevSpeechGate).toBe(true);
     worker.close();
     expect((await post(`${h.base}/livekit/token?v=6&t=tok123`)).status).toBe(200);
     expect(h.lk.dispatches.at(-1)!.metadata).toMatchObject({ jev: true });
@@ -2607,13 +2609,14 @@ describe('/voice jev on the call core', () => {
     await h.stop();
     h = await startHarness(
       { accessCheckIntervalMs: 60_000 },
-      { mirrorApi: chat.api, jevDuck: true, jevOverlapVerdict: false },
+      { mirrorApi: chat.api, jevDuck: true, jevOverlapVerdict: false, jevSpeechGate: false },
     );
     expect((await post(`${h.base}/livekit/token?v=6&t=tok123&jev=0`)).status).toBe(200);
     expect(h.lk.dispatches.at(-1)!.metadata).not.toHaveProperty('jevDuck');
     const worker = await startJevCall();
     expect(worker.meta.jevDuck).toBe(true);
     expect(worker.meta).not.toHaveProperty('jevOverlapVerdict');
+    expect(worker.meta).not.toHaveProperty('jevSpeechGate');
     worker.close();
   });
 

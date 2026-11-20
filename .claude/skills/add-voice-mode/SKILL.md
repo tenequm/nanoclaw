@@ -358,7 +358,7 @@ each speech's 32 ms VAD windows with a probability of at least 0.95
 |---|---|
 | The whole segment: a turn, a wake, the thread transcript (`JEV_SPEECH_EVIDENCE_WINDOWS`) | 3 |
 | A partial that cuts the line or is asked about (`JEV_BARGE_EVIDENCE_WINDOWS`) | 4 |
-| A whole text in `JEV_PHANTOM_PHRASES` ("you are welcome", "thanks for watching", "subtitles by", "bye", "okay", "thank you", "you", "дякую за перегляд", "продолжение следует", and the like), and any partial before it is shown or sent (`JEV_PHANTOM_EVIDENCE_WINDOWS`) | 10 |
+| A whole text in `JEV_PHANTOM_PHRASES` ("you are welcome", "thanks for watching", "subtitles by", a bare "you", "дякую за перегляд", "продолжение следует", and the like), and any partial before it is shown or sent (`JEV_PHANTOM_EVIDENCE_WINDOWS`) | 10 |
 
 A segment without the evidence is noise. It never cuts or wakes the agent,
 never reaches the host or Jev, and never shows in the call's transcript.
@@ -367,7 +367,10 @@ again on each partial, on the final and as the evidence comes in, so a real
 interruption is delayed, never lost. If the speech ends without evidence,
 the line resumes as for a wordless sound. Words the phone reports through
 its interrupt carry its own VAD's say-so and skip the check. Plain calls and
-meetings are unchanged. `heardAsSpeech` is the check for other code.
+meetings are unchanged. `heardAsSpeech` is the check for other code. The
+phantom list holds only what speech recognition invents; words a caller
+really says ("okay", "thank you", "bye", "дякую") keep the segment bar. Set
+`VOICE_MODE_JEV_SPEECH_GATE=0` to turn the check off for new calls.
 
 The bars come from a replay of 296 recorded caller segments from 57 Jev
 calls through the deployed Silero. Every one of the 258 real segments had
@@ -456,6 +459,7 @@ fake LiveKit/Gemini boundaries and cannot prove the microphone or media route.
 | `VOICE_MODE_WAKE_HOP_MS` | `40` | Acoustic scoring hop, `40` or `80` milliseconds; anything else is logged and read as `40`. `40` scores on two interleaved 80 ms grids, about 30% of one core during a call. |
 | `VOICE_MODE_WAKE_START_SECONDS`, `VOICE_MODE_WAKE_IDLE_SECONDS` | `8`, `20` | After the wake phrase, how long the wake waits for the caller's first speech, then how long after the caller's last speech, before it goes back to waiting; zero disables each timer. |
 | `VOICE_MODE_JEV_OVERLAP_VERDICT` | on | `0` or `false` disables Jev barge-in decisions for new Jev voice calls. |
+| `VOICE_MODE_JEV_SPEECH_GATE` | on | `0` or `false` lets caller words on new Jev voice calls through without Silero's evidence of real speech. |
 | `VOICE_MODE_JEV_DUCK` | off | `1` or `true` lowers speech gain during a barge-in on new Jev voice calls. |
 | `VOICE_MODE_RECORDINGS_DAYS` | `0` | Optional private caller/reply recordings in `data/voice-recordings`: one file per turn on a plain call, one per utterance on a jev call (those with no transcript included), and each spoken reply. Meetings record nothing. |
 | `VOICE_MODE_CALL_RECORDING` | off | Debug: `true` or `1` also records each caller's whole call, waiting for the wake phrase included, as `data/voice-recordings/<agent>/<date>/<callId>-call.wav` (16 kHz mono; a plain call keeps the agent's speech as silence, a jev call keeps the caller's audio throughout) with a `.json` of wake detections. Local only, owner-only files; pruned by `VOICE_MODE_RECORDINGS_DAYS` when that is set, kept otherwise. |
