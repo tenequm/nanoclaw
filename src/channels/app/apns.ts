@@ -4,12 +4,9 @@ import { connect, type ClientHttp2Session } from 'node:http2';
 import { setTimeout as delay } from 'node:timers/promises';
 import { log } from '../../log.js';
 import { appConfig, type AppConfig } from './config.js';
-import type { PushPayload } from './contract.js';
+import type { PushPayload, PushTokenRequest } from './contract.js';
 
-export interface PushDestination {
-  token: string;
-  environment: 'sandbox' | 'production';
-}
+export type PushDestination = Omit<PushTokenRequest, 'topic'> & { topic?: string | null };
 export interface PushResult {
   status: number;
   reason?: string;
@@ -93,7 +90,7 @@ export function createApnsClient(options: {
         ':path': `/3/device/${destination.token}`,
         'apns-push-type': 'alert',
         'apns-priority': '10',
-        'apns-topic': options.config.topic ?? undefined,
+        'apns-topic': destination.topic ?? options.config.topic ?? undefined,
         'apns-collapse-id': entityId,
         'apns-id': randomUUID(),
         authorization: `bearer ${token}`,
@@ -154,7 +151,8 @@ export function createApnsClient(options: {
       const body = JSON.stringify(payload);
       if (Buffer.byteLength(body) >= 4096) return { status: 0, reason: 'PayloadTooLarge', clearToken: false };
       const initialToken = jwt(destination.environment);
-      if (!initialToken) return { status: 0, reason: 'EnvironmentDisabled', clearToken: false };
+      if (!initialToken || destination.topic === null)
+        return { status: 0, reason: 'EnvironmentDisabled', clearToken: false };
       let token: string = initialToken;
       let refreshed = false;
       let retries = 0;

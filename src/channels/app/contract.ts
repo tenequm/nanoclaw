@@ -284,6 +284,12 @@ export interface TicketClaims {
   exp: number;
 }
 
+export interface PushTokenRequest {
+  token: string;
+  environment: 'sandbox' | 'production';
+  topic?: string;
+}
+
 export interface PushAlert {
   title: string;
   body: string;

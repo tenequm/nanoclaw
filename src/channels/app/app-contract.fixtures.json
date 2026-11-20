@@ -1631,13 +1631,14 @@
   },
   "pushTokenRequest": {
     "token": "9f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7d6c5b4a39281706f5e4d3c2b1a0",
-    "environment": "sandbox"
+    "environment": "sandbox",
+    "topic": "com.example.client.beta"
   },
   "pushPayload": {
     "headers": {
       "apns-push-type": "alert",
       "apns-priority": "10",
-      "apns-topic": "com.example.HeyDan",
+      "apns-topic": "com.example.client.beta",
       "apns-collapse-id": "msg_2102"
     },
     "body": {

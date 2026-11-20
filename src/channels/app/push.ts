@@ -8,7 +8,7 @@ import { readSignedBody, liveDevices, reachableAgentIds, onDeviceRevoked } from 
 import { json, type AppHandler } from './routes.js';
 import { parseAuthorization, type Badge, type Message, type Question, type PushPayload } from './contract.js';
 import type { EventRow, PushTokenRow } from './db.js';
-import { appConfig, type AppConfig } from './config.js';
+import { allowedPushTopic, appConfig, type AppConfig } from './config.js';
 import { sendPush } from './apns.js';
 
 export function pushTokenHandler(db: () => DbDriver = getDb, readBody = readSignedBody): AppHandler {
@@ -25,7 +25,7 @@ export function pushTokenHandler(db: () => DbDriver = getDb, readBody = readSign
     } catch {
       input = null;
     }
-    const value = input as { token?: unknown; environment?: unknown } | null;
+    const value = input as { token?: unknown; environment?: unknown; topic?: unknown } | null;
     if (
       !value ||
       typeof value.token !== 'string' ||
@@ -35,6 +35,7 @@ export function pushTokenHandler(db: () => DbDriver = getDb, readBody = readSign
       json(res, 400, { error: 'bad_request', message: 'Provide a hexadecimal token and its environment.' });
       return;
     }
+    const topic = typeof value.topic === 'string' && /^[A-Za-z0-9.-]{1,255}$/.test(value.topic) ? value.topic : null;
     const database = db();
     await database.transaction(async () => {
       await database.run(
@@ -43,11 +44,12 @@ export function pushTokenHandler(db: () => DbDriver = getDb, readBody = readSign
         identity.deviceId,
       );
       await database.run(
-        `INSERT INTO app_push_tokens (device_id, token, environment, updated_at) VALUES (?, ?, ?, ?)
-        ON CONFLICT (device_id) DO UPDATE SET token = excluded.token, environment = excluded.environment, updated_at = excluded.updated_at`,
+        `INSERT INTO app_push_tokens (device_id, token, environment, topic, updated_at) VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT (device_id) DO UPDATE SET token = excluded.token, environment = excluded.environment, topic = excluded.topic, updated_at = excluded.updated_at`,
         identity.deviceId,
         value.token,
         value.environment,
+        topic,
         Date.now(),
       );
     });
@@ -85,6 +87,7 @@ export function subscribePush(
   const concurrency = Math.max(1, options.concurrency ?? 4);
   let active = 0;
   let stopped = false;
+  const warnedFallbackTopics = new Map<string, string>();
   let warnedBase = false;
   let warnedFull = false;
   function enqueue(job: () => Promise<void>) {
@@ -155,7 +158,12 @@ export function subscribePush(
             },
           };
           if (stopped || !(await reachableAgentIds(device.id)).includes(event.agent_group_id)) return;
-          const result = await send({ token: row.token, environment: row.environment }, entity.id, payload);
+          const apns = config().apns;
+          const storedTopic = row.topic;
+          const topic = apns.topic && (allowedPushTopic(storedTopic, apns) ?? apns.topic);
+          const usedFallback = storedTopic !== null && topic !== null && topic !== storedTopic;
+          if (!usedFallback) warnedFallbackTopics.delete(device.id);
+          const result = await send({ token: row.token, environment: row.environment, topic }, entity.id, payload);
           const fields = {
             deviceId: device.id,
             entityId: entity.id,
@@ -163,14 +171,22 @@ export function subscribePush(
             status: result.status,
             reason: result.reason,
           };
+          if (usedFallback && result.reason === 'DeviceTokenNotForTopic') {
+            if (warnedFallbackTopics.get(device.id) !== storedTopic) {
+              warnedFallbackTopics.set(device.id, storedTopic);
+              warn('PushRejected', { ...fields, storedTopic });
+            }
+            return;
+          }
           if (result.status !== 200) warn('PushRejected', fields);
           if (result.clearToken) {
             // A delayed rejection must not erase a replacement registration.
             const deleted = await db().run(
-              'DELETE FROM app_push_tokens WHERE device_id = ? AND token = ? AND environment = ? AND updated_at = ?',
+              'DELETE FROM app_push_tokens WHERE device_id = ? AND token = ? AND environment = ? AND topic IS NOT DISTINCT FROM ? AND updated_at = ?',
               device.id,
               row.token,
               row.environment,
+              row.topic,
               row.updated_at,
             );
             if (deleted.changes) warn('PushTokenCleared', fields);
