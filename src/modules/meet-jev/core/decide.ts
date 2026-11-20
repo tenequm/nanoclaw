@@ -20,10 +20,12 @@ import {
   pendingAnswer,
   refreshVersion,
   renderWindow,
+  takesTurn,
   toJevState,
   toRecheckState,
   unmarkHandled,
   unpunctuated,
+  unstartedWake,
   utterancesSince,
   type CallState,
   type Wake,
@@ -46,16 +48,20 @@ const STOP_WORDS = new Set([
 export function reduce(prev: CallState, event: CallEvent): CallState {
   const state = structuredClone<CallState>({ ...prev, commands: [] });
   applyWindow(state, event);
+  if (event.kind === 'speech' || event.kind === 'utterance') holdContinuation(state, event);
+  if (event.kind === 'utterance' && event.final && continuationFor(state, event.speaker.id)) {
+    const previous = latestUtterance(prev, event.speaker.id);
+    if (previous?.uttId === event.uttId && previous.final && previous.text !== event.text.trim())
+      unmarkHandled(state.speakers[event.speaker.id], event.uttId);
+  }
   const out = state.commands;
   switch (event.kind) {
     case 'utterance':
       if (event.final && hasWords(event.text)) out.push({ kind: 'status', status: 'heard' });
-      // Both kinds decide on the final, which comes after the speaker's own VAD end (the worker's, or the
-      // host's per-participant pipeline in a meeting). Only the current utterance's final is a boundary: a late
-      // final of an older one updates the window and decides nothing.
+      // An older final can settle the last open piece of a pending turn.
       if (
         event.final &&
-        state.speakers[event.speaker.id]?.lastUttId === event.uttId &&
+        (state.speakers[event.speaker.id]?.lastUttId === event.uttId || continuationFor(state, event.speaker.id)) &&
         !stillSpeaking(state, event.speaker.id)
       )
         boundary(state, event.speaker.id);
@@ -81,6 +87,11 @@ export function reduce(prev: CallState, event: CallEvent): CallState {
       break;
     case 'verdict':
       onVerdict(state, event.windowVersion, event.verdict, event.ms);
+      // A different participant's judge may have taken the floor while the original speaker finished.
+      if (prev.judging && !state.judging && !floorTaken(state)) {
+        const wake = latestWake(state);
+        if (wake?.continuation && prev.judging.speakerId !== wake.speakerId) boundary(state, wake.speakerId);
+      }
       break;
     case 'recheck_verdict':
       onRecheck(state, event.wakeKey, event.verdict, event.ms);
@@ -110,8 +121,22 @@ export function reduce(prev: CallState, event: CallEvent): CallState {
       if (playing && event.state !== 'started') logPlayback(state, event, playing.wakeKey);
       break;
     }
+    case 'play_ready': {
+      const line = state.playout[event.replyId];
+      if (line) line.requestId = event.requestId;
+      break;
+    }
     case 'chat':
       break;
+  }
+  const pending = latestWake(state);
+  if (pending?.continuation && !pendingAnswer(state)) delete pending.continuation;
+  if (!pending?.continuation) {
+    for (const [replyId, line] of Object.entries(state.playout)) {
+      if (!line.requestId) continue;
+      out.push({ kind: 'allow_play', replyId, requestId: line.requestId });
+      delete line.requestId;
+    }
   }
   refreshVersion(state);
   return state;
@@ -119,6 +144,24 @@ export function reduce(prev: CallState, event: CallEvent): CallState {
 
 export function decide(state: CallState, _event: CallEvent): Command[] {
   return state.commands;
+}
+
+function continuationFor(state: CallState, speakerId: string): Wake | undefined {
+  const wake = latestWake(state);
+  return wake?.continuation && wake.speakerId === speakerId ? wake : undefined;
+}
+
+/** A speaker can extend their wake until its first audio. Other speakers keep the usual recheck. */
+function holdContinuation(state: CallState, event: Extract<CallEvent, { kind: 'speech' | 'utterance' }>): void {
+  const wake = unstartedWake(state, event.speaker.id);
+  if (!wake || wake.continuation) return;
+  if (event.kind === 'speech') {
+    if (!event.on) return;
+  } else {
+    const utt = latestUtterance(state, wake.speakerId);
+    if (utt?.uttId !== event.uttId || !continuationPieces(state, wake).includes(utt)) return;
+  }
+  wake.continuation = { replies: [] };
 }
 
 /** The VAD is exact: a speaker it still hears is not done, whatever a timer says. */
@@ -135,6 +178,27 @@ function log(state: CallState, event: string, fields: Record<string, unknown>): 
  * utterance deferred while someone spoke is.
  */
 function boundary(state: CallState, speakerId: string): void {
+  const wake = latestWake(state);
+  if (wake?.continuation && wake.speakerId === speakerId) {
+    const current = latestUtterance(state, speakerId);
+    const pieces = continuationPieces(state, wake);
+    if (!current || !pieces.includes(current) || pieces.some((u) => !u.final)) return;
+    if (!pieces.some((u) => takesTurn(u.text))) {
+      markHandled(state.speakers[speakerId], current.uttId);
+      const { replies } = wake.continuation;
+      delete wake.continuation;
+      for (const reply of replies) onReply(state, reply.replyId, wake.turnId, reply.text);
+      return;
+    }
+    if (!hasWords(current.text)) {
+      // A wordless last activity can settle after a substantive fragment from the same turn.
+      if (!floorTaken(state) && !isHandled(state.speakers[speakerId], current.uttId)) {
+        markHandled(state.speakers[speakerId], current.uttId);
+        judge(state, speakerId, current.uttId, false);
+      }
+      return;
+    }
+  }
   if (decideLatest(state, speakerId)) return;
   const deferred = state.deferred;
   if (!deferred || floorTaken(state)) return;
@@ -156,7 +220,7 @@ function decideLatest(state: CallState, speakerId: string): boolean {
   const deferred = state.deferred;
   if (deferred) {
     const owner = state.speakers[deferred.speakerId];
-    if (owner) markHandled(owner, deferred.uttId);
+    if (owner && !continuationFor(state, deferred.speakerId)) markHandled(owner, deferred.uttId);
     state.deferred = null;
   }
 
@@ -202,9 +266,29 @@ function decideLatest(state: CallState, speakerId: string): boolean {
   return true;
 }
 
+function continuationPieces(state: CallState, wake: Wake) {
+  const trigger = state.utterances.findIndex((u) => u.speakerId === wake.speakerId && u.uttId === wake.triggerUttId);
+  return state.utterances
+    .filter(
+      (u, i) =>
+        u.speakerId === wake.speakerId &&
+        (u.startedAt > wake.triggerAt || (u.startedAt === wake.triggerAt && i > trigger)),
+    )
+    .sort((a, b) => a.startedAt - b.startedAt);
+}
+
 /** The speaker's open turn as one text, and whether any of it calls the agent by name with words after. */
 function openTurnOf(state: CallState, speakerId: string): { text: string; named: boolean } {
-  const pieces = openTurn(state, speakerId).map((utterance) => utterance.text);
+  const wake = latestWake(state);
+  const pieces =
+    wake?.continuation && wake.speakerId === speakerId
+      ? [
+          wake.trigger,
+          ...continuationPieces(state, wake)
+            .filter((u) => hasWords(u.text))
+            .map((u) => u.text),
+        ]
+      : openTurn(state, speakerId).map((utterance) => utterance.text);
   const text = pieces.join(' ');
   return { text, named: [...pieces, text].some((said) => addressedByName(state, said)) };
 }
@@ -216,6 +300,10 @@ function addressedByName(state: CallState, text: string): boolean {
 }
 
 function judge(state: CallState, speakerId: string, uttId: string, retried: boolean): void {
+  const previous = state.judging;
+  if (previous && previous.speakerId !== speakerId && continuationFor(state, previous.speakerId)) {
+    unmarkHandled(state.speakers[previous.speakerId], previous.uttId);
+  }
   const { text: trigger, named } = openTurnOf(state, speakerId);
   state.judging = {
     version: state.windowVersion,
@@ -253,6 +341,11 @@ function onVerdict(state: CallState, version: number, verdict: Verdict | null, m
     return;
   }
 
+  const wakeInProgress = latestWake(state);
+  if (wakeInProgress?.continuation && wakeInProgress.speakerId === judging.speakerId) {
+    const current = latestUtterance(state, judging.speakerId);
+    if (!current?.final || current.uttId !== judging.uttId) return;
+  }
   if (version !== state.windowVersion) {
     const wokeSince = state.wakes.some((w) => w.seq > judging.seq);
     const utt = latestUtterance(state, judging.speakerId);
@@ -373,6 +466,7 @@ function wake(state: CallState, speakerId: string, uttId: string, message: strin
       replied: false,
       trigger: message,
       triggerAt: triggerAt ?? state.now,
+      triggerUttId: uttId,
       rechecked: null,
     },
   ].slice(-WAKES_KEPT);
@@ -409,12 +503,19 @@ function onReply(state: CallState, replyId: string, turnId: string | null, raw: 
   }
   // People spoke after the trigger: the answer may no longer be wanted. Ask Jev once before speaking (held
   // meanwhile; a stop or a newer wake shows it); nobody spoke, or the same people since the last check: no call.
+  if (latest.continuation) {
+    latest.continuation.replies.push({ replyId, text });
+    log(state, 'reply', { ...fields, outcome: 'held', reason: 'continuation' });
+    return;
+  }
   if (state.recheck?.wakeKey === latest.key) {
     state.recheck.replies.push({ replyId, text });
     log(state, 'reply', { ...fields, outcome: 'held', reason: 'recheck' });
     return;
   }
-  const since = utterancesSince(state, latest).length;
+  const since = utterancesSince(state, latest).filter(
+    (u) => latest.started || u.speakerId !== latest.speakerId || takesTurn(u.text),
+  ).length;
   if (since > 0 && latest.rechecked?.since !== since) {
     state.recheck = { wakeKey: latest.key, since, replies: [{ replyId, text }] };
     state.commands.push({
@@ -447,6 +548,10 @@ function onRecheck(state: CallState, wakeKey: string, verdict: RecheckVerdict | 
   if (!recheck || recheck.wakeKey !== wakeKey) return;
   state.recheck = null;
   const wake = state.wakes.find((w) => w.key === wakeKey);
+  if (wake?.continuation) {
+    wake.continuation.replies.unshift(...recheck.replies);
+    return;
+  }
   const { p } = state.policy.recheckShow;
   const show = !wake || (!!verdict && verdict.action === 'show' && verdict.probabilities.show >= p);
   if (wake) wake.rechecked = { outcome: show ? 'show' : 'speak', since: recheck.since };
@@ -467,6 +572,13 @@ function onRecheck(state: CallState, wakeKey: string, verdict: RecheckVerdict | 
 
 /** A stop or a newer wake during the answer-ready check: its held replies are shown, and its verdict ignored. */
 function endRecheck(state: CallState, reason: 'stopped' | 'replaced'): void {
+  const wake = latestWake(state);
+  if (wake?.continuation) {
+    for (const { replyId, text } of wake.continuation.replies) {
+      state.commands.push(reason === 'stopped' ? { kind: 'drop', replyId } : { kind: 'show', replyId, text });
+    }
+    delete wake.continuation;
+  }
   const recheck = state.recheck;
   if (!recheck) return;
   state.recheck = null;

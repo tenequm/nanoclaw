@@ -754,6 +754,12 @@ function fakeHostFetch(joinedStatus = 200, utteranceStatus = 202) {
     const body = init?.body ? (JSON.parse(String(init.body)) as Record<string, unknown>) : null;
     const auth = (init?.headers as Record<string, string> | undefined)?.Authorization;
     calls.push({ url, auth, body });
+    if (url.endsWith('/jev')) {
+      for (const event of body?.events as JevWorkerEvent[]) {
+        if (event.type === 'play_ready')
+          push(JSON.stringify({ type: 'allow_play', replyId: event.replyId, requestId: event.requestId }));
+      }
+    }
     if (url.includes('/events')) return new Response(stream, { status: 200 });
     if (url.endsWith('/joined')) return new Response('{}', { status: joinedStatus });
     if (url.endsWith('/utterance')) return new Response(JSON.stringify({ id: '1' }), { status: utteranceStatus });
@@ -6857,7 +6863,8 @@ describe('jev: the reporter', () => {
 /** A JevLoop over a fake transcription (none: a meeting's) and a speech output the test drives line by line. */
 function jevLoop({ transcribed = true, app = false }: { transcribed?: boolean; app?: boolean } = {}) {
   const transcription = fakeTranscription();
-  const events: JevWorkerEvent[] = [];
+  const events: Exclude<JevWorkerEvent, { type: 'play_ready' }>[] = [];
+  const allowPlay = vi.fn((replyId: string, requestId: string) => loop.onAllowPlay(replyId, requestId));
   const captions: Array<[number, string, boolean]> = [];
   const recorded: Array<[number, TurnAudio, string, string | undefined]> = [];
   interface Line {
@@ -6895,7 +6902,11 @@ function jevLoop({ transcribed = true, app = false }: { transcribed?: boolean; a
     appCall: app,
     setSpeechPaused: vi.fn(),
     speak,
-    report: (event) => void events.push(event),
+    confirmPlayout: true,
+    report: (event) => {
+      if (event.type === 'play_ready') allowPlay(event.replyId, event.requestId);
+      else events.push(event);
+    },
     caption: (segment, text, final) => void captions.push([segment, text, final]),
     recorded: (segment, audio, transcript, reason) => void recorded.push([segment, audio, transcript, reason]),
     log: silentLog,
@@ -6908,6 +6919,7 @@ function jevLoop({ transcribed = true, app = false }: { transcribed?: boolean; a
     recorded,
     speak,
     lines,
+    allowPlay,
     /** The events so far, one word each. */
     kinds: () =>
       events.map((e) =>
@@ -7245,14 +7257,37 @@ describe('jev: the loop', () => {
     h.loop.onSpeech(true, 20_000);
     h.loop.onInterim('And');
     expect(new Set(h.events.filter((e) => e.type === 'utterance').map((e) => e.uttId)).size).toBe(2);
-    // Speech that came to nothing is marks only: the host never hears of a noise.
+    // Even an empty activity settles the host's wait for a final.
     h.loop.onSpeech(false, 21_000);
     await flush();
     const before = h.events.length;
     h.loop.onSpeech(true, 22_000);
     h.loop.onSpeech(false, 22_500);
     await flush();
-    expect(h.kinds().slice(before)).toEqual(['speech:on', 'speech:off']);
+    expect(h.kinds().slice(before)).toEqual(['speech:on', 'speech:off', 'final:']);
+  });
+
+  it('requires a fresh host decision if the caller resumes before first audio', async () => {
+    const h = jevLoop();
+    h.allowPlay.mockImplementation(() => undefined);
+    h.loop.onReply('r1', 'The first answer.');
+    await flush();
+    const request = () => h.allowPlay.mock.calls.at(-1)![1];
+    const first = request();
+    h.loop.onSpeech(true, 0);
+    h.loop.onSpeech(false, 16000);
+    await flush();
+    const next = request();
+    expect(next).not.toBe(first);
+    h.loop.onAllowPlay('r1', first);
+    await flush();
+    expect(h.lines[0].waited).toBe(false);
+    h.loop.onRevoke('r1');
+    h.loop.onAllowPlay('r1', next);
+    await flush();
+    expect(h.kinds()).toContain('r1:cut_off');
+    expect(h.lines[0].waited).toBe(false);
+    h.loop.close();
   });
 
   it('a reply is spoken once the caller is quiet, and reported started then completed; never over live speech', async () => {
@@ -7607,10 +7642,12 @@ describe('jev: the loop', () => {
 });
 
 describe('jev calls', () => {
-  const JEV_META: LiveKitJobMetadata = { ...META, jev: true };
+  const JEV_META: LiveKitJobMetadata = { ...META, jev: true, confirmPlayout: true };
   const jevEvents = (host: ReturnType<typeof fakeHostFetch>) =>
-    host.calls.filter((c) => c.url.endsWith('/jev')).map((c) => c.body!.events as JevWorkerEvent[]);
-  const summary = (e: JevWorkerEvent) =>
+    host.calls
+      .filter((c) => c.url.endsWith('/jev'))
+      .map((c) => (c.body!.events as JevWorkerEvent[]).filter((e) => e.type !== 'play_ready'));
+  const summary = (e: Exclude<JevWorkerEvent, { type: 'play_ready' }>) =>
     e.type === 'playback'
       ? `${e.replyId}:${e.state}`
       : e.type === 'speech'
@@ -7830,8 +7867,10 @@ describe('jev calls', () => {
       await vi.advanceTimersByTimeAsync(10);
       expect(jevEvents(host).flat().map(summary)).not.toContain('r3:started');
       await vi.advanceTimersByTimeAsync(JEV_WORDS_WINDOW_MS);
-      expect(jevEvents(host).flat().map(summary)).toEqual(
-        expect.arrayContaining(['speech:off', 'final:Wait', 'r3:completed']),
+      await vi.waitFor(() =>
+        expect(jevEvents(host).flat().map(summary)).toEqual(
+          expect.arrayContaining(['speech:off', 'final:Wait', 'r3:completed']),
+        ),
       );
     } finally {
       host.emit({ type: 'end', reason: 'done' });

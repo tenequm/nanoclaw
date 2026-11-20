@@ -147,12 +147,12 @@ describe('createMeetingAudio', () => {
     expect(h.events[0]).toMatchObject({ speaker: alex, at: T0 + 750 });
     expect(h.events[3]).toMatchObject({ at: T0 + 1100 });
     expect(h.words()).toBe(2);
-    // The next speech is a new utterance; one that heard nothing is marks only.
+    // The next speech is a new utterance; one that heard nothing still settles its final.
     h.vads[0].onSpeech(true, 20_000);
     h.stts[0].heard = { interim: '' };
     h.vads[0].onSpeech(false, 21_000);
     await flush();
-    expect(h.summary().slice(5)).toEqual(['100:speech:on', '100:speech:off']);
+    expect(h.summary().slice(5)).toEqual(['100:speech:on', '100:speech:off', '100:100-1:final:']);
     // An acknowledgement is a partial for the host, but no words for the worker's reflex.
     h.vads[0].onSpeech(true, 24_000);
     h.stts[0].options.onInterim('Uh-huh.');

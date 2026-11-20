@@ -94,6 +94,8 @@ export interface LiveKitJobMetadata {
   agentName: string;
   callerName: string;
   callerIdentity: string;
+  /** The host confirms each Jev reply immediately before its first audio. */
+  confirmPlayout?: true;
   /** A call started through the app API. */
   appCall?: boolean;
   /** Spelling hints for the transcription: VOICE_MODE_VOCABULARY plus the agent's voice.vocabulary.txt. */
@@ -131,7 +133,8 @@ export type JevWorkerEvent =
   /** Words heard: partials of one `uttId` update it, its final replaces it. */
   | { type: 'utterance'; uttId: string; text: string; final: boolean; at: number }
   /** VAD start or end of speech on the call's input. */
-  | { type: 'speech'; on: boolean; at: number }
+  | { type: 'speech'; on: boolean; uttId?: string; at: number }
+  | { type: 'play_ready'; replyId: string; requestId: string; at: number }
   /**
    * What became of a `reply` with a `replyId`: started playing, played out, aborted by the reflex
    * or a `stop` (`cut_off`, with the approximate text that got out), or not synthesized (`failed`).
@@ -540,6 +543,7 @@ export type LiveKitHostEvent =
   | { type: 'revoke'; replyId: string }
   | { type: 'words' }
   | { type: 'thinking' }
+  | { type: 'allow_play'; replyId: string; requestId: string }
   | { type: 'working' }
   /** A jev voice call's state as the host's loop sees it: the worker plays its cues from it. */
   | { type: 'status'; status: 'heard' | 'thinking' | 'speaking' | 'idle' }

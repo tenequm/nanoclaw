@@ -66,9 +66,13 @@ export interface Wake {
   /** Refused, or replaced before delivery: no answer will come. */
   dropped: boolean;
   replied: boolean;
+  started?: boolean;
+  /** While the speaker finishes the pending turn, new replies stay here until its boundary decides. */
+  continuation?: { replies: { replyId: string; text: string }[] };
   /** The utterance it answers and when that started: people speaking after it make a landed answer rechecked. */
   trigger: string;
   triggerAt: number;
+  triggerUttId: string;
   /** The last recheck's outcome and how many utterances followed the trigger then; reused while that holds. */
   rechecked: { outcome: RecheckAction; since: number } | null;
 }
@@ -108,7 +112,7 @@ export interface CallState {
   chat: ChatLine[];
   agentLines: AgentLine[];
   /** Replies sent to `speak` that have not finished playing: replyId -> text and the wake. */
-  playout: Record<string, { text: string; wakeKey: string | null }>;
+  playout: Record<string, { text: string; wakeKey: string | null; requestId?: string }>;
   /** Replies a stop took out of `playout` before the host heard them start: the worker still reports them. */
   stoppedPlayout: Record<string, { text: string; wakeKey: string | null }>;
   /** The newest few wakes, oldest first. */
@@ -197,6 +201,25 @@ export function openTurn(state: CallState, speakerId: string): Utterance[] {
   return pieces;
 }
 
+/**
+ * What a listener says over the agent to show they follow, not to take the turn: never enough to cut
+ * the agent off. Lowercase; English, Ukrainian, Russian and Latin transliterations, a few others.
+ */
+const ACKNOWLEDGEMENTS = new Set([
+  ...['uh', 'huh', 'um', 'ah', 'oh', 'yeah', 'yes', 'yep', 'yup', 'ok', 'okay', 'right', 'sure', 'i', 'see'],
+  ...['ага', 'угу', 'так', 'ок', 'добре', 'зрозуміло', 'да', 'хорошо', 'понятно'],
+  ...['aga', 'ugu', 'tak', 'da', 'ja', 'genau', 'oui', 'si', 'sí', 'vale'],
+]);
+/** Hums of any length: `m`, `mm`, `hmm`, `mhm`, `mm-hmm`'s parts, `uhh`, `umm`, `ahh`, `ohh`. */
+const HUM = /^(?:h*m+(?:h+m+)*|u+[hm]+|a+h+|o+h+)$/u;
+
+/** `text` has a word besides acknowledgements and hums: the caller takes the turn from the agent. */
+export function takesTurn(text: string): boolean {
+  return (text.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? []).some(
+    (word) => !ACKNOWLEDGEMENTS.has(word) && !HUM.test(word),
+  );
+}
+
 export const latestWake = (state: CallState): Wake | undefined => state.wakes[state.wakes.length - 1];
 
 export function agentSpeaking(state: CallState): boolean {
@@ -212,9 +235,26 @@ export function awaitingAgent(state: CallState): boolean {
   return !!wake && !wake.dropped && !wake.replied && (state.stoppedSeq === null || state.stoppedSeq < wake.seq);
 }
 
+export function unstartedWake(state: CallState, speakerId: string): Wake | undefined {
+  const wake = latestWake(state);
+  if (!wake || wake.speakerId !== speakerId || wake.started) return;
+  if (
+    awaitingAgent(state) ||
+    wake.continuation ||
+    state.recheck?.wakeKey === wake.key ||
+    Object.values(state.playout).some((line) => line.wakeKey === wake.key)
+  )
+    return wake;
+}
+
 /** An answer is on its way: the latest wake awaits its reply (and no stop came), or a reply is still to play. */
 export function pendingAnswer(state: CallState): boolean {
-  return Object.keys(state.playout).length > 0 || state.recheck !== null || awaitingAgent(state);
+  return (
+    Object.keys(state.playout).length > 0 ||
+    state.recheck !== null ||
+    !!latestWake(state)?.continuation?.replies.length ||
+    awaitingAgent(state)
+  );
 }
 
 /**
@@ -249,6 +289,8 @@ export function applyWindow(state: CallState, event: CallEvent): void {
         utt.at = event.at;
         break;
       }
+      // Empty finals settle tracked continuations. Outside one, wordless sound is only a VAD mark.
+      if (event.final && !text) break;
       // A new uttId while the current speech already showed its own utterance belongs to an earlier speech: a final
       // that settled late, placed before the current line and not made current.
       const late = speaker.claimed !== null && speaker.claimed === speaker.speeches;
@@ -269,6 +311,19 @@ export function applyWindow(state: CallState, event: CallEvent): void {
     case 'speech': {
       const speaker = touchSpeaker(state, event.speaker.id, event.speaker.name);
       if (event.on && !speaker.speaking) speaker.speeches += 1;
+      if (event.on && event.uttId && event.uttId !== speaker.lastUttId && unstartedWake(state, event.speaker.id)) {
+        // Identify this activity before any final from an earlier transcription can arrive.
+        state.utterances.push({
+          speakerId: event.speaker.id,
+          uttId: event.uttId,
+          text: '',
+          final: false,
+          startedAt: event.at,
+          at: event.at,
+        });
+        speaker.lastUttId = event.uttId;
+        speaker.claimed = speaker.speeches;
+      }
       speaker.lastHeardAt = event.at;
       speaker.speaking = event.on;
       break;
@@ -282,6 +337,8 @@ export function applyWindow(state: CallState, event: CallEvent): void {
       if (!playing) break;
       const line = state.agentLines.find((l) => l.replyId === event.replyId);
       if (event.state === 'started') {
+        const wake = state.wakes.find((w) => w.key === playing.wakeKey);
+        if (wake) wake.started = true;
         if (!line)
           state.agentLines.push({ replyId: event.replyId, text: playing.text, state: 'playing', at: event.at });
         state.agentLastSpokeAt = event.at;

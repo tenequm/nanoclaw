@@ -801,6 +801,109 @@ describe('a verdict after the speaker resumed', () => {
   });
 });
 
+describe('continuing a turn before playback', () => {
+  const speaker = { id: 'caller', name: 'Caller' };
+  const reply: Fed = { kind: 'reply', replyId: 'r1', turnId: 't1', text: 'The first answer.' };
+  const say = (uttId: string, text: string, at: number): Fed => ({
+    kind: 'utterance',
+    speaker,
+    uttId,
+    text,
+    final: true,
+    at,
+  });
+
+  it('waits through the fragment, quiet and late final, then speaks only the replacement', () => {
+    const call = new Call();
+    const trigger = 'Can you help me understand';
+    const [first] = only(call.feed(say('a', trigger, 1000)), 'judge');
+    call.feed({
+      kind: 'verdict',
+      windowVersion: first.windowVersion,
+      ms: 260,
+      at: 1260,
+      verdict: {
+        action: 'answer',
+        probabilities: { answer: 0.66, stop: 0, continue: 0, stay_silent: 0.34 },
+        confidence: 0.66,
+      },
+    });
+    call.feed({ kind: 'turn', key: 'w1', turnId: 't1' });
+    const beforeFinal = call.feed(
+      { kind: 'speech', speaker, on: true, uttId: 'c', at: 1520 },
+      say('b', 'whether', 3900),
+      { ...reply, at: 5090 },
+      {
+        kind: 'recheck_verdict',
+        wakeKey: 'w1',
+        at: 5320,
+        ms: 230,
+        verdict: { action: 'speak', probabilities: { speak: 0.78, show: 0.22 }, confidence: 0.78 },
+      },
+      { kind: 'speech', speaker, on: false, at: 11150 },
+    );
+    expect(beforeFinal.filter((c) => c.kind !== 'wait')).toEqual([]);
+    const merged = trigger + ' whether the library is open?';
+    const [judge] = only(call.feed(say('c', 'the library is open?', 11160)), 'judge');
+    expect(judge.state.latest?.text).toBe(merged);
+    const result = call.verdict(judge.windowVersion, 'answer');
+    expect(only(result, 'show').map((c) => c.replyId)).toEqual(['r1']);
+    expect(only(result, 'turn').map((c) => c.message)).toEqual([merged]);
+    call.feed({ kind: 'turn', key: 'w2', turnId: 't2' });
+    expect(call.feed({ ...reply, turnId: 't2', replyId: 'r2', text: 'It opens at ten.' })).toEqual([
+      { kind: 'speak', replyId: 'r2', text: 'It opens at ten.' },
+    ]);
+    expect(call.feed({ kind: 'play_ready', replyId: 'r1', requestId: 'old' })).toEqual([]);
+    expect(call.feed({ kind: 'play_ready', replyId: 'r2', requestId: 'new' })).toEqual([
+      { kind: 'allow_play', replyId: 'r2', requestId: 'new' },
+    ]);
+    call.feed(
+      { kind: 'playback', replyId: 'r2', state: 'started' },
+      { kind: 'playback', replyId: 'r2', state: 'completed' },
+    );
+    expect(call.state.agentLines.map((l) => l.text)).toEqual(['It opens at ten.']);
+  });
+
+  it('waits for outstanding finals in either order and drops held speech on stop', () => {
+    const call = new Call();
+    call.sayAnswered(speaker, 'a', 'Can you check');
+    call.feed({ kind: 'turn', key: 'w1', turnId: 't1' });
+    for (const uttId of ['b', 'c']) {
+      call.feed({ kind: 'speech', speaker, uttId, on: true }, { kind: 'speech', speaker, on: false });
+    }
+    expect(call.feed(reply, say('c', '', 3000), { kind: 'timer', key: 'boundary:caller', at: 7000 })).toEqual([]);
+    const [judge] = only(call.feed(say('b', 'the library hours', 7100)), 'judge');
+    expect(judge.state.latest?.text).toBe('Can you check the library hours');
+    const result = call.verdict(judge.windowVersion, 'stop');
+    expect(only(result, 'drop').map((c) => c.replyId)).toEqual(['r1']);
+    expect(only(result, 'stop_playback')).toHaveLength(1);
+  });
+
+  it('releases the original answer after a backchannel final', () => {
+    const call = new Call();
+    call.sayAnswered(speaker, 'a', 'When does the library open?');
+    call.feed({ kind: 'turn', key: 'w1', turnId: 't1' }, { kind: 'speech', speaker, on: true, uttId: 'b' });
+    expect(call.feed(reply)).toEqual([]);
+    call.feed({ kind: 'speech', speaker, on: false });
+    expect(call.feed(say('b', 'угу', 3000))).toEqual([{ kind: 'speak', replyId: 'r1', text: reply.text }]);
+  });
+
+  it('keeps a queued reply held after stay_silent and revokes it on a later answer', () => {
+    const call = new Call('meet');
+    call.feed({ kind: 'presence', speaker: olena, joined: true }, { kind: 'presence', speaker, joined: true });
+    call.sayAnswered(speaker, 'a', 'Can you check');
+    call.feed({ kind: 'turn', key: 'w1', turnId: 't1' }, reply);
+    const [judge] = only(call.say(speaker, 'b', 'the opening hours'), 'judge');
+    expect(judge.state.latest?.text).toBe('Can you check the opening hours');
+    expect(call.feed({ kind: 'play_ready', replyId: 'r1', requestId: 'q1' })).toEqual([]);
+    expect(call.verdict(judge.windowVersion, 'stay_silent')).toEqual([]);
+    const result = call.sayAnswered(speaker, 'c', 'for the library?');
+    expect(only(result, 'turn').map((c) => c.message)).toEqual(['Can you check the opening hours for the library?']);
+    expect(only(result, 'revoke').map((c) => c.replyId)).toEqual(['r1']);
+    expect(only(result, 'allow_play')).toEqual([]);
+  });
+});
+
 describe('the answer-ready recheck', () => {
   /** Misha asks in a meeting, Olena speaks before the reply lands: returns the commands of the landed reply. */
   function answeredMeanwhile(call: Call, olenaSays = 'It is Lima.'): Command[] {
@@ -871,6 +974,22 @@ describe('the answer-ready recheck', () => {
     answeredMeanwhile(call);
     expect(recheckVerdict(call, null)).toEqual([{ kind: 'speak', replyId: 'r1', text: 'Lima.' }]);
     expect(call.lastLog('recheck')).toMatchObject({ jev: null, outcome: 'spoken', reason: 'jev_failed' });
+  });
+
+  it('holds a still_wanted verdict that crossed the original speaker resuming', () => {
+    const call = new Call('meet');
+    answeredMeanwhile(call);
+    call.feed({ kind: 'speech', speaker: misha, on: true, uttId: 'u2' });
+    expect(recheckVerdict(call, 'speak')).toEqual([]);
+    call.feed({ kind: 'speech', speaker: misha, on: false });
+    const [judge] = only(
+      call.feed({ kind: 'utterance', speaker: misha, uttId: 'u2', text: 'and of Chile?', final: true }),
+      'judge',
+    );
+    expect(judge.state.latest?.text).toBe('Dan, what is the capital of Peru? and of Chile?');
+    const result = call.verdict(judge.windowVersion, 'answer');
+    expect(only(result, 'show').map((c) => c.replyId)).toEqual(['r1']);
+    expect(only(result, 'speak')).toEqual([]);
   });
 
   it('a stop during the check shows the held reply, and the late verdict is ignored', () => {

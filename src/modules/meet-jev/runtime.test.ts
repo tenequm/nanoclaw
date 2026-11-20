@@ -61,6 +61,7 @@ function fakePorts(overrides: Partial<RuntimePorts> = {}) {
     recheck: async () => ({ verdict: null, ms: 0 }),
     turn: ({ message, note }, signal) => new Promise((resolve) => turns.push({ message, note, signal, resolve })),
     speak: (replyId, text) => void calls.push(['speak', replyId, text]),
+    allowPlay: (replyId, requestId) => void calls.push(['allow_play', replyId, requestId]),
     show: (replyId, text) => void calls.push(['show', replyId, text]),
     drop: (replyId) => void calls.push(['drop', replyId]),
     revoke: (replyId) => void calls.push(['revoke', replyId]),

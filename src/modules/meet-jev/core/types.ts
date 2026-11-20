@@ -42,7 +42,8 @@ export type CallEvent =
   /** A participant's words: partials update the utterance, the final replaces it. */
   | { kind: 'utterance'; speaker: Speaker; uttId: string; text: string; final: boolean; at: number }
   /** A participant started or stopped speaking (the worker's VAD, or a meeting participant's own). */
-  | { kind: 'speech'; speaker: Speaker; on: boolean; at: number }
+  | { kind: 'speech'; speaker: Speaker; on: boolean; uttId?: string; at: number }
+  | { kind: 'play_ready'; replyId: string; requestId: string; at: number }
   /** A typed chat line (Meet chat): context only, never a boundary. */
   | { kind: 'chat'; speaker: Speaker; text: string; at: number }
   /** The answer to a `judge` command, for the window version it was asked on. */
@@ -86,6 +87,7 @@ export type Command =
   | { kind: 'turn'; key: string; message: string; note: string; supersedes?: string }
   /** Speak a reply into the room. */
   | { kind: 'speak'; replyId: string; text: string }
+  | { kind: 'allow_play'; replyId: string; requestId: string }
   /** Show a reply in the call chat without speaking it (a replaced turn, after a stop). */
   | { kind: 'show'; replyId: string; text: string }
   /** Drop a reply: the agent answered `[silent]`. */

@@ -170,6 +170,7 @@ export function createJevCall(host: JevCallHost, deps: Partial<JevDeps> = {}): J
       const turn = replyTurns.get(replyId) ?? null;
       host.push({ type: 'reply', text, turn, replyId });
     },
+    allowPlay: (replyId, requestId) => host.push({ type: 'allow_play', replyId, requestId }),
     show: () => undefined,
     drop: () => undefined,
     revoke: (replyId) => host.push({ type: 'revoke', replyId }),
@@ -199,7 +200,7 @@ export function createJevCall(host: JevCallHost, deps: Partial<JevDeps> = {}): J
         if (event.kind === 'playback') {
           if (event.state === 'started') playing.add(event.replyId);
           else playing.delete(event.replyId);
-        } else if (kind === 'meet') {
+        } else if (kind === 'meet' && event.kind !== 'play_ready') {
           // The meeting's mixed audio, not a participant: its VAD times go to the log, to read the pipelines' against.
           if (event.kind === 'speech') log.info('meet-jev: worker vad', { ...fields, on: event.on, at: event.at });
           continue;

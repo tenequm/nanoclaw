@@ -247,8 +247,14 @@ class Pipeline {
     this.speaking = true;
     this.quietSince = null;
     clearTimeout(this.idleTimer);
-    this.emit({ kind: 'speech', speaker: this.speaker, on: true, at: this.atOf(position) });
     this.utterance = { uttId: this.nextUttId(), text: '' };
+    this.emit({
+      kind: 'speech',
+      speaker: this.speaker,
+      on: true,
+      uttId: this.utterance.uttId,
+      at: this.atOf(position),
+    });
     this.stt.begin(this.ring.since(position - samplesOf(PRE_ROLL_MS)));
     // The next activity's socket, set up while this one runs: no connect latency at the next speech.
     void this.stt.prepare();
@@ -265,22 +271,21 @@ class Pipeline {
     const utterance = this.utterance;
     this.utterance = undefined;
     if (!utterance) return Promise.resolve();
+    const finish = (text: string) =>
+      this.emit({
+        kind: 'utterance',
+        speaker: this.speaker,
+        uttId: utterance.uttId,
+        text,
+        final: true,
+        at: this.opts.now(),
+      });
     return this.stt.end().then(
-      (heard) => {
-        const { text } = turnText(heard);
-        // Nothing heard and nothing shown: a noise, which the loop never hears of.
-        if (!text && !utterance.text) return;
-        this.emit({
-          kind: 'utterance',
-          speaker: this.speaker,
-          uttId: utterance.uttId,
-          text,
-          final: true,
-          at: this.opts.now(),
-        });
+      (heard) => finish(turnText(heard).text),
+      (err: unknown) => {
+        this.opts.log.warn('meet-jev audio: an utterance has no final', { speaker: this.speaker.id, err });
+        finish(utterance.text);
       },
-      (err: unknown) =>
-        this.opts.log.warn('meet-jev audio: an utterance has no final', { speaker: this.speaker.id, err }),
     );
   }
 

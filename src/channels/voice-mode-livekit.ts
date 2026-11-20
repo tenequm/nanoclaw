@@ -972,6 +972,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     call.accessTimer.unref();
     const metadata: LiveKitJobMetadata = {
       v: LIVEKIT_PROTOCOL_VERSION,
+      ...(job.jev ? { confirmPlayout: true } : {}),
       callId,
       lineId: platformId,
       agentName: line.agent.name,

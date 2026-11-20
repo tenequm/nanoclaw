@@ -35,6 +35,7 @@ export interface RuntimePorts {
   /** Submit a turn; an aborted `signal` (superseded, or the call ended) stops it being routed, or the wait for it. */
   turn(turn: { message: string; note: string }, signal: AbortSignal): Promise<JevTurnResult>;
   speak(replyId: string, text: string): void;
+  allowPlay(replyId: string, requestId: string): void;
   show(replyId: string, text: string): void;
   drop(replyId: string): void;
   revoke(replyId: string): void;
@@ -142,6 +143,8 @@ export function createCallRuntime<S>(core: CallCore<S>, policy: CallPolicy, port
         return turn(command);
       case 'speak':
         return ports.speak(command.replyId, command.text);
+      case 'allow_play':
+        return ports.allowPlay(command.replyId, command.requestId);
       case 'show':
         return ports.show(command.replyId, command.text);
       case 'drop':

@@ -4988,7 +4988,15 @@ export class JevReporter {
         });
       }
     }
-    this.inFlight ??= this.flush().finally(() => (this.inFlight = undefined));
+    this.startFlush();
+  }
+
+  private startFlush(): void {
+    this.inFlight ??= this.flush().finally(() => {
+      this.inFlight = undefined;
+      // A report can land after flush sees an empty queue but before this promise settles.
+      if (this.queue.length) this.startFlush();
+    });
   }
 
   /** Settles once everything reported so far went out or was dropped. */
@@ -5088,6 +5096,7 @@ export function serveAppInterrupt(
 }
 
 export interface JevLoopDeps {
+  confirmPlayout: boolean;
   /** None on a meeting: the host transcribes each participant, and the reflex has its `words`. */
   transcriber?: Transcription;
   appCall?: boolean;
@@ -5167,6 +5176,7 @@ export class JevLoop {
   private readonly queue: JevPlayout[] = [];
   private playing?: JevPlayout;
   private pumping = false;
+  private playRequest?: { id: string; allowed: boolean };
   private readonly wakers = new Set<() => void>();
   private readonly capture?: TurnCapture;
   private closed = false;
@@ -5192,8 +5202,17 @@ export class JevLoop {
     if (!speaking) this.reflex();
     clearTimeout(this.resumeTimer);
     this.speaking = speaking;
-    this.deps.report({ type: 'speech', on: speaking, at: this.now() });
     const transcriber = this.deps.transcriber;
+    if (speaking) {
+      this.playRequest = undefined;
+      if (transcriber) this.utterance = { uttId: randomUUID(), segment: ++this.segments, text: '', worded: false };
+    }
+    this.deps.report({
+      type: 'speech',
+      on: speaking,
+      ...(speaking && this.utterance ? { uttId: this.utterance.uttId } : {}),
+      at: this.now(),
+    });
     if (speaking) {
       this.speechSince = this.now();
       this.wordsHeard = this.earlyWordsAt !== undefined && this.speechSince - this.earlyWordsAt <= JEV_WORDS_WINDOW_MS;
@@ -5202,7 +5221,6 @@ export class JevLoop {
       this.pauseSpent = false;
       this.speechOver = this.playing?.started ? this.playing : undefined;
       if (transcriber) {
-        this.utterance = { uttId: randomUUID(), segment: ++this.segments, text: '', worded: false };
         const preRoll = this.ring.since(Math.max(preRollFloor, at - samplesOf(PRE_ROLL_MS)));
         transcriber.begin(preRoll);
         this.capture?.start(preRoll);
@@ -5218,6 +5236,7 @@ export class JevLoop {
     const utterance = this.utterance;
     this.utterance = undefined;
     const endedAt = this.now();
+    const beforePlayback = !this.speechOver;
     this.lastSpeech = {
       endedAt,
       endSample: at,
@@ -5240,9 +5259,9 @@ export class JevLoop {
     transcriber.end().then(
       (heard) => {
         const text = turnText(heard).text || (utterance.phoneWords ? utterance.text || utterance.phoneWords : '');
-        // Nothing heard and nothing shown: a noise, which the host never hears of. Its recording says
-        // whether it was long enough to have been words the transcription missed.
+        // An empty final releases a reply held through a wordless activity.
         if (!text && !utterance.text) {
+          if (beforePlayback) this.finishUtterance(utterance, '');
           utterance.needsPhoneFinal = true;
           if (audio) {
             const reason = heard.failed || audio.speechMs >= MIN_LOST_SPEECH_MS ? 'stt' : 'noise';
@@ -5263,6 +5282,7 @@ export class JevLoop {
       (err: unknown) => {
         this.deps.log.warn('voice-mode worker: an utterance has no final', { err });
         if (audio) this.deps.recorded?.(utterance.segment, audio, utterance.text, 'stt');
+        if (beforePlayback && !utterance.phoneWords) this.finishUtterance(utterance, utterance.text);
         utterance.needsPhoneFinal = true;
         if (utterance.phoneWords) this.finishUtterance(utterance, utterance.text || utterance.phoneWords);
       },
@@ -5520,7 +5540,7 @@ export class JevLoop {
     // Synthesized while the caller may still talk; its first audio waits for their quiet (`ready`).
     let outcome: LineOutcome;
     try {
-      outcome = await this.deps.speak(line.text, () => this.callerIdle(signal), signal, line.replyId);
+      outcome = await this.deps.speak(line.text, () => this.beforePlayback(line), signal, line.replyId);
     } catch (err) {
       this.deps.log.warn('voice-mode worker: speaking failed', { err });
       outcome = { heard: false, failed: true, cut: false, audioMs: 0, playedMs: 0, complete: false };
@@ -5550,14 +5570,38 @@ export class JevLoop {
     this.deps.report({ type: 'playback', replyId: line.replyId, state: 'completed', at });
   }
 
-  /** Resolves when the caller is not speaking, or the line was aborted, or the loop closed: never a cap. */
-  private callerIdle(signal: AbortSignal): Promise<void> {
+  onAllowPlay(replyId: string, requestId: string): void {
+    if (this.playing?.replyId !== replyId || this.playRequest?.id !== requestId) return;
+    this.playRequest.allowed = true;
+    this.wake();
+  }
+
+  private beforePlayback(line: JevPlayout): Promise<void> {
+    const { signal } = line.abort;
     return new Promise<void>((resolve) => {
+      // The reporter can lose a POST. A retry still needs a matching host grant.
+      let retry: ReturnType<typeof setTimeout> | undefined;
       const check = () => {
-        if (!this.speaking || signal.aborted || this.closed) {
+        if (
+          signal.aborted ||
+          this.closed ||
+          (!this.speaking && (!this.deps.confirmPlayout || this.playRequest?.allowed))
+        ) {
+          clearTimeout(retry);
           this.wakers.delete(check);
           signal.removeEventListener('abort', check);
+          this.playRequest = undefined;
           resolve();
+        } else if (!this.speaking && !this.playRequest) {
+          const id = randomUUID();
+          this.playRequest = { id, allowed: false };
+          clearTimeout(retry);
+          retry = setTimeout(() => {
+            this.playRequest = undefined;
+            check();
+          }, WORKER_REQUEST_TIMEOUT_MS);
+          retry.unref?.();
+          this.deps.report({ type: 'play_ready', replyId: line.replyId, requestId: id, at: this.now() });
         }
       };
       this.wakers.add(check);
@@ -5665,6 +5709,7 @@ async function runJevCall(s: JevCallSetup): Promise<void> {
         ...(s.transcriptDebug ? { debug: true } : {}),
       });
   const loop: JevLoop = new JevLoop({
+    confirmPlayout: meta.confirmPlayout === true,
     ...(transcriber ? { transcriber } : {}),
     appCall: !!meta.appCall && voiceCall,
     speak: async (text, ready, signal, replyId) => {
@@ -5865,6 +5910,7 @@ async function runJevCall(s: JevCallSetup): Promise<void> {
       } else if (event.type === 'stop') loop.onStop();
       else if (event.type === 'words') loop.onWords();
       else if (event.type === 'revoke') loop.onRevoke(event.replyId);
+      else if (event.type === 'allow_play') loop.onAllowPlay(event.replyId, event.requestId);
       else if (!voiceCall) return;
       else if (event.type === 'thinking') {
         typingUntil = Date.now() + THINKING_HOLD_MS;

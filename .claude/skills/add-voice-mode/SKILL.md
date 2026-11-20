@@ -315,6 +315,13 @@ line to the wake phrase and send word until the caller sends `/voice` (or
 returns the line to jev. A client's `?jev=0` on `livekit/token` makes one call
 plain, and `?jev=1` one jev call. Without the key every call is plain.
 
+If the speaker who prompted an answer continues before playback, the host holds
+the reply through their final transcript. Jev judges the original request and
+the continuation together. An answer replaces the pending turn, silence holds
+it for the next boundary, and a stop drops it. An acknowledgement alone keeps
+the original answer. Before its first audio, each queued line waits for the
+host to confirm it can play. Fresh caller speech invalidates that confirmation.
+
 With one human in the room (a jev voice call, or a meeting down to one
 person) the loop answers more readily, by the `oneCaller` block in
 `src/modules/meet-jev/policy.ts`. Jev gets the one-person policy paragraph.

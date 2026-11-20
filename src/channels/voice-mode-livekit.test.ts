@@ -2581,7 +2581,7 @@ describe('/voice jev on the call core', () => {
 
   it('marks app jobs for the settings handshake and leaves browser jobs unmarked', async () => {
     expect((await h.adapter.startAppCall(LINE, h.base, true, async () => true)).ok).toBe(true);
-    expect(h.lk.dispatches.at(-1)!.metadata).toMatchObject({ jev: true, appCall: true });
+    expect(h.lk.dispatches.at(-1)!.metadata).toMatchObject({ jev: true, confirmPlayout: true, appCall: true });
     const page = await startJevCall();
     expect(page.meta.appCall).toBeUndefined();
     page.close();
@@ -2865,6 +2865,12 @@ describe('/voice jev with the real core', () => {
     );
     const spoken = await worker.waitFor((e) => e.type === 'reply');
     expect(spoken).toEqual({ type: 'reply', text: 'It is nine.', turn: '1', replyId: 'r1' });
+    await worker.post('jev', { events: [{ type: 'play_ready', replyId: 'r1', requestId: 'q1', at: at() }] });
+    expect(await worker.waitFor((e) => e.type === 'allow_play')).toEqual({
+      type: 'allow_play',
+      replyId: 'r1',
+      requestId: 'q1',
+    });
     await worker.post('jev', {
       events: [
         { type: 'playback', replyId: 'r1', state: 'started', at: at() },
