@@ -162,12 +162,19 @@ export function reduce(prev: CallState, event: CallEvent): CallState {
         const held = latestWake(state);
         // The held speaker's own speech is timed again by their next boundary.
         if (!held?.continuation || event.key !== HOLD_TIMER + held.key || stillSpeaking(state, held.speakerId)) break;
-        // The quiet counts only with the floor free: another speaker's turn is decided first.
-        if (floorTaken(state)) holdBriefly(state, held.speakerId);
-        // Words deferred for the floor are decided with the merged turn before anything is released.
-        else if (state.deferred?.speakerId === held.speakerId) decideDeferred(state);
-        else if (state.judging?.speakerId !== held.speakerId && continuationPieces(state, held).every((u) => u.final))
-          release(state, held);
+        const pieces = continuationPieces(state, held);
+        const latest = latestUtterance(state, held.speakerId);
+        // The handled mark, not `state.deferred`: another speaker's decision or deferral can take that slot.
+        const undecided =
+          !!latest &&
+          pieces.includes(latest) &&
+          !latest.contextOnly &&
+          !isHandled(state.speakers[held.speakerId], latest.uttId);
+        if (undecided) {
+          // Words still undecided wait for the floor and any judge in flight; that verdict reaches them itself.
+          if (floorTaken(state) || state.judging) holdBriefly(state, held.speakerId);
+          else boundary(state, held.speakerId);
+        } else if (state.judging?.speakerId !== held.speakerId && pieces.every((u) => u.final)) release(state, held);
       }
       break;
     }

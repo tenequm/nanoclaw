@@ -1512,6 +1512,117 @@ describe('continuing a turn before playback', () => {
     expect(only(call.until(call.state.now + 3_000), 'recheck')).toHaveLength(1);
   });
 
+  describe('a held speaker in a meeting adds words while others talk', () => {
+    const anna: Speaker = { id: 'p3', name: 'Anna' };
+    const merged = 'Can you check the release notes for the mobile app';
+    const spoke = (who: Speaker, on: boolean, at: number): Fed => ({ kind: 'speech', speaker: who, on, at });
+    const said = (who: Speaker, uttId: string, text: string, at: number): Fed => ({
+      kind: 'utterance',
+      speaker: who,
+      uttId,
+      text,
+      final: true,
+      at,
+    });
+
+    /** The caller's answer is ready while they add "for the mobile app" under Olena: the hold ticks at 7.3 and 10.3 s. */
+    function addedUnderOlena(...others: Speaker[]): Call {
+      const call = new Call('meet');
+      call.realTimers = true;
+      call.feed(...[speaker, olena, ...others].map((who): Fed => ({ kind: 'presence', speaker: who, joined: true })));
+      call.sayAnswered(speaker, 'a', 'Can you check the release notes');
+      call.feed(
+        { kind: 'turn', key: 'w1', turnId: 't1' },
+        { kind: 'speech', speaker, on: true, uttId: 'b', at: 3_000 },
+        spoke(olena, true, 3_200),
+        { ...reply, at: 3_500 },
+        ready(),
+        spoke(speaker, false, 4_000),
+        say('b', 'for the mobile app', 4_300),
+      );
+      return call;
+    }
+
+    /** Jev on whatever it is asked, in order: the merged question needs a new answer, the others' talk does not. */
+    function jevDecides(call: Call): Command[] {
+      const out: Command[] = [];
+      for (let i = 0; call.state.judging && i < 5; i++) {
+        const { version, trigger } = call.state.judging;
+        out.push(...call.verdict(version, trigger === merged ? 'answer' : 'stay_silent'));
+      }
+      return out;
+    }
+
+    function expectMergedTurn(out: Command[]): void {
+      expect(only(out, 'recheck')).toEqual([]);
+      expect(only(out, 'allow_play')).toEqual([]);
+      expect(only(out, 'revoke').map((c) => c.replyId)).toEqual(['r1']);
+      expect(only(out, 'turn').map((c) => c.message)).toEqual([merged]);
+    }
+
+    it("a hold tick during another speaker's judge waits for that verdict, then the merged turn is judged", () => {
+      const call = addedUnderOlena();
+      const out = call.feed(spoke(olena, false, 9_900));
+      const [olenaJudge] = only(
+        call.feed(said(olena, 'o1', 'I think we shipped the web one on Monday', 10_100)),
+        'judge',
+      );
+      expect(olenaJudge.state.latest?.text).toBe('I think we shipped the web one on Monday');
+      // The hold ticks at 10.3 s, before Jev's verdict on Olena: it waits again instead of releasing the old answer.
+      expect(call.until(10_400)).toEqual([{ kind: 'wait', key: 'hold:w1', ms: 3000 }]);
+      out.push(...jevDecides(call), ...call.until(call.state.now + 10_000));
+      expectMergedTurn(out);
+    });
+
+    it("with a third participant, another speaker's deferred words do not stand in for the held speaker's", () => {
+      const call = addedUnderOlena(anna);
+      // Anna starts before Olena ends, so Olena's words are deferred too and take the one deferred slot.
+      const out = call.feed(
+        spoke(anna, true, 7_900),
+        spoke(olena, false, 8_000),
+        said(olena, 'o1', 'I think we shipped the web one on Monday', 8_300),
+        spoke(anna, false, 10_000),
+      );
+      // The hold ticks at 10.3 s with the floor free and no judge in flight; Anna's final is still on its way.
+      out.push(...call.until(10_400), ...call.feed(said(anna, 'n1', 'no, that was the week before', 10_800)));
+      out.push(...jevDecides(call), ...call.until(call.state.now + 10_000));
+      expectMergedTurn(out);
+    });
+
+    it("another speaker's judge replacing the merged turn's in flight does not let the hold tick release", () => {
+      const call = addedUnderOlena(anna);
+      call.feed(spoke(olena, false, 6_000));
+      const [olenaJudge] = only(
+        call.feed(said(olena, 'o1', 'I think we shipped the web one on Monday', 6_200)),
+        'judge',
+      );
+      const [mergedJudge] = only(call.verdict(olenaJudge.windowVersion, 'stay_silent'), 'judge');
+      expect(mergedJudge.state.latest?.text).toBe(merged);
+      // Anna's short remark is judged in its place before that verdict; the hold ticks at 7.3 s meanwhile.
+      const out = call.feed(spoke(anna, true, 6_700), spoke(anna, false, 6_900), said(anna, 'n1', 'right', 7_100));
+      expect(call.state.judging?.speakerId).toBe(anna.id);
+      out.push(...call.until(7_400));
+      out.push(...jevDecides(call), ...call.until(call.state.now + 10_000));
+      expectMergedTurn(out);
+    });
+
+    it('a hold with nothing left to decide ends 3 s after its verdict, though others talk on', () => {
+      const call = new Call('meet');
+      call.realTimers = true;
+      call.feed(...[speaker, olena, anna].map((who): Fed => ({ kind: 'presence', speaker: who, joined: true })));
+      call.sayAnswered(speaker, 'a', 'Can you check the release notes');
+      call.feed({ kind: 'turn', key: 'w1', turnId: 't1' }, reply, { kind: 'speech', speaker, on: true, uttId: 'b' });
+      call.feed(ready(), spoke(speaker, false, call.state.now + 400));
+      const [judge] = only(call.feed(say('b', 'thanks in advance')), 'judge');
+      expect(call.verdict(judge.windowVersion, 'stay_silent')).toEqual([{ kind: 'wait', key: 'hold:w1', ms: 3000 }]);
+      const verdictAt = call.state.now;
+      // Olena and Anna talk across the whole hold, one picking up as the other stops.
+      call.feed(spoke(olena, true, verdictAt + 400), spoke(anna, true, verdictAt + 2_000));
+      call.feed(spoke(olena, false, verdictAt + 2_500));
+      expect(only(call.until(verdictAt + 3_000), 'recheck').map((c) => c.wakeKey)).toEqual(['w1']);
+    });
+  });
+
   it('bounds a hold whose last words were held over an older playing line (context only) from their final', () => {
     const call = new Call();
     call.realTimers = true;
