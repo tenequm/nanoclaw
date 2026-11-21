@@ -80,8 +80,8 @@ export interface Wake {
   dropped: boolean;
   replied: boolean;
   started?: boolean;
-  /** While the speaker finishes the pending turn, new replies stay here until its boundary decides. */
-  continuation?: { replies: { replyId: string; text: string }[] };
+  /** The speaker is finishing the pending turn: its lines get no playback grant until that turn's boundary decides. */
+  continuation?: true;
   /** The utterance it answers and when that started: people speaking after it make a landed answer rechecked. */
   trigger: string;
   triggerAt: number;
@@ -142,8 +142,11 @@ export interface CallState {
   utterances: Utterance[];
   chat: ChatLine[];
   agentLines: AgentLine[];
-  /** Replies sent to `speak` that have not finished playing: replyId -> text and the wake. */
-  playout: Record<string, { text: string; wakeKey: string | null; requestId?: string }>;
+  /**
+   * Replies sent to `speak` that have not finished playing: replyId -> text, the wake, the worker's pending
+   * playback request, and `held` while the answer-ready check decides whether it plays.
+   */
+  playout: Record<string, { text: string; wakeKey: string | null; requestId?: string; held?: true }>;
   /** Replies a stop took out of `playout` before the host heard them start: the worker still reports them. */
   stoppedPlayout: Record<string, { text: string; wakeKey: string | null }>;
   /** The newest few wakes, oldest first. */
@@ -284,12 +287,7 @@ export function unstartedWake(state: CallState, speakerId: string): Wake | undef
 
 /** An answer is on its way: the latest wake awaits its reply (and no stop came), or a reply is still to play. */
 export function pendingAnswer(state: CallState): boolean {
-  return (
-    Object.keys(state.playout).length > 0 ||
-    state.recheck !== null ||
-    !!latestWake(state)?.continuation?.replies.length ||
-    awaitingAgent(state)
-  );
+  return Object.keys(state.playout).length > 0 || state.recheck !== null || awaitingAgent(state);
 }
 
 /**
@@ -589,7 +587,10 @@ export function toJevState(state: CallState, latest: JevState['latest'] = null, 
     agent_name: state.policy.agentName,
     participants,
     latest,
-    window: lines(state).map(({ at, ...line }): JevLine => ({ t: secondsAgo(state, at), ...line })),
+    // Lines only shown in the chat were never heard: Jev judges the conversation as spoken.
+    window: lines(state)
+      .filter((line) => !line.shown_only)
+      .map(({ at, shown_only: _shown, ...line }): JevLine => ({ t: secondsAgo(state, at), ...line })),
     facts: {
       humans_in_room: humansInRoom(state),
       agent_speaking: agentSpeaking(state),

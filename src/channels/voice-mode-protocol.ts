@@ -145,6 +145,7 @@ export type JevWorkerEvent =
   | { type: 'overlap'; requestId: string; replyId: string; played: string; text: string; at: number }
   /** VAD start or end of speech on the call's input. */
   | { type: 'speech'; on: boolean; uttId?: string; at: number }
+  /** With `confirmPlayout`: a reply's first audio is ready and waits for the host's `allow_play` with `requestId`. */
   | { type: 'play_ready'; replyId: string; requestId: string; at: number }
   /**
    * What became of a `reply` with a `replyId`: started playing, played out, aborted by the reflex
@@ -591,6 +592,7 @@ export type LiveKitHostEvent =
   /** Jev's answer to the worker's `overlap` request; with no verdict, `reason` says why (the worker logs it). */
   | { type: 'overlap'; requestId: string; verdict: 'yield' | 'keep_talking' | null; reason?: OverlapFallback }
   | { type: 'thinking' }
+  /** The answer to a jev worker's `play_ready`: the reply may start now. */
   | { type: 'allow_play'; replyId: string; requestId: string }
   | { type: 'working' }
   /** A jev voice call's state as the host's loop sees it: the worker plays its cues from it. */

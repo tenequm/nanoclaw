@@ -57,6 +57,7 @@ export type CallEvent =
   | { kind: 'overlap'; speaker: Speaker; requestId: string; replyId: string; played: string; text: string; at: number }
   /** A participant started or stopped speaking (the worker's VAD, or a meeting participant's own). */
   | { kind: 'speech'; speaker: Speaker; on: boolean; uttId?: string; at: number }
+  /** The worker is about to play a reply's first audio and waits for an `allow_play` with `requestId`. */
   | { kind: 'play_ready'; replyId: string; requestId: string; at: number }
   /** A typed chat line (Meet chat): context only, never a boundary. */
   | { kind: 'chat'; speaker: Speaker; text: string; at: number }
@@ -104,6 +105,7 @@ export type Command =
   | { kind: 'turn'; key: string; message: string; note: string; supersedes?: string }
   /** Speak a reply into the room. */
   | { kind: 'speak'; replyId: string; text: string; turnId: string | null }
+  /** Answer the worker's `play_ready`: the reply may start now. */
   | { kind: 'allow_play'; replyId: string; requestId: string }
   /** Show a reply in the call chat without speaking it (a replaced turn, after a stop). */
   | { kind: 'show'; replyId: string; text: string }
@@ -124,9 +126,7 @@ export interface JevLine {
   t: number;
   speaker: string;
   text: string;
-  /** An agent line, with playback status or an explicit chat-only marker. */
   agent?: true;
-  shown_only?: true;
   /** The agent was cut off here; `text` is what got out. */
   cut_off?: true;
   /** Still being spoken (a partial). */
