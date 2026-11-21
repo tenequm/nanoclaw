@@ -2941,6 +2941,24 @@ describe('/voice jev with the real core', () => {
     },
   );
 
+  it('saves a release as the caller when teardown stops routing during the hangup grace', async () => {
+    await h.stop();
+    h = await startHarness({ accessCheckIntervalMs: 60_000 }, { mirrorApi: chat.api, hangupGraceMs: 1000 });
+    await post(`${h.base}/livekit/token?v=6&t=tok123&jev=1`);
+    const worker = await attachWorker(h, h.lk.dispatches.at(-1)!.metadata);
+    await worker.post('joined');
+    const utt = (text: string, final: boolean) => ({ type: 'utterance', uttId: 'a', text, final, at: Date.now() });
+    await worker.post('jev', { events: [{ type: 'listen', on: true, at: Date.now() }, utt('Book', false)] });
+    expect((await post(`${h.base}/livekit/end?t=tok123`, { callId: worker.meta.callId })).status).toBe(204);
+    const shutdown = h.adapter.teardown();
+    expect((await worker.post('jev', { events: [utt('Book a table, zulu.', true)] })).status).toBe(200);
+    await worker.post('ended', { reason: 'caller left' });
+    await shutdown;
+    await vi.waitFor(() => expect(chat.posts.map((p) => p.text)).toEqual(['🎙 Book a table']));
+    expect(h.inbound).toHaveLength(0);
+    worker.close();
+  });
+
   it('finishes routing a release when both hangup and worker end cross its chat lookup', async () => {
     await post(`${h.base}/livekit/token?v=6&t=tok123&jev=1`);
     const worker = await attachWorker(h, h.lk.dispatches.at(-1)!.metadata);

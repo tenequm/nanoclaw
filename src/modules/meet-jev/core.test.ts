@@ -358,6 +358,71 @@ describe('listen until over', () => {
     expect(only(call.say(caller, 'c', 'What next?'), 'judge')).toHaveLength(1);
   });
 
+  it('settles a piece whose speech-off was lost when the caller speaks again after the toggle-off', () => {
+    const call = listening();
+    call.feed(
+      { kind: 'speech', speaker: caller, uttId: 'a', on: true },
+      { kind: 'utterance', speaker: caller, uttId: 'a', text: 'First', final: false },
+      { kind: 'listen', on: false },
+    );
+    const [timer] = only(call.feed({ kind: 'speech', speaker: caller, uttId: 'b', on: true }), 'wait');
+    expect(timer?.key).toBe('listen-piece:a');
+    expect(only(call.feed({ kind: 'timer', key: timer.key }), 'turn')[0]?.message).toBe('First');
+    expect(call.state.listenDraft).toBeNull();
+  });
+
+  it('takes no automatic decision on words after the toggle-off once the call hangs up', () => {
+    const call = listening();
+    call.feed(
+      { kind: 'speech', speaker: caller, uttId: 'a', on: true },
+      { kind: 'utterance', speaker: caller, uttId: 'a', text: 'First', final: false },
+      { kind: 'listen', on: false },
+    );
+    const [timer] = only(call.feed({ kind: 'speech', speaker: caller, on: false }), 'wait');
+    call.say(caller, 'b', 'Dan?');
+    call.feed({ kind: 'hangup', draining: true });
+    const commands = call.feed({ kind: 'timer', key: timer.key });
+    expect(only(commands, 'turn').map((turn) => turn.message)).toEqual(['First']);
+    expect(only(commands, 'judge')).toEqual([]);
+  });
+
+  it('drops a draft whose unfinished last piece ends in a discard phrase at hangup', () => {
+    const call = listening();
+    call.say(caller, 'a', 'Book a table');
+    call.feed(
+      { kind: 'speech', speaker: caller, uttId: 'b', on: true },
+      { kind: 'utterance', speaker: caller, uttId: 'b', text: 'for eight, scratch that', final: false },
+      { kind: 'hangup', draining: true },
+    );
+    expect(call.feed({ kind: 'hangup' })).toEqual([]);
+  });
+
+  it('keeps words set aside for the floor when listening starts: they join the draft', () => {
+    const call = new Call();
+    const [judge] = only(call.say(caller, 'a', 'Book a table'), 'judge');
+    call.feed(
+      { kind: 'speech', speaker: caller, uttId: 'b', on: true },
+      { kind: 'utterance', speaker: caller, uttId: 'b', text: 'for eight', final: false },
+    );
+    call.verdict(judge.windowVersion, 'answer');
+    expect(call.state.deferred).toMatchObject({ uttId: 'a' });
+    call.feed({ kind: 'listen', on: true });
+    const released = call.feed(
+      { kind: 'utterance', speaker: caller, uttId: 'b', text: 'for eight, zulu.', final: true },
+      { kind: 'speech', speaker: caller, on: false },
+    );
+    expect(only(released, 'turn').map((turn) => turn.message)).toEqual(['Book a table for eight']);
+  });
+
+  it('saves a released draft the agent never took as the caller', () => {
+    const call = listening();
+    const [turn] = only(call.say(caller, 'a', 'Book a table for eight, zulu.'), 'turn');
+    expect(call.feed({ kind: 'turn_failed', key: turn.key, reason: '429: too many turns' })).toContainEqual({
+      kind: 'post_caller',
+      text: 'Book a table for eight',
+    });
+  });
+
   it('ignores listen settings in a meeting', () => {
     const call = new Call('meet');
     call.feed({ kind: 'listen', on: true });

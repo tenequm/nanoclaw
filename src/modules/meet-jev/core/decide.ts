@@ -69,6 +69,20 @@ export function reduce(prev: CallState, event: CallEvent): CallState {
   if (state.hangingUp && !['speech', 'utterance', 'hangup', 'timer'].includes(event.kind)) return state;
   if (
     state.afterListen &&
+    event.kind === 'speech' &&
+    event.on &&
+    state.listenDraft?.some(
+      (piece) => piece.speakerId === event.speaker.id && piece.uttId !== event.uttId && beingSaid(state, piece),
+    )
+  ) {
+    // A new speech ends the draft's piece whose speech-off was lost, as it does while listening.
+    const ended = reduce(prev, { kind: 'speech', speaker: event.speaker, on: false, at: event.at });
+    const next = reduce(ended, event);
+    next.commands = [...ended.commands, ...next.commands];
+    return next;
+  }
+  if (
+    state.afterListen &&
     (event.kind === 'listen' ||
       (event.kind === 'speech' && !endsDraftSpeech(state, event)) ||
       (event.kind === 'utterance' && !state.listenDraft?.some((piece) => piece.uttId === event.uttId)))
@@ -93,6 +107,9 @@ export function reduce(prev: CallState, event: CallEvent): CallState {
       if (event.draining) {
         state.hangingUp = true;
       } else {
+        // Settled as the piece timer settles them, so a trailing command still acts.
+        for (const piece of [...state.listenDraft])
+          if (!piece.final) capturePiece(state, piece.speakerId, piece.uttId, { text: piece.text, final: true });
         for (const piece of state.listenDraft) piece.final = true;
         releaseMarkers(state);
         flushDraft(state, state.listenDraft.splice(0), !state.afterListen);
@@ -213,6 +230,8 @@ export function reduce(prev: CallState, event: CallEvent): CallState {
       const wake = state.wakes.find((w) => w.key === event.key);
       if (wake) wake.dropped = true;
       if (wake && wake === latestWake(state)) out.push({ kind: 'status', status: 'idle' });
+      // Dictation the agent never took is kept as the caller's words; a superseding turn carries them on.
+      if (wake?.fromDraft && event.reason !== 'superseded') out.push({ kind: 'post_caller', text: wake.trigger });
       log(state, 'turn_failed', { key: event.key, reason: event.reason });
       break;
     }
@@ -255,7 +274,8 @@ export function reduce(prev: CallState, event: CallEvent): CallState {
   if (state.afterListen && state.listenDraft?.every((piece) => piece.final)) {
     flushDraft(state, state.listenDraft.splice(0), false);
     state.listenDraft = null;
-    const queued = state.afterListen;
+    // A call that is hanging up takes no automatic decision on what was said after the toggle-off.
+    const queued = state.hangingUp ? [] : state.afterListen;
     delete state.afterListen;
     if (!state.hangingUp && awaitingAgent(state)) out.push({ kind: 'status', status: 'thinking' });
     let nextState = state;
@@ -296,14 +316,16 @@ function setListening(state: CallState, on: boolean): void {
   state.listenDraft = [];
   state.commands.push({ kind: 'status', status: agentSpeaking(state) ? 'speaking' : 'idle' });
   const judging = state.judging;
+  const deferred = state.deferred;
   state.judging = null;
   state.deferred = null;
   if (judging) unmarkHandled(state.speakers[judging.speakerId], judging.uttId);
   for (const [id, speaker] of Object.entries(state.speakers)) {
     if (speaker.pendingSpeech) capturePiece(state, id, speaker.pendingSpeech.uttId);
   }
+  // Words waiting on a decision join the draft: the judged ones and the ones set aside for the floor.
   for (const utt of state.utterances) {
-    if (!utt.final || (utt.uttId === judging?.uttId && utt.speakerId === judging.speakerId))
+    if (!utt.final || [judging, deferred].some((at) => at?.uttId === utt.uttId && at.speakerId === utt.speakerId))
       capturePiece(state, utt.speakerId, utt.uttId, utt);
   }
   const wake = latestWake(state);
@@ -333,7 +355,10 @@ function flushDraft(state: CallState, pieces: ListenPiece[], hangup: boolean): b
   }
   if (!text) return false;
   if (hangup) state.commands.push({ kind: 'post_caller', text });
-  else wake(state, last.speakerId, last.uttId, text);
+  else {
+    wake(state, last.speakerId, last.uttId, text);
+    latestWake(state)!.fromDraft = true;
+  }
   return true;
 }
 

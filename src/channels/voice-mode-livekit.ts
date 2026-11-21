@@ -1347,9 +1347,13 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
       return { ok: false, reason: 'the call has ended' };
     }
     const admitted = admitTurn(call);
-    if (!admitted.ok) return { ok: false, reason: admitted.body };
+    if (!admitted.ok) {
+      saveIfDraining();
+      return { ok: false, reason: admitted.body };
+    }
     const outcome = await takeTurn(call, message, admitted.t, undefined, { note, signal });
-    if (!outcome.id && !takesTurns(call)) saveIfDraining();
+    // A draining call's words that no turn took are kept, whether the call stopped taking turns or routing failed.
+    if (!outcome.id) saveIfDraining();
     return outcome.id
       ? { ok: true, turnId: outcome.id, stored: outcome.stored }
       : { ok: false, reason: `${outcome.status}: ${outcome.body}` };

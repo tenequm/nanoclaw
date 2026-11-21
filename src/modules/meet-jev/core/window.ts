@@ -86,6 +86,8 @@ export interface Wake {
   judged?: string;
   /** When the hold is released at the latest without a new verdict (`now` clock). */
   holdUntil?: number;
+  /** Sent from a listen-until-over draft: its words exist nowhere else if the agent never takes them. */
+  fromDraft?: true;
   /** The utterance it answers and when that started: people speaking after it make a landed answer rechecked. */
   trigger: string;
   triggerAt: number;
