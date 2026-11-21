@@ -3,6 +3,7 @@
  * the judge in flight), so `reduce` makes it and records its commands in the state; `decide`
  * returns them. Replaying the event log through `reduce` reproduces every decision.
  */
+import { endPhrases, phraseEnd, spokenWord, type EndPhrase } from './spoken.js';
 import type { Action, CallEvent, Command, RecheckVerdict, SessionStamp, Verdict } from './types.js';
 import {
   agentSpeaking,
@@ -34,7 +35,6 @@ import {
 } from './window.js';
 
 const PIECE_TIMER = 'listen-piece:';
-const MARKER_OWN_SENTENCE = false;
 const BOUNDARY_TIMER = 'boundary:';
 const HOLD_TIMER = 'hold:';
 /** A speaker's STT final comes up to ~3 s after their VAD end; a boundary waits that long for it. */
@@ -365,7 +365,7 @@ function capturePiece(
     markHandled(state.speakers[speakerId], uttId);
     draft.splice(draft.indexOf(piece), 1);
   } else {
-    const rest = beforeMarker(piece.text, state.policy.overWords ?? []);
+    const rest = beforeMarker(piece.text, state.policy.releaseWords ?? []);
     piece.releases = rest !== null;
     if (rest !== null) piece.text = rest;
   }
@@ -410,20 +410,16 @@ function releaseMarkers(state: CallState): void {
   }
 }
 
-export function beforeMarker(text: string, markers: string[], ownSentence = MARKER_OWN_SENTENCE): string | null {
+/**
+ * The words before the release words a transcript ends with, each repeat stripped (`tell me, zulu,
+ * zulu`: `tell me`), or null when it ends with none; matched as the worker matches its send words.
+ */
+export function beforeMarker(text: string, words: readonly EndPhrase[]): string | null {
+  const phrases = endPhrases(words);
   let rest = text;
   let matched = false;
-  // Keep sentence punctuation between words until every repeated marker has been examined.
-  for (;;) {
-    const end = rest.replace(/[\s\p{P}]+$/gu, '');
-    const marker = markers.find(
-      (word) => word.length && new RegExp(`(?:^|[\\s\\p{P}])${escapeRegExp(word)}$`, 'iu').test(end),
-    );
-    if (!marker) break;
-    const before = end.slice(0, -marker.length);
-    if (/[-\u2010\u2011]$/u.test(before)) break;
-    if (ownSentence && !/(^|[.!?,;:\u2013\u2014-])\s*$/u.test(before)) break;
-    rest = before;
+  for (let end = phraseEnd(rest, phrases); end && !end.missed; end = phraseEnd(rest, phrases)) {
+    rest = rest.slice(0, end.at);
     matched = true;
   }
   return matched ? rest.replace(/[\s,;:\u2013\u2014-]+$/gu, '') : null;
@@ -1046,21 +1042,9 @@ export function nameAlone(text: string, names: string[]): boolean {
   );
 }
 
-/** Cyrillic letters as Latin sounds (the worker's wake matching uses the same table). */
-const CYRILLIC_LATIN: Record<string, string> = Object.fromEntries(
-  'а:a б:b в:v г:h ґ:g д:d е:e є:ye ё:yo ж:zh з:z и:y і:i ї:yi й:y к:k л:l м:m н:n о:o п:p р:r с:s т:t у:u ф:f х:h ц:ts ч:ch ш:sh щ:shch ь: ъ: ы:y э:e ю:yu я:ya'
-    .split(' ')
-    .map((pair) => pair.split(':')),
-);
-
 /** A name's sound: Latin letters, every vowel one mark, doubled letters once (`Ден` and `Dan` agree). */
 function nameKey(word: string): string {
-  let latin = '';
-  for (const ch of word.normalize('NFKC').toLowerCase()) latin += CYRILLIC_LATIN[ch] ?? ch;
-  return latin
-    .normalize('NFD')
-    .replace(/\p{M}/gu, '')
-    .replace(/kh/g, 'h')
+  return spokenWord(word)
     .replace(/[aeiouy]/g, '*')
     .replace(/([^*])\1+/g, '$1');
 }

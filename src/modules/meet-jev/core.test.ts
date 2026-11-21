@@ -4,7 +4,7 @@
  */
 import { describe, expect, it } from 'vitest';
 
-import { overWordForms, parseOverWords } from '../../channels/voice-mode-protocol.js';
+import { CALL_COMMAND_WORDS } from '../../channels/voice-mode-protocol.js';
 import { beforeMarker, vocativeOf } from './core/decide.js';
 import { callCore, type CallState } from './core/index.js';
 import type { Action, CallEvent, CallKind, Command, Speaker } from './core/types.js';
@@ -126,31 +126,44 @@ function wakeAndSpeak(call: Call, text: string, answer: string, n: number): stri
 
 describe('listen until over', () => {
   const caller: Speaker = { id: 'caller', name: 'Caller' };
-  function listening(markers?: string) {
+  function listening() {
     const call = new Call();
-    call.state.policy.overWords = overWordForms(parseOverWords(markers));
     call.feed({ kind: 'listen', on: true });
     return call;
   }
 
-  it('displays default markers in Cyrillic then Latin', () => {
-    expect(parseOverWords()).toEqual(['прийом', 'зулу', 'овер', 'zulu', 'over']);
+  it('releases on the spoken send words, by their rules', () => {
+    expect(new Call().state.policy.releaseWords).toEqual(
+      CALL_COMMAND_WORDS.send.map(({ say, ownSentence }) => ({ say, ...(ownSentence ? { ownSentence } : {}) })),
+    );
+    expect(new Call('meet').state.policy.releaseWords).toBeUndefined();
   });
 
-  it.each(['прийом.', 'Прийом!', 'Zulu', 'зулу?', 'OVER!', 'овер', 'оувер…', 'приём'])(
-    'strips a final %s and ignores a marker alone',
-    (marker) => {
-      const call = listening();
-      expect(call.say(caller, 'empty', marker)).toEqual([]);
-      expect(call.say(caller, 'one', 'Go over the handover')).toEqual([]);
-      const commands = call.say(caller, 'two', 'Next, ' + marker);
-      expect(commands).toEqual([expect.objectContaining({ kind: 'turn', message: 'Go over the handover Next' })]);
-      expect(call.statuses).not.toContainEqual({ kind: 'status', status: 'thinking' });
-    },
-  );
+  it.each([
+    'zulu.',
+    'Zulu',
+    'ZULU!',
+    'зулу?',
+    'Зулу',
+    'прийом.',
+    'Прийом!',
+    'приём',
+    'pryyom',
+    'copy',
+    'Copy!',
+    'copy that.',
+    'Copy that',
+  ])('strips a final %s and ignores a marker alone', (marker) => {
+    const call = listening();
+    expect(call.say(caller, 'empty', marker)).toEqual([]);
+    expect(call.say(caller, 'one', 'Go over the handover')).toEqual([]);
+    const commands = call.say(caller, 'two', 'Next, ' + marker);
+    expect(commands).toEqual([expect.objectContaining({ kind: 'turn', message: 'Go over the handover Next' })]);
+    expect(call.statuses).not.toContainEqual({ kind: 'status', status: 'thinking' });
+  });
 
   it('waits for an earlier final before releasing a later marker; each new draft remains separate', () => {
-    const call = listening('end message');
+    const call = listening();
     const speech = (uttId: string, on: boolean) => call.feed({ kind: 'speech', speaker: caller, uttId, on });
     const final = (uttId: string, text: string) =>
       call.feed({ kind: 'utterance', speaker: caller, uttId, text, final: true });
@@ -158,7 +171,7 @@ describe('listen until over', () => {
     speech('a', false);
     speech('b', true);
     speech('b', false);
-    expect(final('b', 'Plan, END MESSAGE.')).toEqual([]);
+    expect(final('b', 'Plan, copy that.')).toEqual([]);
     expect(final('a', 'Look over')).toEqual([expect.objectContaining({ kind: 'turn', message: 'Look over Plan' })]);
     call.feed({ kind: 'turn', key: 'w1', turnId: 't1' });
     expect(final('c', 'Next draft')).toEqual([]);
@@ -192,30 +205,48 @@ describe('listen until over', () => {
     );
     const [timer] = only(call.feed({ kind: 'speech', speaker: caller, on: false }), 'wait');
     expect(timer?.ms).toBeGreaterThan(0);
-    expect(only(call.say(caller, 'b', 'and this, over.'), 'turn')).toEqual([]);
+    expect(only(call.say(caller, 'b', 'and this, zulu.'), 'turn')).toEqual([]);
     expect(only(call.feed({ kind: 'timer', key: timer.key }), 'turn')[0]?.message).toBe('Keep this and this');
-    expect(only(call.say(caller, 'c', 'Next, over.'), 'turn')[0]?.message).toBe('Next');
+    expect(only(call.say(caller, 'c', 'Next, zulu.'), 'turn')[0]?.message).toBe('Next');
   });
 
-  it('strips consecutive markers and keeps hyphenated words intact', () => {
+  it('strips consecutive markers', () => {
     const call = listening();
     expect(call.say(caller, 'a', 'Прийом, прийом.')).toEqual([]);
-    expect(call.say(caller, 'b', 'hand-over')).toEqual([]);
-    expect(only(call.say(caller, 'c', 'Прийом, прийом.'), 'turn')[0]?.message).toBe('hand-over');
+    expect(call.say(caller, 'b', 'hand it over')).toEqual([]);
+    expect(only(call.say(caller, 'c', 'Прийом, прийом.'), 'turn')[0]?.message).toBe('hand it over');
   });
 
   it.each([
-    ['the game is over.', 'the game is', null],
-    ['hand-over', null, null],
-    ['hand‐over', null, null],
-    ['already over there.', null, null],
-    ['say it. Over!', 'say it.', 'say it.'],
-    ['say it\u2014over', 'say it', 'say it'],
-    ['tell me, over, over.', 'tell me', 'tell me'],
-    ['Over!', '', ''],
-  ])('recognizes %s in suffix and own-clause modes', (text, suffix, clause) => {
-    expect(beforeMarker(text!, ['over'], false)).toBe(suffix);
-    expect(beforeMarker(text!, ['over'], true)).toBe(clause);
+    ['the game is done, zulu.', 'the game is done'],
+    ['the game is done zulu', 'the game is done'],
+    ['say it\u2014прийом', 'say it'],
+    ['tell me, zulu, zulu.', 'tell me'],
+    ['say it. Copy!', 'say it.'],
+    ['say it, copy that.', 'say it'],
+    ['Copy that.', ''],
+    ['zulu, call Anna', null],
+    ['send me a copy', null],
+    ['send me a Copy', null],
+    ['copy that file', null],
+    ['I need a copy that works', null],
+    ['the game is over.', null],
+    ['Over!', null],
+    ['овер', null],
+    ['Next, over.', null],
+  ])('reads %s as %s before the release words', (text, rest) => {
+    expect(beforeMarker(text!, new Call().state.policy.releaseWords!)).toBe(rest);
+  });
+
+  it('keeps everyday copy and over in the draft', () => {
+    const call = listening();
+    expect(call.say(caller, 'a', 'send me a copy')).toEqual([]);
+    expect(call.say(caller, 'b', 'copy that file')).toEqual([]);
+    expect(call.say(caller, 'c', 'Next, over.')).toEqual([]);
+    expect(call.say(caller, 'd', 'овер')).toEqual([]);
+    expect(only(call.say(caller, 'e', 'Done. Copy.'), 'turn')[0]?.message).toBe(
+      'send me a copy copy that file Next, over. овер Done.',
+    );
   });
 
   it('shows pending and playing replies accurately at toggle-on and releases a held continuation', () => {
@@ -247,13 +278,12 @@ describe('listen until over', () => {
 
   it('orders an utterance started before toggle-on ahead of a later marker', () => {
     const call = new Call();
-    call.state.policy.overWords = ['over'];
     call.feed(
       { kind: 'speech', speaker: caller, uttId: 'a', on: true },
       { kind: 'listen', on: true },
       { kind: 'speech', speaker: caller, on: false },
     );
-    expect(only(call.say(caller, 'b', 'Second, over.'), 'turn')).toHaveLength(0);
+    expect(only(call.say(caller, 'b', 'Second, zulu.'), 'turn')).toHaveLength(0);
     expect(
       only(call.feed({ kind: 'utterance', speaker: caller, uttId: 'a', text: 'First.', final: true }), 'turn')[0]
         ?.message,
@@ -289,7 +319,6 @@ describe('listen until over', () => {
 
   it('a boundary timer armed before listening neither settles nor releases the draft', () => {
     const call = new Call();
-    call.state.policy.overWords = overWordForms(parseOverWords());
     call.feed(
       { kind: 'speech', speaker: caller, uttId: 'a', on: true },
       { kind: 'utterance', speaker: caller, uttId: 'a', text: 'Keep this', final: false },
@@ -299,7 +328,7 @@ describe('listen until over', () => {
     const [piece] = only(call.feed({ kind: 'listen', on: true }), 'wait');
     expect(call.feed({ kind: 'timer', key: boundary.key })).toEqual([]);
     expect(call.state.listenDraft?.map((p) => [p.text, p.final])).toEqual([['Keep this', false]]);
-    expect(only(call.say(caller, 'b', 'and this, over.'), 'turn')).toEqual([]);
+    expect(only(call.say(caller, 'b', 'and this, zulu.'), 'turn')).toEqual([]);
     expect(only(call.feed({ kind: 'timer', key: piece.key }), 'turn')[0]?.message).toBe('Keep this and this');
   });
 
@@ -313,7 +342,7 @@ describe('listen until over', () => {
         { kind: 'utterance', speaker: caller, uttId, text: '', final: true },
       );
     expect(only(noise('n1'), 'turn')).toEqual([]);
-    expect(only(call.say(caller, 'b', 'Next, over.'), 'turn').map((turn) => turn.message)).toEqual(['Draft Next']);
+    expect(only(call.say(caller, 'b', 'Next, zulu.'), 'turn').map((turn) => turn.message)).toEqual(['Draft Next']);
     expect(only(noise('n2'), 'turn')).toEqual([]);
     const off = call.feed({ kind: 'listen', on: false });
     expect(only(off, 'turn')).toEqual([]);
@@ -359,7 +388,7 @@ describe('listen until over', () => {
   it('a final replayed by a retried POST changes nothing, while listening or not', () => {
     const call = listening();
     call.say(caller, 'a', 'Draft');
-    const final = { kind: 'utterance', speaker: caller, uttId: 'b', text: 'Next, over.', final: true } as const;
+    const final = { kind: 'utterance', speaker: caller, uttId: 'b', text: 'Next, zulu.', final: true } as const;
     call.feed(
       { kind: 'speech', speaker: caller, uttId: 'b', on: true },
       { kind: 'speech', speaker: caller, on: false },
@@ -1423,13 +1452,12 @@ describe('continuing a turn before playback', () => {
     ['the answer-ready check', true],
   ] as const)('listening that starts during %s plays the queued answer and holds the draft', (_, checking) => {
     const { call } = heldAfter('stay_silent');
-    call.state.policy.overWords = overWordForms(parseOverWords());
     if (checking) expect(only(call.feed({ kind: 'timer', key: 'hold:w1' }), 'recheck')).toHaveLength(1);
     expect(only(call.feed({ kind: 'listen', on: true }), 'allow_play')).toEqual([allow()]);
     expect(call.feed({ kind: 'timer', key: 'hold:w1' })).toEqual([]);
     expect(recheck(call, 'show')).toEqual([]);
     expect(only(call.say(speaker, 'd', 'And tomorrow'), 'turn')).toEqual([]);
-    expect(only(call.say(speaker, 'e', 'Over.'), 'turn').map((turn) => turn.message)).toEqual(['And tomorrow']);
+    expect(only(call.say(speaker, 'e', 'Zulu.'), 'turn').map((turn) => turn.message)).toEqual(['And tomorrow']);
   });
 
   it('the hold timer waits while the caller speaks again, and their next boundary decides', () => {

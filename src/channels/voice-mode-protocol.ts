@@ -96,7 +96,7 @@ export interface LiveKitJobMetadata {
   callerIdentity: string;
   /** The host confirms each Jev reply immediately before its first audio. */
   confirmPlayout?: true;
-  /** Jev voice calls supporting explicit turn release, in display order. */
+  /** Jev voice calls supporting explicit turn release: OVER_WORDS, in display order. */
   overWords?: string[];
   /** A call started through the app API. */
   appCall?: boolean;
@@ -309,28 +309,6 @@ export const CALL_COMMANDS_ATTRIBUTE = 'nanoclaw.voice-mode.commands';
  */
 export const CALL_COMMANDS_VERSION = '3';
 
-const PRIYOM = 'прийом';
-const ZULU = 'zulu';
-const OVER_MARKERS = [
-  [PRIYOM, 'приём', 'прием'],
-  ['зулу', ZULU],
-  ['овер', 'over', 'оувер'],
-];
-
-export function parseOverWords(raw?: string): string[] {
-  const configured = raw
-    ?.split(',')
-    .map((word) => word.trim())
-    .filter(Boolean);
-  return configured?.length ? [...new Set(configured)] : [...OVER_MARKERS.map(([display]) => display), ZULU, 'over'];
-}
-
-export function overWordForms(display: readonly string[]): string[] {
-  return [
-    ...new Set(display.flatMap((word) => OVER_MARKERS.find((group) => group.includes(word.toLowerCase())) ?? [word])),
-  ];
-}
-
 export type CallCommand = 'send' | 'discard';
 /**
  * One spoken command as the caller says it (`say`, any script). `ownSentence`: it counts only as its
@@ -355,13 +333,21 @@ export interface CallCommandWords {
 export const CALL_COMMAND_WORDS: CallCommandWords = {
   v: 1,
   send: [
-    { say: ZULU, hint: true },
+    { say: 'zulu', hint: true },
     { say: 'copy', ownSentence: true, hint: true },
     { say: 'copy that', ownSentence: true },
-    { say: PRIYOM },
+    { say: 'прийом' },
   ],
   discard: [{ say: 'scratch that', hint: true }, { say: 'discard turn' }, { say: 'discard this turn' }],
 };
+/**
+ * Listen until over's release words as the app shows them (it quotes the first): the send words,
+ * the `hint` ones first. The jev loop releases a draft on the same words by the same rules.
+ */
+export const OVER_WORDS: readonly string[] = [
+  ...CALL_COMMAND_WORDS.send.filter((word) => word.hint),
+  ...CALL_COMMAND_WORDS.send.filter((word) => !word.hint),
+].map((word) => word.say);
 /**
  * The worker's participant attribute with CALL_COMMAND_WORDS as compact JSON, set with
  * CALL_COMMANDS_ATTRIBUTE.
@@ -466,7 +452,7 @@ export interface ReviewRequest {
 export interface ReviewReply {
   /** Together with overWords, confirms support for explicit release. */
   listenUntilOver?: boolean;
-  /** The call's release markers in display order. */
+  /** The call's release words in display order (OVER_WORDS). */
   overWords?: string[];
   /** Current sound cue preference. */
   cues?: boolean;

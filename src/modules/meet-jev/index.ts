@@ -17,12 +17,7 @@
  */
 import { DataPacket_Kind, RoomServiceClient } from 'livekit-server-sdk';
 
-import {
-  overWordForms,
-  parseOverWords,
-  type LiveKitHostEvent,
-  type OverlapFallback,
-} from '../../channels/voice-mode-protocol.js';
+import type { LiveKitHostEvent, OverlapFallback } from '../../channels/voice-mode-protocol.js';
 import { log } from '../../log.js';
 import { callCore } from './core/index.js';
 import type { CallCore, CallEvent, CallKind, SessionStamp } from './core/types.js';
@@ -56,8 +51,6 @@ export interface JevCallHost {
   /** The worker lowers the line's gain during a barge-in instead of pausing it. */
   jevDuck?: boolean;
   callerName: string;
-  /** Release markers advertised to the caller. */
-  overWords?: string[];
   /** Save unreleased words to this call's thread. */
   postCaller?(text: string): void;
   agentName: string;
@@ -104,7 +97,6 @@ export function createJevCall(host: JevCallHost, deps: Partial<JevDeps> = {}): J
   const kind = host.kind ?? 'voice';
   const judgeOverlap = kind === 'voice' && host.jevOverlapVerdict !== false;
   const policy = policyFor(kind, host.agentName, [...host.agentAliases]);
-  if (kind === 'voice') policy.overWords = overWordForms(host.overWords ?? parseOverWords());
   const ingress = createWorkerIngress({ name: host.callerName }, host.maxTextBytes);
   let replies = 0;
   const fields = { callId: host.callId };

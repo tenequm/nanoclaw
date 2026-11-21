@@ -120,6 +120,7 @@ import {
 } from './channels/voice-mode-tts-catalog.js';
 import { DATA_DIR } from './config.js';
 import { readEnvFile } from './env.js';
+import { endPhrases, phraseEnd, spokenWord, spokenWords } from './modules/meet-jev/core/spoken.js';
 import {
   FINAL_GRACE_MS,
   FINAL_TIMEOUT_MS,
@@ -2017,31 +2018,6 @@ async function publishAudioTrack(
   }
 }
 
-/** Cyrillic letters as Latin sounds, so a name matches in either script (`Енді` and `Andy`). */
-const CYRILLIC_LATIN: Record<string, string> = Object.fromEntries(
-  'а:a б:b в:v г:h ґ:g д:d е:e є:ye ё:yo ж:zh з:z и:y і:i ї:yi й:y к:k л:l м:m н:n о:o п:p р:r с:s т:t у:u ф:f х:h ц:ts ч:ch ш:sh щ:shch ь: ъ: ы:y э:e ю:yu я:ya'
-    .split(' ')
-    .map((pair) => pair.split(':')),
-);
-
-/** A spoken word, normalised: lower case, Latin letters without accents, `kh` as `h`. */
-function spokenWord(raw: string): string {
-  const lower = raw.normalize('NFKC').toLowerCase();
-  let out = '';
-  for (const ch of lower) out += CYRILLIC_LATIN[ch] ?? ch;
-  return out.normalize('NFD').replace(/\p{M}/gu, '').replace(/kh/g, 'h');
-}
-
-/** The words of a transcript with where each sits in it, and whether it was written in Cyrillic; punctuation is not a word. */
-function spokenWords(text: string): Array<{ word: string; start: number; end: number; cyrillic: boolean }> {
-  return [...text.matchAll(/[\p{L}\p{N}]+/gu)].map((m) => ({
-    word: spokenWord(m[0]),
-    start: m.index,
-    end: m.index + m[0].length,
-    cyrillic: /\p{Script=Cyrillic}/u.test(m[0]),
-  }));
-}
-
 /** Vowels as one mark and doubled letters as one: `Andy`, `Endy` and `Енді` sound alike, `and` and `Andy` do not. */
 const nameSkeleton = (word: string): string => word.replace(/[aeiouy]/g, '*').replace(/([^*])\1+/g, '$1');
 
@@ -2102,38 +2078,37 @@ export function matchWake(text: string, names: readonly WakeName[]): { start: nu
 /** A command a transcript ends with, and what was said before it; `ownSentence` for `copy` and `copy that`. */
 export type CommandMatch = { command: CallCommand; rest: string; ownSentence?: true };
 /**
- * CALL_COMMAND_WORDS, longest first, as the words that end an utterance (Cyrillic read as Latin:
- * `зулу` is `zulu`, `прийом` is `pryyom`). `copy` and `copy that` are everyday words too, so any
- * text takes them only as their own sentence (`ownSentence`): the whole utterance, or after
- * punctuation. A capital letter alone is no boundary.
+ * CALL_COMMAND_WORDS as the words that end an utterance (Cyrillic read as Latin: `зулу` is `zulu`,
+ * `прийом` is `pryyom`). `copy` and `copy that` are everyday words too, so any text takes them only
+ * as their own sentence (`ownSentence`): the whole utterance, or after punctuation. A capital letter
+ * alone is no boundary.
  */
-const COMMANDS: ReadonlyArray<readonly [CallCommand, readonly string[], { ownSentence: true } | undefined]> = (
-  ['send', 'discard'] as const
-)
-  .flatMap((command) =>
-    CALL_COMMAND_WORDS[command].map(
-      ({ say, ownSentence }) =>
-        [command, spokenWords(say).map((w) => w.word), ownSentence ? { ownSentence } : undefined] as const,
-    ),
-  )
-  .sort((a, b) => b[1].length - a[1].length);
+const COMMANDS = endPhrases(
+  (['send', 'discard'] as const).flatMap((command) =>
+    CALL_COMMAND_WORDS[command].map(({ say, ownSentence }) => ({
+      command,
+      say,
+      ...(ownSentence ? { ownSentence } : {}),
+    })),
+  ),
+);
 
 /**
  * The command phrase a transcript ends with and what was said before it; `missed` when it is an
  * `ownSentence` command inside a sentence (`send me a copy`).
  */
 function commandEnd(text: string): (CommandMatch & { phrase: string; at: number; missed?: true }) | null {
-  const words = spokenWords(text);
-  for (const [command, phrase, guard] of COMMANDS) {
-    if (words.length < phrase.length) continue;
-    const tail = words.slice(words.length - phrase.length);
-    if (!tail.every((w, i) => w.word === phrase[i])) continue;
-    const before = text.slice(0, tail[0].start);
-    const found = { command, rest: sentence(before), phrase: phrase.join('-'), at: tail[0].start, ...guard };
-    if (guard?.ownSentence && !/(^|[.!?,;:–—-])\s*$/u.test(before)) return { ...found, missed: true };
-    return found;
-  }
-  return null;
+  const end = phraseEnd(text, COMMANDS);
+  if (!end) return null;
+  const { command, ownSentence } = end.phrase;
+  return {
+    command,
+    rest: sentence(text.slice(0, end.at)),
+    phrase: end.words.join('-'),
+    at: end.at,
+    ...(ownSentence ? { ownSentence } : {}),
+    ...(end.missed ? { missed: end.missed } : {}),
+  };
 }
 
 /**

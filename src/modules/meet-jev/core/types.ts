@@ -7,6 +7,7 @@
  * Times (`at`) are host epoch milliseconds; an ingress converts its source's clock (Recall's
  * frame timestamps, the worker's marks) on arrival.
  */
+import type { EndPhrase } from './spoken.js';
 
 export type CallStatus = 'heard' | 'thinking' | 'speaking' | 'idle';
 
@@ -178,8 +179,8 @@ export interface ActionThreshold {
 
 /** Everything that differs between the two kinds; the core knows nothing else about them. */
 export interface CallPolicy {
-  /** Accepted spellings of explicit release markers. */
-  overWords?: string[];
+  /** Voice: the words that end a listen-until-over draft (the spoken send words). */
+  releaseWords?: EndPhrase[];
   kind: CallKind;
   /** The agent's name as people say it, for the vocative fact, the stop rule and the state. */
   agentName: string;

@@ -68,7 +68,7 @@ import {
   settleWithin,
   baseLanguage,
   DEFAULT_VOICE_LANGUAGES,
-  parseOverWords,
+  OVER_WORDS,
   MAX_JEV_EVENTS_PER_POST,
   MAX_JEV_POST_BYTES,
   WORKER_REQUEST_TIMEOUT_MS,
@@ -244,7 +244,6 @@ export interface LiveKitVoiceConfig {
   jevDuck?: boolean;
   /** The wake phrase's name (wakePhraseName): what a jev call's people call the agent, over the line's agent name. */
   wakeName?: string;
-  overWords?: string[];
   /** VOICE_MODE_LANGUAGES as parseVoiceLanguages read it; DEFAULT_VOICE_LANGUAGES when unset. */
   languages?: readonly string[];
   /** Signaling URL the caller's browser connects to (LIVEKIT_URL). */
@@ -631,7 +630,6 @@ export async function readJsonObject(
 export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost): LiveKitVoice {
   const api = config.api ?? defaultApi(config);
   const agentName = config.agentName || DEFAULT_LIVEKIT_AGENT_NAME;
-  const overWords = config.overWords ?? parseOverWords();
   const languages = config.languages?.length ? [...config.languages] : [...DEFAULT_VOICE_LANGUAGES];
   // What every turn tells the agent about the caller's language; the same for the engine's life.
   const languageNote = callLanguageNote(languages);
@@ -1043,7 +1041,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     const metadata: LiveKitJobMetadata = {
       v: LIVEKIT_PROTOCOL_VERSION,
       ...(job.jev ? { confirmPlayout: true } : {}),
-      ...(job.jev && !job.meeting ? { overWords } : {}),
+      ...(job.jev && !job.meeting ? { overWords: [...OVER_WORDS] } : {}),
       callId,
       lineId: platformId,
       agentName: line.agent.name,
@@ -1385,7 +1383,6 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
           (name) => name !== (config.wakeName ?? call.line.agent.name),
         ),
         maxTextBytes: MAX_UTTERANCE_TEXT_BYTES,
-        overWords,
         postCaller: (text) => saveCallerDraft(call, text),
         submitTurn: (message, note, signal) => submitTurn(call, message, note, signal),
         push: (event) => {

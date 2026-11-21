@@ -50,7 +50,6 @@ import {
   wakePhrase,
   wakePhraseName,
   parseVoiceLanguages,
-  parseOverWords,
 } from './voice-mode-protocol.js';
 import { getMessagingGroupAgentByPair, getMessagingGroupByPlatform } from '../db/messaging-groups.js';
 import { findSessionByAgentGroup, findSessionForAgent } from '../db/sessions.js';
@@ -800,7 +799,6 @@ registerChannelAdapter(VOICE_MODE_CHANNEL, {
       'VOICE_MODE_TRUSTED_PROXY_CIDRS',
       'VOICE_MODE_ALLOWED_CLIENT_CIDRS',
       'VOICE_MODE_VOCABULARY',
-      'VOICE_MODE_OVER_WORDS',
       ...LIVEKIT_REQUIRED,
       'VOICE_MODE_ELEVENLABS_API_KEY',
       'LIVEKIT_WORKER_URL',
@@ -851,7 +849,6 @@ registerChannelAdapter(VOICE_MODE_CHANNEL, {
       ...(recallConfig ? { meetAudioOrigin: recallConfig.audioOrigin } : {}),
       livekit: {
         url: env.LIVEKIT_URL,
-        overWords: parseOverWords(env.VOICE_MODE_OVER_WORDS),
         languages: parseVoiceLanguages(env.VOICE_MODE_LANGUAGES),
         wakeName: wakePhraseName(env) ?? undefined,
         serverUrl: env.LIVEKIT_WORKER_URL,

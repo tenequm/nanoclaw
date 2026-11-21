@@ -30,6 +30,7 @@ import {
   CALL_REVIEW_ATTRIBUTE,
   LIVEKIT_PROTOCOL_VERSION,
   liveKitCallSecret,
+  OVER_WORDS,
   liveKitHostUrl,
   type CallReviewState,
   type CallVoiceState,
@@ -8396,8 +8397,7 @@ describe('jev calls', () => {
 
   it('keeps gated noise and phantom markers out of a listen draft and releases evidenced speech once', async () => {
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
-    const overWords = ['прийом', 'you are welcome'];
-    const { ctx } = fakeJob({ ...JEV_META, appCall: true, overWords, jevSpeechGate: true });
+    const { ctx } = fakeJob({ ...JEV_META, appCall: true, overWords: [...OVER_WORDS], jevSpeechGate: true });
     const submitTurn = vi.fn(async () => ({ ok: true as const, turnId: 't1' }));
     const judge = vi.fn(async () => ({ verdict: null, ms: 0 }));
     const call = createJevCall(
@@ -8407,7 +8407,6 @@ describe('jev calls', () => {
         agentName: 'Dan',
         agentAliases: [],
         maxTextBytes: 4096,
-        overWords,
         now: Date.now,
         submitTurn,
         push: (event) => host.emit(event),
@@ -8749,7 +8748,7 @@ describe('jev calls', () => {
 
   it('closes a stalled listening transcriber at the grace deadline and sends the partial once', async () => {
     vi.useFakeTimers();
-    const { ctx, job } = fakeJob({ ...JEV_META, appCall: true, overWords: ['over'] });
+    const { ctx, job } = fakeJob({ ...JEV_META, appCall: true, overWords: [...OVER_WORDS] });
     const host = fakeHostFetch();
     const v = fakeVoice();
     await runCall(ctx, callDeps(host.fetchImpl, v));
@@ -8773,14 +8772,14 @@ describe('jev calls', () => {
 
   it('waits for the final of a release word said just before the hangup, past the short grace', async () => {
     vi.useFakeTimers();
-    const { ctx, job } = fakeJob({ ...JEV_META, appCall: true, overWords: ['over'] });
+    const { ctx, job } = fakeJob({ ...JEV_META, appCall: true, overWords: [...OVER_WORDS] });
     const host = fakeHostFetch();
     const v = fakeVoice();
     await runCall(ctx, callDeps(host.fetchImpl, v));
     await v.rpc('settings', { listenUntilOver: true });
     v.events.onSpeech(true, 0);
     v.interim('Early');
-    v.transcription.results.push(heard('Early', 'Corrected, over.'));
+    v.transcription.results.push(heard('Early', 'Corrected, zulu.'));
     v.transcription.hold = true;
     v.events.onSpeech(false, 1600);
     host.emit({ type: 'end', reason: 'hangup' });
@@ -8794,7 +8793,7 @@ describe('jev calls', () => {
         .flat()
         .map(summary)
         .filter((e) => e.startsWith('final:')),
-    ).toEqual(['final:Corrected, over.']);
+    ).toEqual(['final:Corrected, zulu.']);
   });
 
   it('keeps version 3 settings available when an older host omits release markers', async () => {
@@ -8813,14 +8812,14 @@ describe('jev calls', () => {
   });
 
   it.each([true, false])('waits for a final before acknowledging host hangup with listening=%s', async (on) => {
-    const { ctx, job } = fakeJob({ ...JEV_META, appCall: true, overWords: ['over'] });
+    const { ctx, job } = fakeJob({ ...JEV_META, appCall: true, overWords: [...OVER_WORDS] });
     const host = fakeHostFetch();
     const v = fakeVoice();
     await runCall(ctx, callDeps(host.fetchImpl, v));
     await v.rpc('settings', { listenUntilOver: true });
     v.events.onSpeech(true, 0);
     v.interim('Early');
-    v.transcription.results.push(heard('Early', 'Corrected, over.'));
+    v.transcription.results.push(heard('Early', 'Corrected, zulu.'));
     v.transcription.hold = true;
     if (!on) {
       v.events.onSpeech(false, 1600);
@@ -8831,7 +8830,7 @@ describe('jev calls', () => {
     expect(v.transcription.close).not.toHaveBeenCalled();
     v.transcription.release();
     await vi.waitFor(() => expect(job.shutdown).toHaveBeenCalledWith('host: hangup'));
-    expect(jevEvents(host).flat().map(summary).slice(-2)).toEqual(['hangup', 'final:Corrected, over.']);
+    expect(jevEvents(host).flat().map(summary).slice(-2)).toEqual(['hangup', 'final:Corrected, zulu.']);
     expect(host.calls.at(-1)?.url).toMatch(/\/ended$/);
   });
 
@@ -8839,7 +8838,7 @@ describe('jev calls', () => {
     'retries the settings POST with bounded backoff, persistent failure=%s',
     async (persistent) => {
       vi.useFakeTimers();
-      const { ctx, job } = fakeJob({ ...JEV_META, appCall: true, overWords: ['over'] });
+      const { ctx, job } = fakeJob({ ...JEV_META, appCall: true, overWords: [...OVER_WORDS] });
       const host = fakeHostFetch();
       const v = fakeVoice();
       await runCall(ctx, callDeps(host.fetchImpl, v));
@@ -8870,8 +8869,9 @@ describe('jev calls', () => {
 
   it('echoes the listen setting, silences thinking and turn cues, and still speaks the reply', async () => {
     vi.useFakeTimers();
-    const overWords = ['прийом', 'зулу', 'овер'];
-    const meta = { ...JEV_META, appCall: true, overWords };
+    const overWords = ['zulu', 'copy', 'copy that', 'прийом'];
+    expect(OVER_WORDS).toEqual(overWords);
+    const meta = { ...JEV_META, appCall: true, overWords: [...OVER_WORDS] };
     expect(callControlAttributes(meta)[CALL_COMMANDS_ATTRIBUTE]).toBe('3');
     const { ctx } = fakeJob(meta);
     const host = fakeHostFetch();
@@ -9399,7 +9399,7 @@ describe('jev calls', () => {
     'clears the speech sink in the app interrupt callback with listenUntilOver=%s',
     async (listenUntilOver) => {
       const host = fakeHostFetch();
-      const { ctx, job } = fakeJob({ ...JEV_META, appCall: true, overWords: ['over'] });
+      const { ctx, job } = fakeJob({ ...JEV_META, appCall: true, overWords: [...OVER_WORDS] });
       const sink = {
         captureFrame: vi.fn(async () => undefined),
         queuedDuration: 50,

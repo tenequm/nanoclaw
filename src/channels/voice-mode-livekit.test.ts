@@ -49,7 +49,6 @@ import {
 } from './voice-mode-livekit.js';
 import type { MessagingGroup, Session } from '../types.js';
 import {
-  parseOverWords,
   LIVEKIT_PROTOCOL_VERSION,
   liveKitCallSecret,
   type LiveKitHostEvent,
@@ -2892,7 +2891,7 @@ describe('/voice jev with the real core', () => {
       expect(
         (
           await worker.post('jev', {
-            events: [utt(marker ? 'The corrected words, over.' : 'The corrected words', true)],
+            events: [utt(marker ? 'The corrected words, zulu.' : 'The corrected words', true)],
           })
         ).status,
       ).toBe(200);
@@ -2963,7 +2962,7 @@ describe('/voice jev with the real core', () => {
     await worker.post('jev', {
       events: [
         { type: 'listen', on: true, at: Date.now() },
-        { type: 'utterance', uttId: 'a', text: 'Deliver, over.', final: true, at: Date.now() },
+        { type: 'utterance', uttId: 'a', text: 'Deliver, zulu.', final: true, at: Date.now() },
       ],
     });
     await looking;
@@ -2976,19 +2975,19 @@ describe('/voice jev with the real core', () => {
     worker.close();
   });
 
-  it('passes custom host release words through metadata, recognition and delivery', async () => {
-    await h.stop();
-    h = await startHarness({}, { mirrorApi: chat.api, overWords: parseOverWords('  finished here, , ') });
+  it('passes the spoken send words through metadata, recognition and delivery', async () => {
     await post(`${h.base}/livekit/token?v=6&t=tok123&jev=1`);
     const meta = h.lk.dispatches.at(-1)!.metadata;
-    expect(meta.overWords).toEqual(['finished here']);
+    expect(meta.overWords).toEqual(['zulu', 'copy', 'copy that', 'прийом']);
     const worker = await attachWorker(h, meta);
     await worker.post('joined');
     const utt = (id: string, text: string) => ({ type: 'utterance', uttId: id, text, final: true, at: Date.now() });
-    await worker.post('jev', { events: [{ type: 'listen', on: true, at: Date.now() }, utt('a', 'Come over')] });
+    await worker.post('jev', {
+      events: [{ type: 'listen', on: true, at: Date.now() }, utt('a', 'Come over'), utt('b', 'send me a copy')],
+    });
     expect(h.inbound).toHaveLength(0);
-    await worker.post('jev', { events: [utt('b', 'Now, finished here.')] });
-    await vi.waitFor(() => expect(chat.posts.map((p) => p.text)).toEqual(['🎙 Come over Now']));
+    await worker.post('jev', { events: [utt('c', 'Now, copy that.')] });
+    await vi.waitFor(() => expect(chat.posts.map((p) => p.text)).toEqual(['🎙 Come over send me a copy Now']));
     await worker.post('ended');
     worker.close();
   });
