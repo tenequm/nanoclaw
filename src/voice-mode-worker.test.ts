@@ -41,7 +41,7 @@ import {
   type ReviewRequest,
 } from './channels/voice-mode-protocol.js';
 import { createJevCall, type JevCall } from './modules/meet-jev/index.js';
-import { FINAL_GRACE_MS, turnText, type Heard } from './voice-mode-gemini-live.js';
+import { FINAL_GRACE_MS, FINAL_TIMEOUT_MS, turnText, type Heard } from './voice-mode-gemini-live.js';
 import type { ChoiceDetails } from './channels/voice-mode-tts-catalog.js';
 import type { TtsAudio, TtsChoice, TtsInstance } from './voice-mode-tts.js';
 import {
@@ -6812,6 +6812,41 @@ describe('jev: the reporter', () => {
     ]);
   });
 
+  it('retries finals reported while dictating, in batches of their own; speech marks and playback go once', async () => {
+    const final = (uttId: string): JevWorkerEvent => ({ type: 'utterance', uttId, text: uttId, final: true, at: 0 });
+    const started: JevWorkerEvent = { type: 'playback', replyId: 'r1', state: 'started', at: 0 };
+    const posted: JevWorkerEvent[][] = [];
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+    const post = vi.fn(async (events: JevWorkerEvent[]) => {
+      posted.push(events);
+      if (posted.length === 1) await held;
+      if (posted.length === 2 || posted.length === 3) throw new Error('lost acknowledgement');
+      return new Response(null, { status: 204 });
+    });
+    const reporter = new JevReporter(post, silentLog);
+    reporter.retryFinals = () => true;
+    for (const event of [jevEvent(0), jevEvent(1), final('a'), final('b'), started]) reporter.report(event);
+    release();
+    await reporter.drain();
+    expect(posted).toEqual([
+      [jevEvent(0)],
+      [jevEvent(1)],
+      [final('a'), final('b')],
+      [final('a'), final('b')],
+      [started],
+    ]);
+  });
+
+  it('without dictation, a final rides with the other events and goes once', async () => {
+    const final: JevWorkerEvent = { type: 'utterance', uttId: 'a', text: 'a', final: true, at: 0 };
+    const h = heldReporter();
+    for (const event of [jevEvent(0), jevEvent(1), final, jevEvent(2)]) h.reporter.report(event);
+    h.release();
+    await h.reporter.drain();
+    expect(h.posted).toEqual([[jevEvent(0)], [jevEvent(1), final, jevEvent(2)]]);
+  });
+
   /** A reporter whose first POST is held until `release`. */
   const heldReporter = (perPost?: number, backlog?: number, maxBytes?: number) => {
     const warnings: string[] = [];
@@ -8723,7 +8758,7 @@ describe('jev calls', () => {
     v.interim('Last partial');
     v.transcription.hold = true;
     host.emit({ type: 'end', reason: 'hangup' });
-    await vi.advanceTimersByTimeAsync(FINAL_GRACE_MS - 1);
+    await vi.advanceTimersByTimeAsync(FINAL_TIMEOUT_MS - 1);
     expect(v.transcription.close).not.toHaveBeenCalled();
     await vi.advanceTimersByTimeAsync(1);
     expect(v.transcription.close).toHaveBeenCalledTimes(1);
@@ -8734,6 +8769,32 @@ describe('jev calls', () => {
         .filter((e) => e.startsWith('final:')),
     ).toEqual(['final:Last partial']);
     expect(job.shutdown).toHaveBeenCalledWith('host: hangup');
+  });
+
+  it('waits for the final of a release word said just before the hangup, past the short grace', async () => {
+    vi.useFakeTimers();
+    const { ctx, job } = fakeJob({ ...JEV_META, appCall: true, overWords: ['over'] });
+    const host = fakeHostFetch();
+    const v = fakeVoice();
+    await runCall(ctx, callDeps(host.fetchImpl, v));
+    await v.rpc('settings', { listenUntilOver: true });
+    v.events.onSpeech(true, 0);
+    v.interim('Early');
+    v.transcription.results.push(heard('Early', 'Corrected, over.'));
+    v.transcription.hold = true;
+    v.events.onSpeech(false, 1600);
+    host.emit({ type: 'end', reason: 'hangup' });
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(v.transcription.close).not.toHaveBeenCalled();
+    v.transcription.release();
+    await vi.advanceTimersByTimeAsync(FINAL_GRACE_MS);
+    expect(job.shutdown).toHaveBeenCalledWith('host: hangup');
+    expect(
+      jevEvents(host)
+        .flat()
+        .map(summary)
+        .filter((e) => e.startsWith('final:')),
+    ).toEqual(['final:Corrected, over.']);
   });
 
   it('keeps version 3 settings available when an older host omits release markers', async () => {

@@ -54,11 +54,13 @@ const STOP_WORDS = new Set([
 
 export function reduce(prev: CallState, event: CallEvent): CallState {
   const state = structuredClone<CallState>({ ...prev, commands: [] });
+  // A retried POST can replay a final the host already has: it changes nothing.
+  if (repeatsFinal(state, event)) return state;
   if (state.hangingUp && !['speech', 'utterance', 'hangup', 'timer'].includes(event.kind)) return state;
   if (
     state.afterListen &&
     (event.kind === 'listen' ||
-      event.kind === 'speech' ||
+      (event.kind === 'speech' && !endsDraftSpeech(state, event)) ||
       (event.kind === 'utterance' && !state.listenDraft?.some((piece) => piece.uttId === event.uttId)))
   ) {
     state.afterListen.push(event);
@@ -137,7 +139,9 @@ export function reduce(prev: CallState, event: CallEvent): CallState {
       const piece = event.key.startsWith(PIECE_TIMER)
         ? state.listenDraft?.find((item) => item.uttId === event.key.slice(PIECE_TIMER.length))
         : undefined;
-      if (piece && !piece.final) {
+      if (piece) delete piece.settling;
+      // A piece still being said is timed again from its speech-off.
+      if (piece && !piece.final && !beingSaid(state, piece)) {
         capturePiece(state, piece.speakerId, piece.uttId, { text: piece.text, final: true });
       }
       // A listening draft settles only through its own pieces; turn boundaries and holds wait for its release.
@@ -203,7 +207,11 @@ export function reduce(prev: CallState, event: CallEvent): CallState {
     }
     case 'play_ready': {
       const line = state.playout[event.replyId];
-      if (line) line.requestId = event.requestId;
+      if (line) {
+        line.requestId = event.requestId;
+        // The worker did not play the grant (speech came first) and waits again.
+        delete line.granted;
+      }
       break;
     }
     case 'chat':
@@ -216,6 +224,7 @@ export function reduce(prev: CallState, event: CallEvent): CallState {
       if (!line.requestId || line.held) continue;
       out.push({ kind: 'allow_play', replyId, requestId: line.requestId });
       delete line.requestId;
+      line.granted = true;
     }
   }
   refreshVersion(state);
@@ -256,7 +265,8 @@ function setListening(state: CallState, on: boolean): void {
   if (on === !!state.listenDraft) return;
   if (!on) {
     state.afterListen = [];
-    for (const piece of state.listenDraft!) armPiece(state, piece);
+    // The activity still being said settles from its own speech-off, which passes the queue.
+    for (const piece of state.listenDraft!) if (!beingSaid(state, piece)) armPiece(state, piece);
     return;
   }
   state.listenDraft = [];
@@ -281,7 +291,7 @@ function setListening(state: CallState, on: boolean): void {
     for (const reply of held) {
       const line = state.playout[reply.replyId];
       if (line) delete line.held;
-      else onReply(state, reply.replyId, wake.turnId, reply.text);
+      else if (!reply.queued) onReply(state, reply.replyId, wake.turnId, reply.text);
     }
   }
 }
@@ -324,7 +334,8 @@ function capturePiece(
     if (!stillSpeaking(state, speakerId)) armPiece(state, piece);
     return;
   }
-  if (piece.final && !transcript.final) return;
+  // A settled piece stays settled: a later partial or held overlap final cannot reopen it.
+  if (piece.final && (!transcript.final || transcript.contextOnly)) return;
   // A held overlap can become dictation after the worker reports a cut. Until then it has no draft words.
   piece.text = transcript.contextOnly ? '' : transcript.text.trim();
   piece.final = transcript.final && !transcript.contextOnly;
@@ -345,6 +356,24 @@ function capturePiece(
     if (rest !== null) piece.text = rest;
   }
   releaseMarkers(state);
+}
+
+/** The speaker is still saying this piece: its VAD is on and it is their latest activity. */
+function beingSaid(state: CallState, piece: ListenPiece): boolean {
+  return stillSpeaking(state, piece.speakerId) && state.speakers[piece.speakerId]?.pendingSpeech?.uttId === piece.uttId;
+}
+
+/** A speech-off that ends a draft piece's activity after a toggle-off: it settles that piece, so it is not queued. */
+function endsDraftSpeech(state: CallState, event: Extract<CallEvent, { kind: 'speech' }>): boolean {
+  return (
+    !event.on && !!state.listenDraft?.some((piece) => piece.speakerId === event.speaker.id && beingSaid(state, piece))
+  );
+}
+
+function repeatsFinal(state: CallState, event: CallEvent): boolean {
+  if (event.kind !== 'utterance' || !event.final) return false;
+  const utt = state.utterances.find((u) => u.speakerId === event.speaker.id && u.uttId === event.uttId);
+  return !!utt?.final && utt.text === event.text.trim() && !!utt.contextOnly === !!event.contextOnly;
 }
 
 function armPiece(state: CallState, piece: ListenPiece): void {
@@ -419,30 +448,44 @@ function log(state: CallState, event: string, fields: Record<string, unknown>): 
  * utterance deferred while someone spoke is.
  */
 function boundary(state: CallState, speakerId: string): void {
-  const wake = latestWake(state);
-  if (wake?.continuation && wake.speakerId === speakerId) {
-    const current = latestUtterance(state, speakerId);
-    const pieces = continuationPieces(state, wake);
-    if (!current || !pieces.includes(current) || pieces.some((u) => !u.final)) return;
-    if (!pieces.some((u) => takesTurn(u.text))) {
-      markHandled(state.speakers[speakerId], current.uttId);
-      release(state, wake);
-      return;
-    }
-    if (!hasWords(current.text)) {
-      // A wordless last activity can settle after a substantive fragment from the same turn.
-      if (!floorTaken(state) && !isHandled(state.speakers[speakerId], current.uttId)) {
-        markHandled(state.speakers[speakerId], current.uttId);
-        judge(state, speakerId, current.uttId, false);
-      }
-      return;
-    }
+  const wake = continuationFor(state, speakerId);
+  if (!wake) {
+    if (!decideLatest(state, speakerId)) decideDeferred(state);
+    return;
   }
-  if (decideLatest(state, speakerId)) return;
+  const current = latestUtterance(state, speakerId);
+  const pieces = continuationPieces(state, wake);
+  if (!current || !pieces.includes(current) || pieces.some((u) => !u.final)) return;
+  const speaker = state.speakers[speakerId];
+  // This boundary decides the speaker's own deferred piece too.
+  if (state.deferred?.speakerId === speakerId && !floorTaken(state)) state.deferred = null;
+  if (!pieces.some((u) => takesTurn(u.text))) {
+    markHandled(speaker, current.uttId);
+    release(state, wake);
+    return;
+  }
+  if (hasWords(current.text)) {
+    if (!decideLatest(state, speakerId)) decideDeferred(state);
+  } else if (floorTaken(state)) {
+    // Decided again through this boundary once the floor is free.
+    state.deferred = { speakerId, uttId: current.uttId };
+  } else if (!isHandled(speaker, current.uttId)) {
+    // A wordless last activity can settle after a substantive fragment from the same turn; it adds nothing to a
+    // merged turn Jev already judged.
+    markHandled(speaker, current.uttId);
+    if (openTurnOf(state, speakerId).text !== wake.judged) judge(state, speakerId, current.uttId, false);
+  }
+  // Nothing on its way decides the hold (no judge for this speaker): it ends after the quiet, bounded.
+  if (continuationFor(state, speakerId) && state.judging?.speakerId !== speakerId) holdBriefly(state, speakerId, false);
+}
+
+/** An utterance deferred while someone spoke, decided once the floor is free; a held speaker's through their boundary. */
+function decideDeferred(state: CallState): void {
   const deferred = state.deferred;
   if (!deferred || floorTaken(state)) return;
   state.deferred = null;
-  if (state.speakers[deferred.speakerId]?.lastUttId === deferred.uttId) decideLatest(state, deferred.speakerId);
+  if (continuationFor(state, deferred.speakerId)) boundary(state, deferred.speakerId);
+  else if (state.speakers[deferred.speakerId]?.lastUttId === deferred.uttId) decideLatest(state, deferred.speakerId);
 }
 
 /**
@@ -536,6 +579,8 @@ function judge(state: CallState, speakerId: string, uttId: string, retried: bool
     unmarkHandled(state.speakers[previous.speakerId], previous.uttId);
   }
   const { text: trigger, named } = openTurnOf(state, speakerId);
+  const held = continuationFor(state, speakerId);
+  if (held) held.judged = trigger;
   state.judging = {
     version: state.windowVersion,
     speakerId,
@@ -569,13 +614,19 @@ function onVerdict(state: CallState, version: number, verdict: Verdict | null, m
     if (speaker) unmarkHandled(speaker, judging.uttId);
     state.deferred = { speakerId: judging.speakerId, uttId: judging.uttId };
     log(state, 'verdict_deferred', { ...trigger, verdictVersion: version, choice: verdict?.action ?? null });
+    holdBriefly(state, judging.speakerId, false);
     return;
   }
 
   const wakeInProgress = latestWake(state);
   if (wakeInProgress?.continuation && wakeInProgress.speakerId === judging.speakerId) {
     const current = latestUtterance(state, judging.speakerId);
-    if (!current?.final || current.uttId !== judging.uttId) return;
+    // A later piece with words is judged at its own boundary; a wordless one leaves the judged text as it was.
+    if (
+      !current?.final ||
+      (current.uttId !== judging.uttId && openTurnOf(state, judging.speakerId).text !== judging.trigger)
+    )
+      return;
   }
   if (version !== state.windowVersion) {
     const wokeSince = state.wakes.some((w) => w.seq > judging.seq);
@@ -618,10 +669,15 @@ function onVerdict(state: CallState, version: number, verdict: Verdict | null, m
   } else holdBriefly(state, judging.speakerId);
 }
 
-/** A held turn that needs no new answer: its pending answer is released after HOLD_RELEASE_MS of quiet. */
-function holdBriefly(state: CallState, speakerId: string): void {
+/**
+ * A held turn that needs no new answer: its pending answer is released after HOLD_RELEASE_MS of quiet. Only a new
+ * verdict (`fresh`) restarts that time; anything else keeps the deadline already set.
+ */
+function holdBriefly(state: CallState, speakerId: string, fresh = true): void {
   const held = continuationFor(state, speakerId);
-  if (held) state.commands.push({ kind: 'wait', key: HOLD_TIMER + held.key, ms: HOLD_RELEASE_MS });
+  if (!held) return;
+  if (fresh || held.holdUntil === undefined) held.holdUntil = state.now + HOLD_RELEASE_MS;
+  state.commands.push({ kind: 'wait', key: HOLD_TIMER + held.key, ms: Math.max(0, held.holdUntil - state.now) });
 }
 
 /**
@@ -630,15 +686,18 @@ function holdBriefly(state: CallState, speakerId: string): void {
  */
 function release(state: CallState, wake: Wake): void {
   delete wake.continuation;
+  // A granted line is on its way to the room: nothing to hold back.
   const queued = Object.entries(state.playout).filter(
     ([replyId, line]) =>
-      line.wakeKey === wake.key && !state.agentLines.some((l) => l.replyId === replyId && l.state === 'playing'),
+      line.wakeKey === wake.key &&
+      !line.granted &&
+      !state.agentLines.some((l) => l.replyId === replyId && l.state === 'playing'),
   );
   const since = sinceTrigger(state, wake);
   if (queued.length === 0 || since === 0) return;
   if (state.recheck || wake.rechecked?.since !== since) {
     for (const [, line] of queued) line.held = true;
-    const replies = queued.map(([replyId, line]) => ({ replyId, text: line.text }));
+    const replies = queued.map(([replyId, line]) => ({ replyId, text: line.text, queued: true as const }));
     if (state.recheck) {
       const asked = new Set(state.recheck.replies.map((r) => r.replyId));
       state.recheck.replies.push(...replies.filter((r) => !asked.has(r.replyId)));
@@ -873,10 +932,10 @@ function onRecheck(state: CallState, wakeKey: string, verdict: RecheckVerdict | 
   const wake = state.wakes.find((w) => w.key === wakeKey);
   // The speaker resumed during the check: the turn's boundary decides instead, the lines queued meanwhile.
   if (wake?.continuation) {
-    for (const { replyId, text } of recheck.replies) {
+    for (const { replyId, text, queued } of recheck.replies) {
       const line = state.playout[replyId];
       if (line) delete line.held;
-      else speak(state, replyId, text, wake, { outcome: 'held', reason: 'continuation' });
+      else if (!queued) speak(state, replyId, text, wake, { outcome: 'held', reason: 'continuation' });
     }
     return;
   }
@@ -892,8 +951,10 @@ function onRecheck(state: CallState, wakeKey: string, verdict: RecheckVerdict | 
     ...(verdict ? {} : { reason: 'jev_failed' }),
   });
   if (show) state.commands.push({ kind: 'status', status: 'idle' });
-  for (const { replyId, text } of recheck.replies) {
+  for (const { replyId, text, queued } of recheck.replies) {
     const line = state.playout[replyId];
+    // A queued line that left playout during the check (played, failed, revoked) was reported already.
+    if (!line && queued) continue;
     if (line && (show || !wake)) revokeQueued(state, replyId);
     else if (line) delete line.held;
     else if (show || !wake) showReply(state, replyId, text);
@@ -912,7 +973,8 @@ function endRecheck(state: CallState, reason: 'stopped' | 'replaced'): void {
   if (!recheck) return;
   state.recheck = null;
   log(state, 'recheck', { replyIds: recheck.replies.map((r) => r.replyId), outcome: 'shown', reason });
-  for (const { replyId, text } of recheck.replies) if (!state.playout[replyId]) showReply(state, replyId, text);
+  for (const { replyId, text, queued } of recheck.replies)
+    if (!state.playout[replyId] && !queued) showReply(state, replyId, text);
 }
 
 function logPlayback(state: CallState, event: Extract<CallEvent, { kind: 'playback' }>, wakeKey: string | null): void {

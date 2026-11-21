@@ -241,8 +241,9 @@ describe('listen until over', () => {
       { kind: 'speech', speaker: caller, uttId: 'a', on: true },
       { kind: 'utterance', speaker: caller, uttId: 'a', text: 'First', final: false },
     );
-    const [timer] = only(call.feed({ kind: 'listen', on: false }), 'wait');
-    call.feed({ kind: 'speech', speaker: caller, on: false });
+    // The piece still being said is timed from its own speech-off.
+    expect(only(call.feed({ kind: 'listen', on: false }), 'wait')).toEqual([]);
+    const [timer] = only(call.feed({ kind: 'speech', speaker: caller, on: false }), 'wait');
     expect(only(call.say(caller, 'b', 'What next?'), 'judge')).toHaveLength(0);
     const commands = call.feed({ kind: 'timer', key: timer.key });
     expect(only(commands, 'turn')[0]?.message).toBe('First');
@@ -299,6 +300,54 @@ describe('listen until over', () => {
     const call = new Call('meet');
     call.feed({ kind: 'listen', on: true });
     expect(call.state.listenDraft).toBeNull();
+  });
+
+  it('a held overlap final after its piece timer keeps the piece settled, so later releases still go out', () => {
+    const call = listening();
+    call.feed(
+      { kind: 'speech', speaker: caller, uttId: 'a', on: true },
+      { kind: 'utterance', speaker: caller, uttId: 'a', text: 'ага, так', final: false, contextOnly: true },
+    );
+    const [timer] = only(call.feed({ kind: 'speech', speaker: caller, on: false }), 'wait');
+    call.feed({ kind: 'timer', key: timer.key });
+    call.feed({ kind: 'utterance', speaker: caller, uttId: 'a', text: 'ага, так', final: true, contextOnly: true });
+    expect(call.state.listenDraft?.map((piece) => piece.final)).toEqual([true]);
+    expect(only(call.say(caller, 'b', 'Нове питання, прийом.'), 'turn').map((turn) => turn.message)).toEqual([
+      'Нове питання',
+    ]);
+  });
+
+  it('switching off mid-sentence waits for the rest of that utterance', () => {
+    const call = listening();
+    const words = (text: string, final: boolean) =>
+      ({ kind: 'utterance', speaker: caller, uttId: 'a', text, final }) as const;
+    call.feed({ kind: 'speech', speaker: caller, uttId: 'a', on: true }, words('я хочу сказати що', false));
+    expect(only(call.feed({ kind: 'listen', on: false }), 'wait')).toEqual([]);
+    // Even a piece timer cannot cut the utterance while the caller is still saying it.
+    expect(only(call.feed({ kind: 'timer', key: 'listen-piece:a' }), 'turn')).toEqual([]);
+    call.feed(words('я хочу сказати що завтра', false));
+    expect(only(call.feed({ kind: 'speech', speaker: caller, on: false }), 'wait')).toHaveLength(1);
+    const [turn] = only(call.feed(words('я хочу сказати що завтра буде дощ.', true)), 'turn');
+    expect(turn?.message).toBe('я хочу сказати що завтра буде дощ.');
+  });
+
+  it('a final replayed by a retried POST changes nothing, while listening or not', () => {
+    const call = listening();
+    call.say(caller, 'a', 'Draft');
+    const final = { kind: 'utterance', speaker: caller, uttId: 'b', text: 'Next, over.', final: true } as const;
+    call.feed(
+      { kind: 'speech', speaker: caller, uttId: 'b', on: true },
+      { kind: 'speech', speaker: caller, on: false },
+    );
+    expect(only(call.feed(final), 'turn').map((turn) => turn.message)).toEqual(['Draft Next']);
+    expect(call.feed(final)).toEqual([]);
+    call.feed({ kind: 'listen', on: false }, { kind: 'turn', key: 'w1', turnId: 't1' });
+    const [judge] = only(call.say(caller, 'c', 'What next?'), 'judge');
+    const logs = call.logs.length;
+    const statuses = call.statuses.length;
+    expect(call.feed({ kind: 'utterance', speaker: caller, uttId: 'c', text: 'What next?', final: true })).toEqual([]);
+    expect([call.logs.length, call.statuses.length]).toEqual([logs, statuses]);
+    expect(only(call.verdict(judge.windowVersion, 'answer'), 'turn')).toHaveLength(1);
   });
 
   it('ignores a judge verdict already in flight when listening starts', () => {
@@ -1365,6 +1414,167 @@ describe('continuing a turn before playback', () => {
     call.feed({ kind: 'speech', speaker, on: false });
     const [judge] = only(call.feed(say('c', 'for the library?')), 'judge');
     expect(only(call.verdict(judge.windowVersion, 'answer'), 'revoke').map((c) => c.replyId)).toEqual(['r1']);
+  });
+
+  it("in a meeting, decides a held speaker's words and cough that ended while another spoke, once the floor is free", () => {
+    const call = new Call('meet');
+    call.feed({ kind: 'presence', speaker: olena, joined: true }, { kind: 'presence', speaker, joined: true });
+    call.sayAnswered(speaker, 'a', 'Can you check the release notes');
+    call.feed({ kind: 'turn', key: 'w1', turnId: 't1' }, { kind: 'speech', speaker, on: true, uttId: 'b' });
+    expect(call.feed(reply, ready())).toEqual([speakR1]);
+    call.feed({ kind: 'speech', speaker: olena, on: true }, { kind: 'speech', speaker, on: false });
+    // Deferred for the floor; the hold is bounded meanwhile.
+    expect(only(call.feed(say('b', 'for the mobile app')), 'wait')).toEqual([
+      { kind: 'wait', key: 'hold:w1', ms: 3000 },
+    ]);
+    call.feed({ kind: 'speech', speaker, on: true, uttId: 'c' }, { kind: 'speech', speaker, on: false });
+    expect(only(call.feed(say('c', '')), 'judge')).toEqual([]);
+    // Olena's sound had no words: her boundary is her fallback timer.
+    const [olenaTimer] = only(call.feed({ kind: 'speech', speaker: olena, on: false }), 'wait');
+    const [judge] = only(call.feed({ kind: 'timer', key: olenaTimer.key }), 'judge');
+    expect(judge?.state.latest?.text).toBe('Can you check the release notes for the mobile app');
+    expect(call.verdict(judge.windowVersion, 'stay_silent')).toEqual([{ kind: 'wait', key: 'hold:w1', ms: 3000 }]);
+    expect(only(call.feed({ kind: 'timer', key: 'hold:w1' }), 'recheck')).toHaveLength(1);
+  });
+
+  it('bounds a hold whose last words were held over an older playing line (context only)', () => {
+    const call = new Call();
+    wakeAndSpeak(call, 'Read me the news.', 'First, the weather.', 1);
+    // An interjection between two lines of the answer, judged a new turn.
+    call.sayAnswered(misha, 'u2', 'And the traffic?');
+    call.feed({ kind: 'turn', key: 'w2', turnId: 't2' }, { kind: 'speech', speaker: misha, on: true, uttId: 'u3' });
+    const [boundaryTimer] = only(call.feed({ kind: 'speech', speaker: misha, on: false }), 'wait');
+    call.feed({
+      kind: 'utterance',
+      speaker: misha,
+      uttId: 'u3',
+      text: 'that is interesting',
+      final: true,
+      contextOnly: true,
+    });
+    call.feed({ kind: 'reply', replyId: 'r2', turnId: 't2', text: 'Traffic is light.' });
+    expect(call.feed({ kind: 'play_ready', replyId: 'r2', requestId: 'q2' })).toEqual([]);
+    expect(only(call.feed({ kind: 'timer', key: boundaryTimer.key }), 'wait')).toEqual([
+      { kind: 'wait', key: 'hold:w2', ms: 3000 },
+    ]);
+    expect(only(call.feed({ kind: 'timer', key: 'hold:w2' }), 'recheck').map((c) => c.wakeKey)).toEqual(['w2']);
+  });
+
+  it('a late final with the words its timer already settled does not hold the released answer again', () => {
+    const call = resumed();
+    call.feed({ kind: 'utterance', speaker, uttId: 'b', text: 'the opening hours', final: false });
+    const [wait] = only(call.feed({ kind: 'speech', speaker, on: false }), 'wait');
+    call.feed(reply, ready());
+    const [judge] = only(call.feed({ kind: 'timer', key: wait.key }), 'judge');
+    call.verdict(judge.windowVersion, 'stay_silent');
+    expect(only(call.feed({ kind: 'timer', key: 'hold:w1' }), 'recheck')).toHaveLength(1);
+    expect(recheck(call, 'speak')).toEqual([allow()]);
+    expect(call.feed(say('b', 'the opening hours'))).toEqual([]);
+    expect(call.state.wakes.at(-1)?.continuation).toBeUndefined();
+    // The grant was lost to speech: the worker asks again and is granted.
+    expect(call.feed(ready('r1', 'q2'))).toEqual([allow('r1', 'q2')]);
+  });
+
+  it('a cough during the hold neither asks Jev again nor restarts the wait', () => {
+    const { call } = heldAfter('stay_silent');
+    const judges = (commands: Command[]) => only(commands, 'judge');
+    call.feed({ kind: 'speech', speaker, on: true, uttId: 'c', at: 20_000 });
+    expect(call.feed({ kind: 'timer', key: 'hold:w1', at: 21_000 })).toEqual([]);
+    call.feed({ kind: 'speech', speaker, on: false, at: 21_500 });
+    const settled = call.feed({ kind: 'utterance', speaker, uttId: 'c', text: '', final: true, at: 21_600 });
+    expect(judges(settled)).toEqual([]);
+    expect(only(settled, 'wait')).toEqual([{ kind: 'wait', key: 'hold:w1', ms: 0 }]);
+    expect(only(call.feed({ kind: 'timer', key: 'hold:w1' }), 'recheck')).toHaveLength(1);
+  });
+
+  it('a cough while the merged turn is judged keeps that verdict, which still ends the hold', () => {
+    const call = resumed();
+    call.feed({ kind: 'speech', speaker, on: false }, reply, ready());
+    const [judge] = only(call.feed(say('b', 'the opening hours')), 'judge');
+    call.feed({ kind: 'speech', speaker, on: true, uttId: 'c' }, { kind: 'speech', speaker, on: false });
+    expect(only(call.feed(say('c', '')), 'judge')).toEqual([]);
+    expect(only(call.verdict(judge.windowVersion, 'stay_silent'), 'wait')).toEqual([
+      { kind: 'wait', key: 'hold:w1', ms: 3000 },
+    ]);
+    expect(only(call.feed({ kind: 'timer', key: 'hold:w1' }), 'recheck')).toHaveLength(1);
+  });
+
+  it('a further reply to a multi-message older turn, written after the newer turn was stored, is spoken for it', () => {
+    // The trade of retagging (#72 R2): the queued regime looks like the coalesced one, so "Lisbon is sunny." is
+    // spoken as turn 18's answer before the real one.
+    const call = new Call();
+    const session = 'call-session';
+    const [first] = only(call.sayAnswered(misha, 'u1', 'What is the weather in Lisbon?'), 'turn');
+    call.feed({ kind: 'turn', key: first.key, turnId: '17', stored: { sessionId: session, at: 1_000 }, at: 1_000 });
+    const produced = (at: number) => ({ sessionId: session, at });
+    expect(
+      call.feed({
+        kind: 'reply',
+        replyId: 'r1',
+        turnId: '17',
+        text: 'Let me check.',
+        produced: produced(1_500),
+        at: 1_500,
+      }),
+    ).toEqual([{ kind: 'speak', replyId: 'r1', turnId: '17', text: 'Let me check.' }]);
+    call.feed(
+      { kind: 'playback', replyId: 'r1', state: 'started' },
+      { kind: 'playback', replyId: 'r1', state: 'completed' },
+    );
+    const [second] = only(call.sayAnswered(misha, 'u2', 'Actually, in Porto?'), 'turn');
+    const storedAt = call.state.now + 100;
+    call.feed({
+      kind: 'turn',
+      key: second.key,
+      turnId: '18',
+      stored: { sessionId: session, at: storedAt },
+      at: storedAt,
+    });
+    expect(
+      call.feed({
+        kind: 'reply',
+        replyId: 'r2',
+        turnId: '17',
+        text: 'Lisbon is sunny.',
+        produced: produced(storedAt + 500),
+        at: storedAt + 500,
+      }),
+    ).toEqual([{ kind: 'speak', replyId: 'r2', turnId: '18', text: 'Lisbon is sunny.' }]);
+    expect(
+      call.feed({
+        kind: 'reply',
+        replyId: 'r3',
+        turnId: '18',
+        text: 'Porto is rainy.',
+        produced: produced(storedAt + 900),
+        at: storedAt + 900,
+      }),
+    ).toEqual([{ kind: 'speak', replyId: 'r3', turnId: '18', text: 'Porto is rainy.' }]);
+  });
+
+  it('a held line that failed during its answer-ready check is not spoken again by the verdict', () => {
+    const { call } = heldAfter('stay_silent');
+    expect(only(call.feed({ kind: 'timer', key: 'hold:w1' }), 'recheck')).toHaveLength(1);
+    call.feed({ kind: 'playback', replyId: 'r1', state: 'failed' });
+    expect(recheck(call, 'speak')).toEqual([]);
+    expect(call.state.agentLines.filter((l) => l.replyId === 'r1').map((l) => l.state)).toEqual(['shown']);
+  });
+
+  it('a line granted before the hold reopened is not taken into the check, nor spoken twice', () => {
+    const call = new Call();
+    call.sayAnswered(speaker, 'a', 'When does the library open?');
+    call.feed({ kind: 'turn', key: 'w1', turnId: 't1' });
+    expect(call.feed(reply, ready())).toEqual([speakR1, allow()]);
+    // Speech starts before the host hears the line start.
+    call.feed({ kind: 'speech', speaker, on: true, uttId: 'b' }, { kind: 'speech', speaker, on: false });
+    const [judge] = only(call.feed(say('b', 'and on Sunday')), 'judge');
+    call.verdict(judge.windowVersion, 'stay_silent');
+    expect(only(call.feed({ kind: 'timer', key: 'hold:w1' }), 'recheck')).toEqual([]);
+    call.feed(
+      { kind: 'playback', replyId: 'r1', state: 'started' },
+      { kind: 'playback', replyId: 'r1', state: 'completed' },
+    );
+    expect(call.state.agentLines.filter((l) => l.replyId === 'r1').map((l) => l.state)).toEqual(['done']);
   });
 });
 

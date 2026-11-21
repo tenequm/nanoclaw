@@ -770,8 +770,9 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
   const refreshChat = async (call: LiveKitCall, turn: boolean): Promise<CallChat | null> => {
     const refresh = ++call.chatRefreshes;
     const chat = await probeChat(call);
+    // A drained draft reaches only the chat the call talked in, as its saved caller text does.
+    if (call.ended && hungUp.get(call.callId)?.drainingDraft) return sameChat(call.chat, chat) ? chat : null;
     // A slower, older refresh (the join's, say) must not undo a newer one.
-    if (call.ended) return sameChat(call.chat, chat) ? chat : null;
     if (refresh !== call.chatRefreshes) return chat;
     if (turn && call.previousChat) {
       if (call.previousChat.active) call.previousChat.active = false;
@@ -973,7 +974,11 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
     if (!eligible()) return false;
     try {
       const current = await host.resolveLine(call.platformId);
-      if (current && sameCallerAndAgent(call.line, current)) return eligible();
+      if (current && sameCallerAndAgent(call.line, current)) {
+        if (eligible()) return true;
+        // A newer call on the line: the drained draft is saved as caller text, not discarded.
+        if (hungUp.get(call.callId)?.drainingDraft) return false;
+      }
     } catch (err) {
       log.warn('livekit-voice-mode: call access check failed', { platformId: call.platformId, err });
     }

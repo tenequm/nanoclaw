@@ -319,9 +319,11 @@ On a Jev voice call, enable **Listen until over** to dictate across pauses.
 The agent waits until an utterance ends with `прийом`, `зулу` or `овер`
 (`zulu`, `over` and common transcription variants also work). It receives
 one message with the marker removed. A marker alone releases a pending draft
-and is silent when the draft is empty. Switching the mode off sends the draft.
+and is silent when the draft is empty. Switching the mode off sends the draft
+once the utterance being said ends.
 At call end, unfinished words are posted to the caller's thread unless access
-was revoked. A marker finalized during hangup grace still sends the turn.
+was revoked. At hangup the worker waits up to 3 s for outstanding finals, so a
+marker said just before it still sends the turn.
 Replies are spoken and the caller can interrupt them or say
 `stop`. Typing, the working indicator and the end-of-turn cue stay silent.
 The mode starts off on each call. Meetings use their usual Jev policy.
@@ -336,9 +338,9 @@ the reply's first audio through their final transcript; one that never comes
 counts as heard so far once the boundary timer fires. Jev judges the original
 request and the continuation together. An answer replaces the pending turn, a
 stop drops it, and an acknowledgement alone releases the original answer. When
-Jev chooses silence the answer is released after a few seconds of quiet, and
-when Jev fails at once; either way it goes through the usual answer-ready
-check. The worker synthesizes a held reply meanwhile. Before its first audio,
+Jev chooses silence, or nothing new is left to judge (a cough, words held over
+a playing line), the answer is released after a few seconds of quiet, and when
+Jev fails at once; either way it goes through the usual answer-ready check. The worker synthesizes a held reply meanwhile. Before its first audio,
 each queued line waits for the host to confirm it can play. Fresh caller
 speech invalidates that confirmation.
 

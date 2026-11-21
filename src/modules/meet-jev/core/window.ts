@@ -82,6 +82,10 @@ export interface Wake {
   started?: boolean;
   /** The speaker is finishing the pending turn: its lines get no playback grant until that turn's boundary decides. */
   continuation?: true;
+  /** The merged turn text the last judge during a hold was asked on: a wordless piece that leaves it is not re-asked. */
+  judged?: string;
+  /** When the hold is released at the latest without a new verdict (`now` clock). */
+  holdUntil?: number;
   /** The utterance it answers and when that started: people speaking after it make a landed answer rechecked. */
   trigger: string;
   triggerAt: number;
@@ -95,7 +99,8 @@ export interface Recheck {
   wakeKey: string;
   /** `utterancesSince` the trigger when the check was asked. */
   since: number;
-  replies: { replyId: string; text: string }[];
+  /** `queued`: taken from playout by a release; once its line left playout, the verdict has nothing to do for it. */
+  replies: { replyId: string; text: string; queued?: true }[];
 }
 
 /** The `judge` in flight: one at a time, the newest boundary's. */
@@ -144,9 +149,10 @@ export interface CallState {
   agentLines: AgentLine[];
   /**
    * Replies sent to `speak` that have not finished playing: replyId -> text, the wake, the worker's pending
-   * playback request, and `held` while the answer-ready check decides whether it plays.
+   * playback request, `held` while the answer-ready check decides whether it plays, and `granted` once its
+   * request was granted and no newer one came.
    */
-  playout: Record<string, { text: string; wakeKey: string | null; requestId?: string; held?: true }>;
+  playout: Record<string, { text: string; wakeKey: string | null; requestId?: string; held?: true; granted?: true }>;
   /** Replies a stop took out of `playout` before the host heard them start: the worker still reports them. */
   stoppedPlayout: Record<string, { text: string; wakeKey: string | null }>;
   /** The newest few wakes, oldest first. */

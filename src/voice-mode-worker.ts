@@ -122,6 +122,7 @@ import { DATA_DIR } from './config.js';
 import { readEnvFile } from './env.js';
 import {
   FINAL_GRACE_MS,
+  FINAL_TIMEOUT_MS,
   GeminiLiveTranscriber,
   takesTurn,
   turnText,
@@ -5101,15 +5102,21 @@ function playedPrefix(text: string, playedMs: number, audioMs: number, complete:
 const isPartial = (e: JevWorkerEvent): e is Extract<JevWorkerEvent, { type: 'utterance' }> =>
   e.type === 'utterance' && !e.final;
 
+const JEV_POST_ATTEMPTS = 3;
+
 /**
  * The worker's events to the host's `agent/jev`, in order: what piles up while one POST is in flight
  * goes in the next, MAX_JEV_EVENTS_PER_POST and MAX_JEV_POST_BYTES at a time. A queued partial is
  * replaced by its utterance's next one. A host that cannot be reached, or refuses a batch, loses that
- * batch with a log line; audio never waits on it. A backlog sheds partials only: speech marks, finals
- * and playback are what the host decides on.
+ * batch with a log line: after JEV_POST_ATTEMPTS tries for a settings change, and for finals reported while
+ * `retryFinals` holds; after one try for the rest. Audio never waits on it. A backlog sheds partials only:
+ * speech marks, finals and playback are what the host decides on.
  */
 export class JevReporter {
+  /** Finals reported meanwhile are dictation: each is worth a retry, and the host ignores one it already has. */
+  retryFinals: () => boolean = () => false;
   private readonly queue: JevWorkerEvent[] = [];
+  private readonly retriedFinals = new WeakSet<JevWorkerEvent>();
   private inFlight?: Promise<void>;
   private readonly settingsAcks = new Map<JevWorkerEvent, (accepted: boolean) => void>();
   private shed = 0;
@@ -5132,6 +5139,7 @@ export class JevReporter {
   }
 
   report(event: JevWorkerEvent): void {
+    if (event.type === 'utterance' && event.final && this.retryFinals()) this.retriedFinals.add(event);
     if (isPartial(event)) {
       // The newer partial goes at the end, so the queue stays in the order things were heard.
       const stale = this.queue.findIndex((e) => isPartial(e) && e.uttId === event.uttId);
@@ -5166,13 +5174,17 @@ export class JevReporter {
     while (this.inFlight) await this.inFlight;
   }
 
+  /** A retried POST carries a settings change alone, or retried finals only, so a replay cannot repeat speech. */
+  private retryKind(event: JevWorkerEvent): 'listen' | 'final' | null {
+    return event.type === 'listen' ? 'listen' : this.retriedFinals.has(event) ? 'final' : null;
+  }
+
   /** The next POST's events: within the count and the body size; one too big for any POST is dropped. */
   private nextBatch(): JevWorkerEvent[] {
     const batch: JevWorkerEvent[] = [];
     let bytes = JEV_POST_ENVELOPE_BYTES;
     while (this.queue.length && batch.length < this.perPost) {
-      // Retry a settings change on its own so a lost acknowledgement cannot replay speech.
-      if (batch.length && this.queue[0].type === 'listen') break;
+      if (batch.length && this.retryKind(this.queue[0]) !== this.retryKind(batch[0])) break;
       const size = Buffer.byteLength(JSON.stringify(this.queue[0])) + 1;
       if (JEV_POST_ENVELOPE_BYTES + size > this.maxBytes) {
         const event = this.queue.shift()!;
@@ -5195,7 +5207,7 @@ export class JevReporter {
     while (this.queue.length) {
       const batch = this.nextBatch();
       if (!batch.length) continue;
-      const attempts = batch[0].type === 'listen' ? 3 : 1;
+      const attempts = this.retryKind(batch[0]) ? JEV_POST_ATTEMPTS : 1;
       let accepted = false;
       for (let attempt = 0; attempt < attempts && !accepted; attempt++) {
         if (attempt) await pause(100 * 2 ** (attempt - 1));
@@ -5799,7 +5811,8 @@ export class JevLoop {
 
   async finishInput(): Promise<void> {
     this.onSpeech(false, this.ring.position);
-    await atMost(Promise.all(this.finalizing.values()), FINAL_GRACE_MS);
+    // A release word said just before the hangup lives in its final: wait as long as a final can take, within the host's grace.
+    await atMost(Promise.all(this.finalizing.values()), FINAL_TIMEOUT_MS);
     this.deps.transcriber?.close();
     await atMost(Promise.all(this.finalizing.values()), FINAL_GRACE_MS);
   }
@@ -6261,6 +6274,7 @@ async function runJevCall(s: JevCallSetup): Promise<void> {
       }
     }
   }, callLog);
+  reporter.retryFinals = () => listenUntilOver || drainingInput;
   const languages = callLanguages(meta.languages);
   const transcriber = meta.meeting
     ? undefined
@@ -6423,10 +6437,10 @@ async function runJevCall(s: JevCallSetup): Promise<void> {
       const req = callerIdentity === meta.callerIdentity ? readReviewRequest(payload) : null;
       if (!req) throw new Error('not a review request from the caller');
       let error: ReviewReply['error'];
-      if (ending) error = 'closed';
-      else if (op !== 'settings') error = 'not_review';
+      if (op !== 'settings') error = 'not_review';
       else {
-        if (overWords && req.listenUntilOver !== undefined && req.listenUntilOver !== listenUntilOver) {
+        // While the call ends, its draft drains as it stands: the mode no longer changes.
+        if (!ending && overWords && req.listenUntilOver !== undefined && req.listenUntilOver !== listenUntilOver) {
           loop.retainListenInput();
           listenUntilOver = req.listenUntilOver;
           awaitingUntil = typingUntil = 0;
