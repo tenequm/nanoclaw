@@ -162,6 +162,9 @@ describe('SQLite mailbox canonical serialization', () => {
     expect(outbound.getDueMessages()).toEqual([
       {
         id: 'out-1',
+        timestamp: (
+          outboundDb.prepare("SELECT timestamp FROM messages_out WHERE id = 'out-1'").get() as { timestamp: string }
+        ).timestamp,
         kind: 'chat',
         platformId: 'room',
         channelType: 'test',

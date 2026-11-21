@@ -3,7 +3,16 @@
  * the bookkeeping the decisions need (wakes, replies in playout, the stop mark), and the
  * renderings of it for Jev (`toJevState`) and for the agent's turn note (`renderWindow`).
  */
-import type { CallEvent, CallPolicy, Command, JevLine, JevState, RecheckAction, RecheckState } from './types.js';
+import type {
+  CallEvent,
+  CallPolicy,
+  Command,
+  JevLine,
+  JevState,
+  RecheckAction,
+  RecheckState,
+  SessionStamp,
+} from './types.js';
 
 export interface Utterance {
   speakerId: string;
@@ -15,11 +24,11 @@ export interface Utterance {
   at: number;
 }
 
-/** A line the agent got out, from playback reports only. */
+/** An agent line and how the caller received it. */
 export interface AgentLine {
   replyId: string;
   text: string;
-  state: 'playing' | 'done' | 'cut_off';
+  state: 'playing' | 'done' | 'cut_off' | 'shown';
   at: number;
 }
 
@@ -64,12 +73,17 @@ export interface Wake {
   seq: number;
   at: number;
   turnId: string | null;
+  stored?: SessionStamp;
   /** Refused, or replaced before delivery: no answer will come. */
   dropped: boolean;
   replied: boolean;
+  started?: boolean;
+  /** The speaker is finishing the pending turn: its lines get no playback grant until that turn's boundary decides. */
+  continuation?: true;
   /** The utterance it answers and when that started: people speaking after it make a landed answer rechecked. */
   trigger: string;
   triggerAt: number;
+  triggerUttId: string;
   /** The last recheck's outcome and how many utterances followed the trigger then; reused while that holds. */
   rechecked: { outcome: RecheckAction; since: number } | null;
 }
@@ -108,8 +122,11 @@ export interface CallState {
   utterances: Utterance[];
   chat: ChatLine[];
   agentLines: AgentLine[];
-  /** Replies sent to `speak` that have not finished playing: replyId -> text and the wake. */
-  playout: Record<string, { text: string; wakeKey: string | null }>;
+  /**
+   * Replies sent to `speak` that have not finished playing: replyId -> text, the wake, the worker's pending
+   * playback request, and `held` while the answer-ready check decides whether it plays.
+   */
+  playout: Record<string, { text: string; wakeKey: string | null; requestId?: string; held?: true }>;
   /** Replies a stop took out of `playout` before the host heard them start: the worker still reports them. */
   stoppedPlayout: Record<string, { text: string; wakeKey: string | null }>;
   /** The newest few wakes, oldest first. */
@@ -187,7 +204,10 @@ export function openTurn(state: CallState, speakerId: string): Utterance[] {
   if (!current) return [];
   const pieces = [current];
   if (humansInRoom(state) > 1) return pieces;
-  const closedAt = Math.max(state.speakers[speakerId]?.closedAt ?? 0, ...state.agentLines.map((line) => line.at));
+  const closedAt = Math.max(
+    state.speakers[speakerId]?.closedAt ?? 0,
+    ...state.agentLines.filter((line) => line.state !== 'shown').map((line) => line.at),
+  );
   const earlier = state.utterances
     .filter((u) => u.speakerId === speakerId && !u.contextOnly && u.startedAt < current.startedAt && hasWords(u.text))
     .sort((a, b) => b.startedAt - a.startedAt);
@@ -196,6 +216,25 @@ export function openTurn(state: CallState, speakerId: string): Utterance[] {
     pieces.unshift(piece);
   }
   return pieces;
+}
+
+/**
+ * What a listener says over the agent to show they follow, not to take the turn: never enough to cut
+ * the agent off. Lowercase; English, Ukrainian, Russian and Latin transliterations, a few others.
+ */
+const ACKNOWLEDGEMENTS = new Set([
+  ...['uh', 'huh', 'um', 'ah', 'oh', 'yeah', 'yes', 'yep', 'yup', 'ok', 'okay', 'right', 'sure', 'i', 'see'],
+  ...['ага', 'угу', 'так', 'ок', 'добре', 'зрозуміло', 'да', 'хорошо', 'понятно'],
+  ...['aga', 'ugu', 'tak', 'da', 'ja', 'genau', 'oui', 'si', 'sí', 'vale'],
+]);
+/** Hums of any length: `m`, `mm`, `hmm`, `mhm`, `mm-hmm`'s parts, `uhh`, `umm`, `ahh`, `ohh`. */
+const HUM = /^(?:h*m+(?:h+m+)*|u+[hm]+|a+h+|o+h+)$/u;
+
+/** `text` has a word besides acknowledgements and hums: the caller takes the turn from the agent. */
+export function takesTurn(text: string): boolean {
+  return (text.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? []).some(
+    (word) => !ACKNOWLEDGEMENTS.has(word) && !HUM.test(word),
+  );
 }
 
 export const latestWake = (state: CallState): Wake | undefined => state.wakes[state.wakes.length - 1];
@@ -211,6 +250,18 @@ export const floorTaken = (state: CallState): boolean => Object.values(state.spe
 export function awaitingAgent(state: CallState): boolean {
   const wake = latestWake(state);
   return !!wake && !wake.dropped && !wake.replied && (state.stoppedSeq === null || state.stoppedSeq < wake.seq);
+}
+
+export function unstartedWake(state: CallState, speakerId: string): Wake | undefined {
+  const wake = latestWake(state);
+  if (!wake || wake.speakerId !== speakerId || wake.started) return;
+  if (
+    awaitingAgent(state) ||
+    wake.continuation ||
+    state.recheck?.wakeKey === wake.key ||
+    Object.values(state.playout).some((line) => line.wakeKey === wake.key)
+  )
+    return wake;
 }
 
 /** An answer is on its way: the latest wake awaits its reply (and no stop came), or a reply is still to play. */
@@ -251,6 +302,8 @@ export function applyWindow(state: CallState, event: CallEvent): void {
         utt.at = event.at;
         break;
       }
+      // Empty finals settle tracked continuations. Outside one, wordless sound is only a VAD mark.
+      if (event.final && !text) break;
       // A new uttId while the current speech already showed its own utterance belongs to an earlier speech: a final
       // that settled late, placed before the current line and not made current.
       const late = speaker.claimed !== null && speaker.claimed === speaker.speeches;
@@ -272,6 +325,19 @@ export function applyWindow(state: CallState, event: CallEvent): void {
     case 'speech': {
       const speaker = touchSpeaker(state, event.speaker.id, event.speaker.name);
       if (event.on && !speaker.speaking) speaker.speeches += 1;
+      if (event.on && event.uttId && event.uttId !== speaker.lastUttId && unstartedWake(state, event.speaker.id)) {
+        // Identify this activity before any final from an earlier transcription can arrive.
+        state.utterances.push({
+          speakerId: event.speaker.id,
+          uttId: event.uttId,
+          text: '',
+          final: false,
+          startedAt: event.at,
+          at: event.at,
+        });
+        speaker.lastUttId = event.uttId;
+        speaker.claimed = speaker.speeches;
+      }
       speaker.lastHeardAt = event.at;
       speaker.speaking = event.on;
       break;
@@ -285,6 +351,8 @@ export function applyWindow(state: CallState, event: CallEvent): void {
       if (!playing) break;
       const line = state.agentLines.find((l) => l.replyId === event.replyId);
       if (event.state === 'started') {
+        const wake = state.wakes.find((w) => w.key === playing.wakeKey);
+        if (wake) wake.started = true;
         if (!line)
           state.agentLines.push({ replyId: event.replyId, text: playing.text, state: 'playing', at: event.at });
         state.agentLastSpokeAt = event.at;
@@ -296,6 +364,7 @@ export function applyWindow(state: CallState, event: CallEvent): void {
       // Failed, or dropped before it started (a stop, a revoke): nothing got out.
       if (event.state === 'failed' || (!line && !delivered)) {
         state.agentLines = state.agentLines.filter((l) => l.replyId !== event.replyId);
+        if (!line) recordShown(state, event.replyId, playing.text);
         break;
       }
       if (line) Object.assign(line, { text: delivered, state: event.state === 'cut_off' ? 'cut_off' : 'done' });
@@ -341,6 +410,11 @@ function touchSpeaker(state: CallState, id: string, name: string): SpeakerState 
   return speaker;
 }
 
+export function recordShown(state: CallState, replyId: string, text: string): void {
+  state.agentLines.push({ replyId, text, state: 'shown', at: state.now });
+  trim(state);
+}
+
 const utf8 = new TextEncoder();
 
 /** Keep `windowMs` of history and at most `windowBytes` of text, dropping the oldest lines first. */
@@ -373,6 +447,7 @@ interface Line {
   speaker: string;
   text: string;
   agent?: true;
+  shown_only?: true;
   cut_off?: true;
   partial?: true;
 }
@@ -394,6 +469,7 @@ function lines(state: CallState): Line[] {
       speaker: state.policy.agentName,
       text: l.text,
       agent: true as const,
+      ...(l.state === 'shown' ? { shown_only: true as const } : {}),
       ...(l.state === 'cut_off' ? { cut_off: true as const } : {}),
       ...(l.state === 'playing' ? { partial: true as const } : {}),
     })),
@@ -483,7 +559,10 @@ export function toJevState(state: CallState, latest: JevState['latest'] = null, 
     agent_name: state.policy.agentName,
     participants,
     latest,
-    window: lines(state).map(({ at, ...line }): JevLine => ({ t: secondsAgo(state, at), ...line })),
+    // Lines only shown in the chat were never heard: Jev judges the conversation as spoken.
+    window: lines(state)
+      .filter((line) => !line.shown_only)
+      .map(({ at, shown_only: _shown, ...line }): JevLine => ({ t: secondsAgo(state, at), ...line })),
     facts: {
       humans_in_room: humansInRoom(state),
       agent_speaking: agentSpeaking(state),
@@ -554,7 +633,13 @@ export function renderWindow(state: CallState): string {
   return lines(state)
     .map((line) => {
       const who = line.agent ? `${line.speaker} (you)` : line.speaker;
-      const mark = line.cut_off ? ' [cut off here]' : line.partial ? ' [still speaking]' : '';
+      const mark = line.shown_only
+        ? ' [shown, not spoken]'
+        : line.cut_off
+          ? ' [cut off here]'
+          : line.partial
+            ? ' [still speaking]'
+            : '';
       return `${who}: ${line.text}${mark}`;
     })
     .join('\n');

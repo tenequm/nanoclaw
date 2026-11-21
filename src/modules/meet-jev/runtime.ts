@@ -16,11 +16,12 @@ import type {
   JevState,
   RecheckState,
   RecheckVerdict,
+  SessionStamp,
   Verdict,
 } from './core/types.js';
 
 /** What a turn submission came to: the host's utterance id for it, or why it did not reach the agent. */
-export type JevTurnResult = { ok: true; turnId: string } | { ok: false; reason: string };
+export type JevTurnResult = { ok: true; turnId: string; stored?: SessionStamp } | { ok: false; reason: string };
 
 export interface RuntimePorts {
   overlap(command: Extract<Command, { kind: 'overlap' }>, signal: AbortSignal): Promise<void>;
@@ -35,7 +36,8 @@ export interface RuntimePorts {
   ): Promise<{ verdict: RecheckVerdict | null; ms: number }>;
   /** Submit a turn; an aborted `signal` (superseded, or the call ended) stops it being routed, or the wait for it. */
   turn(turn: { message: string; note: string }, signal: AbortSignal): Promise<JevTurnResult>;
-  speak(replyId: string, text: string): void;
+  speak(replyId: string, text: string, turnId: string | null): void;
+  allowPlay(replyId: string, requestId: string): void;
   show(replyId: string, text: string): void;
   drop(replyId: string): void;
   revoke(replyId: string): void;
@@ -153,7 +155,9 @@ export function createCallRuntime<S>(core: CallCore<S>, policy: CallPolicy, port
       case 'turn':
         return turn(command);
       case 'speak':
-        return ports.speak(command.replyId, command.text);
+        return ports.speak(command.replyId, command.text, command.turnId);
+      case 'allow_play':
+        return ports.allowPlay(command.replyId, command.requestId);
       case 'show':
         return ports.show(command.replyId, command.text);
       case 'drop':
@@ -243,7 +247,7 @@ export function createCallRuntime<S>(core: CallCore<S>, policy: CallPolicy, port
         const at = ports.now();
         enqueue({
           event: result.ok
-            ? { kind: 'turn', key: next.key, turnId: result.turnId, at }
+            ? { kind: 'turn', key: next.key, turnId: result.turnId, stored: result.stored, at }
             : { kind: 'turn_failed', key: next.key, reason: result.reason, at },
         });
         pumpTurns();

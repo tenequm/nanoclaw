@@ -40,13 +40,21 @@ export type RecheckAction = 'speak' | 'show';
 export const RECHECK_ACTIONS: readonly RecheckAction[] = ['speak', 'show'];
 export type RecheckVerdict = Choice<RecheckAction>;
 
+/** A host/runner epoch timestamp at the session mailbox, independent of chat delivery. */
+export interface SessionStamp {
+  sessionId: string;
+  at: number;
+}
+
 export type CallEvent =
   | { kind: 'presence'; speaker: Speaker; joined: boolean; at: number }
   /** A participant's words: partials update the utterance, the final replaces it. */
   | { kind: 'utterance'; speaker: Speaker; uttId: string; text: string; final: boolean; contextOnly?: true; at: number }
   | { kind: 'overlap'; speaker: Speaker; requestId: string; replyId: string; played: string; text: string; at: number }
   /** A participant started or stopped speaking (the worker's VAD, or a meeting participant's own). */
-  | { kind: 'speech'; speaker: Speaker; on: boolean; at: number }
+  | { kind: 'speech'; speaker: Speaker; on: boolean; uttId?: string; at: number }
+  /** The worker is about to play a reply's first audio and waits for an `allow_play` with `requestId`. */
+  | { kind: 'play_ready'; replyId: string; requestId: string; at: number }
   /** A typed chat line (Meet chat): context only, never a boundary. */
   | { kind: 'chat'; speaker: Speaker; text: string; at: number }
   /** The answer to a `judge` command, for the window version it was asked on. */
@@ -56,11 +64,11 @@ export type CallEvent =
   /** A `wait` command's timer fired. */
   | { kind: 'timer'; key: string; at: number }
   /** A `turn` command reached the agent's session; `turnId` is the host's utterance id for it. */
-  | { kind: 'turn'; key: string; turnId: string; at: number }
+  | { kind: 'turn'; key: string; turnId: string; stored?: SessionStamp; at: number }
   /** A `turn` command was refused (limits, access) or replaced before delivery. */
   | { kind: 'turn_failed'; key: string; reason: string; at: number }
   /** An agent message for this call; `turnId` is the turn it answers, null when unprompted. */
-  | { kind: 'reply'; replyId: string; turnId: string | null; text: string; at: number }
+  | { kind: 'reply'; replyId: string; turnId: string | null; text: string; produced?: SessionStamp; at: number }
   /**
    * What became of a `speak` command in the room. `delivered` on `cut_off` is the approximate
    * text that got out before the abort.
@@ -90,7 +98,9 @@ export type Command =
    */
   | { kind: 'turn'; key: string; message: string; note: string; supersedes?: string }
   /** Speak a reply into the room. */
-  | { kind: 'speak'; replyId: string; text: string }
+  | { kind: 'speak'; replyId: string; text: string; turnId: string | null }
+  /** Answer the worker's `play_ready`: the reply may start now. */
+  | { kind: 'allow_play'; replyId: string; requestId: string }
   /** Show a reply in the call chat without speaking it (a replaced turn, after a stop). */
   | { kind: 'show'; replyId: string; text: string }
   /** Drop a reply: the agent answered `[silent]`. */
@@ -110,7 +120,6 @@ export interface JevLine {
   t: number;
   speaker: string;
   text: string;
-  /** Said by the agent (from playback reports, not from the reply text). */
   agent?: true;
   /** The agent was cut off here; `text` is what got out. */
   cut_off?: true;

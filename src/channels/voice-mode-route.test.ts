@@ -129,8 +129,10 @@ describe('routeVoiceModeTurn', () => {
       }
     });
     it("stores the turn as a waking message in the line agent's session only, and wakes it", async () => {
-      expect(await routeVoiceModeTurn(turn(), await fromCaller())).toBe(true);
+      const onStored = vi.fn();
+      expect(await routeVoiceModeTurn({ ...turn(), onStored }, await fromCaller())).toBe(true);
       const [session] = await getSessionsByAgentGroup('ag-1');
+      expect(onStored).toHaveBeenCalledWith(expect.objectContaining({ id: session.id }));
       expect(session).toMatchObject({ messaging_group_id: 'mg-1' });
       expect(await getSessionsByAgentGroup('ag-2')).toEqual([]);
       const db = new Database(inboundDbPath('ag-1', session.id), { readonly: true });

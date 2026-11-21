@@ -45,8 +45,11 @@ export function parseWorkerEvent(raw: unknown, maxTextBytes: number): JevWorkerE
       if (!isId(e.requestId) || !isId(e.replyId) || !text(e.played) || !text(e.text)) return null;
       return { type: 'overlap', requestId: e.requestId, replyId: e.replyId, played: e.played, text: e.text, at: e.at };
     case 'speech':
-      if (typeof e.on !== 'boolean') return null;
-      return { type: 'speech', on: e.on, at: e.at };
+      if (typeof e.on !== 'boolean' || (e.uttId !== undefined && !isId(e.uttId))) return null;
+      return { type: 'speech', on: e.on, ...(e.uttId ? { uttId: e.uttId } : {}), at: e.at };
+    case 'play_ready':
+      if (!isId(e.replyId) || !isId(e.requestId)) return null;
+      return { type: 'play_ready', replyId: e.replyId, requestId: e.requestId, at: e.at };
     case 'playback':
       if (!isId(e.replyId) || typeof e.state !== 'string' || !PLAYBACK_STATES.has(e.state)) return null;
       if (e.delivered !== undefined && !text(e.delivered)) return null;
@@ -89,7 +92,9 @@ export function createWorkerIngress(caller: { name: string }, maxTextBytes: numb
           at,
         };
       case 'speech':
-        return { kind: 'speech', speaker, on: e.on, at };
+        return { kind: 'speech', speaker, on: e.on, ...(e.uttId ? { uttId: e.uttId } : {}), at };
+      case 'play_ready':
+        return { kind: 'play_ready', replyId: e.replyId, requestId: e.requestId, at };
       case 'playback':
         return {
           kind: 'playback',

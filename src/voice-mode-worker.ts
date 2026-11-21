@@ -4994,6 +4994,8 @@ export const JEV_SPEECH_EVIDENCE_WINDOWS = 3;
 export const JEV_BARGE_EVIDENCE_WINDOWS = 4;
 /** Evidence windows a known STT phantom (the whole text) needs, and a partial needs to be shown or sent at all. */
 export const JEV_PHANTOM_EVIDENCE_WINDOWS = 10;
+/** A `play_ready` the host has not answered (a lost POST) is sent again after this, under a new request id. */
+export const JEV_PLAY_READY_RETRY_MS = 2_000;
 /**
  * What speech recognition writes on noise and silence, matched against the whole normalized text only. Words a
  * caller really says ("okay", "thank you", "bye") stay off it: they keep the ordinary segment bar.
@@ -5245,6 +5247,7 @@ export function serveAppInterrupt(
 }
 
 export interface JevLoopDeps {
+  confirmPlayout: boolean;
   /** None on a meeting: the host transcribes each participant, and the reflex has its `words`. */
   transcriber?: Transcription;
   appCall?: boolean;
@@ -5281,6 +5284,8 @@ interface JevUtterance {
   noise?: boolean;
   phoneWords?: string;
   needsPhoneFinal?: boolean;
+  /** An empty final went to the host for it. */
+  settled?: boolean;
   uttId: string;
   segment: number;
   /** The partial text so far. */
@@ -5357,6 +5362,7 @@ export class JevLoop {
   private readonly queue: JevPlayout[] = [];
   private playing?: JevPlayout;
   private pumping = false;
+  private playRequest?: { id: string; allowed: boolean };
   private readonly wakers = new Set<() => void>();
   private readonly capture?: TurnCapture;
   private closed = false;
@@ -5382,8 +5388,17 @@ export class JevLoop {
     if (!speaking) this.reflex();
     clearTimeout(this.resumeTimer);
     this.speaking = speaking;
-    this.deps.report({ type: 'speech', on: speaking, at: this.now() });
     const transcriber = this.deps.transcriber;
+    if (speaking) {
+      this.playRequest = undefined;
+      if (transcriber) this.utterance = { uttId: randomUUID(), segment: ++this.segments, text: '', worded: false };
+    }
+    this.deps.report({
+      type: 'speech',
+      on: speaking,
+      ...(speaking && this.utterance ? { uttId: this.utterance.uttId } : {}),
+      at: this.now(),
+    });
     if (speaking) {
       this.speechSince = this.now();
       this.wordsHeard = this.earlyWordsAt !== undefined && this.speechSince - this.earlyWordsAt <= JEV_WORDS_WINDOW_MS;
@@ -5392,7 +5407,6 @@ export class JevLoop {
       this.pauseSpent = false;
       this.speechOver = this.playing?.started ? this.playing : undefined;
       if (transcriber) {
-        this.utterance = { uttId: randomUUID(), segment: ++this.segments, text: '', worded: false };
         const preRoll = this.ring.since(Math.max(preRollFloor, at - samplesOf(PRE_ROLL_MS)));
         transcriber.begin(preRoll);
         this.capture?.start(preRoll);
@@ -5414,6 +5428,7 @@ export class JevLoop {
     const utterance = this.utterance;
     this.utterance = undefined;
     const endedAt = this.now();
+    const beforePlayback = !this.speechOver;
     this.lastSpeech = {
       endedAt,
       endSample: at,
@@ -5436,12 +5451,14 @@ export class JevLoop {
     this.wake();
     const audio = this.capture?.take(endedAt - this.speechSince);
     if (!utterance || !transcriber) return;
+    // Too little evidence for any text to pass the gate: the host need not wait for the transcription.
+    if (this.deps.speechEvidence && !utterance.phoneWords && evidenceOf(utterance).strong < JEV_SPEECH_EVIDENCE_WINDOWS)
+      this.settleEmpty(utterance);
     transcriber.end().then(
       (heard) => {
         const text = turnText(heard).text || (utterance.phoneWords ? utterance.text || utterance.phoneWords : '');
-        // Nothing heard and nothing shown: a noise, which the host never hears of. Its recording says
-        // whether it was long enough to have been words the transcription missed.
         if (!text && !utterance.text) {
+          this.settleEmpty(utterance);
           utterance.needsPhoneFinal = true;
           if (audio) {
             const reason = heard.failed || audio.speechMs >= MIN_LOST_SPEECH_MS ? 'stt' : 'noise';
@@ -5473,6 +5490,14 @@ export class JevLoop {
       (err: unknown) => {
         this.deps.log.warn('voice-mode worker: an utterance has no final', { err });
         if (audio) this.deps.recorded?.(utterance.segment, audio, utterance.text, 'stt');
+        if (utterance.text && !this.heardSpeech(utterance, utterance.text)) {
+          this.ignoreNoise(utterance, utterance.text);
+          return;
+        }
+        if (!utterance.phoneWords) {
+          if (!utterance.text) this.settleEmpty(utterance);
+          else if (beforePlayback) this.finishUtterance(utterance, utterance.text);
+        }
         utterance.needsPhoneFinal = true;
         // No final will come: a keep on its partial is its last word.
         if (utterance.contextOnly) {
@@ -5557,7 +5582,9 @@ export class JevLoop {
   /** A segment whose words had no evidence of real speech: logged for tuning, and otherwise a wordless sound. */
   private ignoreNoise(utterance: JevUtterance, text: string): void {
     utterance.noise = true;
-    utterance.needsPhoneFinal = false;
+    utterance.needsPhoneFinal = true;
+    // Settle the host's placeholder even if the local overlap still holds unverified words.
+    this.settleEmpty(utterance);
     const { strong, peak, voiced } = evidenceOf(utterance);
     this.deps.log.info('voice-mode worker: noise segment ignored', {
       text,
@@ -5571,6 +5598,13 @@ export class JevLoop {
     overlap.timer = overlap.latestId = overlap.retryAfter = undefined;
     overlap.pending.clear();
     overlap.keepTalking = false;
+  }
+
+  /** An empty final ends the host's wait for this activity's words: a held answer is not kept behind a noise. */
+  private settleEmpty(utterance: JevUtterance): void {
+    if (utterance.settled || this.closed) return;
+    utterance.settled = true;
+    this.deps.report({ type: 'utterance', uttId: utterance.uttId, text: '', final: true, at: this.now() });
   }
 
   /** The host's `words`: a participant's words arrived (the reflex's confirmation where the worker has no transcript). */
@@ -5837,7 +5871,7 @@ export class JevLoop {
       if (this.overlap?.utterance !== utterance && !utterance.releasing && utterance.keptText !== spokenKey(text))
         utterance.contextOnly = false;
     }
-    if (this.deps.speechEvidence) {
+    if (this.deps.speechEvidence && text) {
       const { strong, peak, voiced } = evidenceOf(utterance);
       this.deps.log.info('voice-mode worker: utterance evidence', {
         segment: utterance.segment,
@@ -6002,7 +6036,7 @@ export class JevLoop {
     // Synthesized while the caller may still talk; its first audio waits for their quiet (`ready`).
     let outcome: LineOutcome;
     try {
-      outcome = await this.deps.speak(line.text, () => this.callerIdle(signal), signal, line.replyId);
+      outcome = await this.deps.speak(line.text, () => this.beforePlayback(line), signal, line.replyId);
     } catch (err) {
       this.deps.log.warn('voice-mode worker: speaking failed', { err });
       outcome = { heard: false, failed: true, cut: false, audioMs: 0, playedMs: 0, complete: false };
@@ -6036,14 +6070,38 @@ export class JevLoop {
     this.deps.report({ type: 'playback', replyId: line.replyId, state: 'completed', at });
   }
 
-  /** Resolves when the caller is not speaking, or the line was aborted, or the loop closed: never a cap. */
-  private callerIdle(signal: AbortSignal): Promise<void> {
+  onAllowPlay(replyId: string, requestId: string): void {
+    if (this.playing?.replyId !== replyId || this.playRequest?.id !== requestId) return;
+    this.playRequest.allowed = true;
+    this.wake();
+  }
+
+  private beforePlayback(line: JevPlayout): Promise<void> {
+    const { signal } = line.abort;
     return new Promise<void>((resolve) => {
+      // The reporter can lose a POST. A retry still needs a matching host grant.
+      let retry: ReturnType<typeof setTimeout> | undefined;
       const check = () => {
-        if (!this.speaking || signal.aborted || this.closed) {
+        if (
+          signal.aborted ||
+          this.closed ||
+          (!this.speaking && (!this.deps.confirmPlayout || this.playRequest?.allowed))
+        ) {
+          clearTimeout(retry);
           this.wakers.delete(check);
           signal.removeEventListener('abort', check);
+          this.playRequest = undefined;
           resolve();
+        } else if (!this.speaking && !this.playRequest) {
+          const id = randomUUID();
+          this.playRequest = { id, allowed: false };
+          clearTimeout(retry);
+          retry = setTimeout(() => {
+            this.playRequest = undefined;
+            check();
+          }, JEV_PLAY_READY_RETRY_MS);
+          retry.unref?.();
+          this.deps.report({ type: 'play_ready', replyId: line.replyId, requestId: id, at: this.now() });
         }
       };
       this.wakers.add(check);
@@ -6162,6 +6220,7 @@ async function runJevCall(s: JevCallSetup): Promise<void> {
         ...(s.transcriptDebug ? { debug: true } : {}),
       });
   const loop: JevLoop = new JevLoop({
+    confirmPlayout: meta.confirmPlayout === true,
     ...(transcriber ? { transcriber } : {}),
     appCall: !!meta.appCall && voiceCall,
     ...(meta.jevOverlapVerdict && voiceCall ? { overlapPlayedText: () => callVoice?.playedText() ?? '' } : {}),
@@ -6367,6 +6426,7 @@ async function runJevCall(s: JevCallSetup): Promise<void> {
       else if (event.type === 'words') loop.onWords();
       else if (event.type === 'overlap') loop.onOverlap(event.requestId, event.verdict, event.reason);
       else if (event.type === 'revoke') loop.onRevoke(event.replyId);
+      else if (event.type === 'allow_play') loop.onAllowPlay(event.replyId, event.requestId);
       else if (!voiceCall) return;
       else if (event.type === 'thinking') {
         typingUntil = Date.now() + THINKING_HOLD_MS;
