@@ -4994,6 +4994,8 @@ export const JEV_SPEECH_EVIDENCE_WINDOWS = 3;
 export const JEV_BARGE_EVIDENCE_WINDOWS = 4;
 /** Evidence windows a known STT phantom (the whole text) needs, and a partial needs to be shown or sent at all. */
 export const JEV_PHANTOM_EVIDENCE_WINDOWS = 10;
+/** A `play_ready` the host has not answered (a lost POST) is sent again after this, under a new request id. */
+export const JEV_PLAY_READY_RETRY_MS = 2_000;
 /**
  * What speech recognition writes on noise and silence, matched against the whole normalized text only. Words a
  * caller really says ("okay", "thank you", "bye") stay off it: they keep the ordinary segment bar.
@@ -5282,6 +5284,8 @@ interface JevUtterance {
   noise?: boolean;
   phoneWords?: string;
   needsPhoneFinal?: boolean;
+  /** An empty final went to the host for it. */
+  settled?: boolean;
   uttId: string;
   segment: number;
   /** The partial text so far. */
@@ -5447,12 +5451,14 @@ export class JevLoop {
     this.wake();
     const audio = this.capture?.take(endedAt - this.speechSince);
     if (!utterance || !transcriber) return;
+    // Too little evidence for any text to pass the gate: the host need not wait for the transcription.
+    if (this.deps.speechEvidence && !utterance.phoneWords && evidenceOf(utterance).strong < JEV_SPEECH_EVIDENCE_WINDOWS)
+      this.settleEmpty(utterance);
     transcriber.end().then(
       (heard) => {
         const text = turnText(heard).text || (utterance.phoneWords ? utterance.text || utterance.phoneWords : '');
-        // An empty final releases a reply held through a wordless activity.
         if (!text && !utterance.text) {
-          if (beforePlayback) this.finishUtterance(utterance, '');
+          this.settleEmpty(utterance);
           utterance.needsPhoneFinal = true;
           if (audio) {
             const reason = heard.failed || audio.speechMs >= MIN_LOST_SPEECH_MS ? 'stt' : 'noise';
@@ -5488,7 +5494,10 @@ export class JevLoop {
           this.ignoreNoise(utterance, utterance.text);
           return;
         }
-        if (beforePlayback && !utterance.phoneWords) this.finishUtterance(utterance, utterance.text);
+        if (!utterance.phoneWords) {
+          if (!utterance.text) this.settleEmpty(utterance);
+          else if (beforePlayback) this.finishUtterance(utterance, utterance.text);
+        }
         utterance.needsPhoneFinal = true;
         // No final will come: a keep on its partial is its last word.
         if (utterance.contextOnly) {
@@ -5575,8 +5584,7 @@ export class JevLoop {
     utterance.noise = true;
     utterance.needsPhoneFinal = true;
     // Settle the host's placeholder even if the local overlap still holds unverified words.
-    if (!this.closed)
-      this.deps.report({ type: 'utterance', uttId: utterance.uttId, text: '', final: true, at: this.now() });
+    this.settleEmpty(utterance);
     const { strong, peak, voiced } = evidenceOf(utterance);
     this.deps.log.info('voice-mode worker: noise segment ignored', {
       text,
@@ -5590,6 +5598,13 @@ export class JevLoop {
     overlap.timer = overlap.latestId = overlap.retryAfter = undefined;
     overlap.pending.clear();
     overlap.keepTalking = false;
+  }
+
+  /** An empty final ends the host's wait for this activity's words: a held answer is not kept behind a noise. */
+  private settleEmpty(utterance: JevUtterance): void {
+    if (utterance.settled || this.closed) return;
+    utterance.settled = true;
+    this.deps.report({ type: 'utterance', uttId: utterance.uttId, text: '', final: true, at: this.now() });
   }
 
   /** The host's `words`: a participant's words arrived (the reflex's confirmation where the worker has no transcript). */
@@ -6084,7 +6099,7 @@ export class JevLoop {
           retry = setTimeout(() => {
             this.playRequest = undefined;
             check();
-          }, WORKER_REQUEST_TIMEOUT_MS);
+          }, JEV_PLAY_READY_RETRY_MS);
           retry.unref?.();
           this.deps.report({ type: 'play_ready', replyId: line.replyId, requestId: id, at: this.now() });
         }

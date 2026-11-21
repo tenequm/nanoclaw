@@ -131,6 +131,7 @@ import {
   JEV_BARGE_MS,
   JEV_BARGE_EVIDENCE_WINDOWS,
   JEV_PHANTOM_EVIDENCE_WINDOWS,
+  JEV_PLAY_READY_RETRY_MS,
   JEV_SPEECH_EVIDENCE_WINDOWS,
   heardAsSpeech,
   isSttPhantom,
@@ -6905,7 +6906,15 @@ function jevLoop({
   duck = false,
   judge = false,
   evidence = false,
-}: { transcribed?: boolean; app?: boolean; duck?: boolean; judge?: boolean; evidence?: boolean } = {}) {
+  confirm = true,
+}: {
+  transcribed?: boolean;
+  app?: boolean;
+  duck?: boolean;
+  judge?: boolean;
+  evidence?: boolean;
+  confirm?: boolean;
+} = {}) {
   const transcription = fakeTranscription();
   const events: Exclude<JevWorkerEvent, { type: 'play_ready' }>[] = [];
   const allowPlay = vi.fn((replyId: string, requestId: string) => loop.onAllowPlay(replyId, requestId));
@@ -6951,7 +6960,7 @@ function jevLoop({
     appCall: app,
     setSpeechPaused: vi.fn(),
     speak,
-    confirmPlayout: true,
+    confirmPlayout: confirm,
     report: (event) => {
       if (event.type === 'play_ready') allowPlay(event.replyId, event.requestId);
       else events.push(event);
@@ -7692,7 +7701,8 @@ describe('app interrupt RPC', () => {
   it.each([
     { localPartial: '', result: 'Stop.', finals: ['final:Stop.'] },
     { localPartial: 'St', result: '', finals: ['final:'] },
-    { localPartial: '', result: '', finals: ['final:Stop'] },
+    // The empty final settles the host's wait; the phone's words follow under the same uttId.
+    { localPartial: '', result: '', finals: ['final:', 'final:Stop'] },
   ])(
     'associates a late phone cut with one ended VAD turn ($localPartial / $result)',
     async ({ localPartial, result, finals }) => {
@@ -7889,6 +7899,56 @@ describe('jev: the loop', () => {
     await flush();
     expect(h.kinds().slice(before)).toEqual(['speech:on', 'speech:off', 'final:']);
   });
+
+  it('asks again under a new request id when the host never answers play_ready', async () => {
+    vi.useFakeTimers();
+    const h = jevLoop();
+    h.allowPlay.mockImplementation(() => undefined);
+    h.loop.onReply('r1', 'The first answer.');
+    await vi.advanceTimersByTimeAsync(1);
+    const first = h.allowPlay.mock.calls.at(-1)![1];
+    await vi.advanceTimersByTimeAsync(JEV_PLAY_READY_RETRY_MS);
+    const second = h.allowPlay.mock.calls.at(-1)![1];
+    expect(h.allowPlay).toHaveBeenCalledTimes(2);
+    expect(second).not.toBe(first);
+    h.loop.onAllowPlay('r1', first);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(h.lines[0].waited).toBe(false);
+    h.loop.onAllowPlay('r1', second);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(h.lines[0].waited).toBe(true);
+    h.loop.close();
+  });
+
+  it('plays without asking the host when it does not confirm playout', async () => {
+    const h = jevLoop({ confirm: false });
+    h.loop.onReply('r1', 'The first answer.');
+    await flush();
+    expect(h.allowPlay).not.toHaveBeenCalled();
+    expect(h.lines[0].waited).toBe(true);
+    h.loop.close();
+  });
+
+  it.each([
+    [JEV_SPEECH_EVIDENCE_WINDOWS - 1, ['speech:on', 'speech:off', 'final:']],
+    [JEV_SPEECH_EVIDENCE_WINDOWS, ['speech:on', 'speech:off']],
+  ] as const)(
+    'with %i evidence windows, settles the segment at VAD end only if no text could pass',
+    async (n, atEnd) => {
+      const h = jevLoop({ evidence: true });
+      h.transcription.hold = true;
+      h.loop.onSpeech(true, 0);
+      h.windows(n, 0.99);
+      h.transcription.results.push(heard('', 'You are welcome.'));
+      h.loop.onSpeech(false, 16000);
+      expect(h.kinds()).toEqual(atEnd);
+      h.transcription.release();
+      await flush();
+      // The phantom words then fail the gate: one empty final either way.
+      expect(h.kinds()).toEqual(['speech:on', 'speech:off', 'final:']);
+      h.loop.close();
+    },
+  );
 
   it('requires a fresh host decision if the caller resumes before first audio', async () => {
     const h = jevLoop();
@@ -8314,12 +8374,13 @@ describe('jev calls', () => {
       await vi.advanceTimersByTimeAsync(1);
       call.reply('I am here.', 't1');
       await vi.advanceTimersByTimeAsync(1);
-      expect(v.voice.speak).not.toHaveBeenCalled();
+      // Synthesis starts during the noise; the first audio waits for the host's grant.
+      expect(v.voice.speak.mock.calls.map(([line]) => line)).toEqual(['I am here.']);
+      expect(jevEvents(host).flat().map(summary)).not.toContain('r1:started');
 
       v.transcription.results.push(heard('', 'You are welcome.'));
       v.events.onSpeech(false, 48000);
       await vi.advanceTimersByTimeAsync(1);
-      expect(v.voice.speak.mock.calls.map(([line]) => line)).toEqual(['I am here.']);
       expect(jevEvents(host).flat().map(summary)).toEqual([
         'speech:on',
         'speech:off',
