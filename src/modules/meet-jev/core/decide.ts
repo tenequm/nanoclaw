@@ -739,11 +739,8 @@ function onVerdict(state: CallState, version: number, verdict: Verdict | null, m
     ms,
     action,
   });
-  if (action === 'stop') {
-    stop(state);
-    // A discard turned stop still withdraws the caller's unsent words: they never join a later turn.
-    if (verdict.action === 'discard') closeTurn(state, judging);
-  } else if (action === 'answer') wake(state, judging.speakerId, judging.uttId, judging.trigger);
+  if (action === 'stop') stop(state);
+  else if (action === 'answer') wake(state, judging.speakerId, judging.uttId, judging.trigger);
   else if (action === 'continue') {
     const cutOff = `You were cut off after "${state.cutOffAfter ?? ''}"; ${speaker?.name ?? 'the caller'} asked you to go on. Continue briefly from there.`;
     wake(state, judging.speakerId, judging.uttId, judging.trigger, cutOff);
@@ -760,7 +757,8 @@ function onVerdict(state: CallState, version: number, verdict: Verdict | null, m
  * The caller's words not sent to the agent yet, with the command they end with stripped: a held turn's pieces after
  * its trigger, or else everything since their last closed turn or the agent's last line.
  */
-function unsentWords(state: CallState, speakerId: string, command: 'send' | 'discard'): string {
+function unsentWords(state: CallState, judging: Judging, command: 'send' | 'discard'): string {
+  const { speakerId } = judging;
   const held = continuationFor(state, speakerId);
   const closedAt = Math.max(
     state.speakers[speakerId]?.closedAt ?? 0,
@@ -771,7 +769,16 @@ function unsentWords(state: CallState, speakerId: string, command: 'send' | 'dis
     : state.utterances
         .filter((u) => u.speakerId === speakerId && u.startedAt > closedAt)
         .sort((a, b) => a.startedAt - b.startedAt);
-  const texts = pieces.filter((u) => !u.contextOnly && hasWords(u.text)).map((u) => u.text);
+  const texts = pieces
+    .filter((u) => !u.contextOnly && hasWords(u.text))
+    // A discard said without its phrase ("forget it") is the command itself, not words to drop.
+    .filter(
+      (u) =>
+        command !== 'discard' ||
+        u.uttId !== judging.uttId ||
+        spokenCommand(u.text, state.policy)?.command === 'discard',
+    )
+    .map((u) => u.text);
   // A piece boundary is a sentence boundary: the command is stripped from the pieces it ends, never across a join.
   for (let i = texts.length - 1; i >= 0; i--) {
     const said = spokenCommand(texts[i], state.policy);
@@ -788,7 +795,7 @@ function unsentWords(state: CallState, speakerId: string, command: 'send' | 'dis
  * is confirmed (`sent`, its answer plays without a recheck); with none either, false and the `nope` cue.
  */
 function sendUnsent(state: CallState, judging: Judging): boolean {
-  const words = unsentWords(state, judging.speakerId, 'send');
+  const words = unsentWords(state, judging, 'send');
   const pending = hasWords(words) ? undefined : unstartedWake(state, judging.speakerId);
   log(state, 'command', { command: 'send', outcome: hasWords(words) ? 'sent' : pending ? 'confirmed' : 'nothing' });
   if (hasWords(words)) {
@@ -809,23 +816,15 @@ function sendUnsent(state: CallState, judging: Judging): boolean {
 }
 
 /**
- * Jev heard the caller discard: their unsent words are dropped, and the latest turn's answer, when it has not
- * started, is taken back (a reply still to come is shown only, as after a stop), with the `discard` cue. False,
- * with the `nope` cue, when there was neither.
+ * Jev heard the caller discard: their words since their last sent turn are dropped with the `discard` cue, and an
+ * answer on its way to that turn still plays. With no such words, an answer pending or playing is withdrawn as by a
+ * stop (queued lines revoked, a reply still to come shown only). With neither, false and the `nope` cue.
  */
 function discardUnsent(state: CallState, judging: Judging): boolean {
-  const dropped = hasWords(unsentWords(state, judging.speakerId, 'discard'));
-  const latest = latestWake(state);
-  const revocable =
-    !!latest &&
-    latest.speakerId === judging.speakerId &&
-    !latest.dropped &&
-    !latest.started &&
-    (awaitingAgent(state) ||
-      state.recheck?.wakeKey === latest.key ||
-      Object.values(state.playout).some((line) => line.wakeKey === latest.key));
+  const dropped = hasWords(unsentWords(state, judging, 'discard'));
+  const withdrawn = !dropped && (agentSpeaking(state) || pendingAnswer(state));
   const revoked: string[] = [];
-  if (revocable) {
+  if (withdrawn) {
     state.stoppedSeq = state.seq;
     endRecheck(state, 'discarded');
     for (const replyId of takeBackUnstarted(state)) {
@@ -833,16 +832,19 @@ function discardUnsent(state: CallState, judging: Judging): boolean {
       state.commands.push({ kind: 'revoke', replyId });
       log(state, 'reply', { replyId, outcome: 'revoked', reason: 'discarded' });
     }
+    if (agentSpeaking(state)) state.commands.push({ kind: 'stop_playback' });
     state.commands.push({ kind: 'status', status: 'idle' });
   }
-  log(state, 'command', { command: 'discard', dropped, revokedTurn: revocable, revoked });
+  log(state, 'command', { command: 'discard', dropped, withdrawn, revoked });
   closeTurn(state, judging);
-  if (!dropped && !revocable) {
+  if (!dropped && !withdrawn) {
     cue(state, 'nope');
     return false;
   }
-  const held = continuationFor(state, judging.speakerId);
-  if (held) release(state, held);
+  // The dropped words leave the pending answer as wanted as before: it plays without a recheck.
+  const pending = unstartedWake(state, judging.speakerId);
+  if (dropped && pending) pending.rechecked = { outcome: 'speak', since: sinceTrigger(state, pending) };
+  if (pending?.continuation) release(state, pending);
   cue(state, 'discard');
   return true;
 }
@@ -941,15 +943,14 @@ function chosen(state: CallState, verdict: Verdict, addressedByName: boolean): A
           : thresholds[action];
     return !!threshold && verdict.action === action && p(action) >= threshold.p;
   };
-  // Jev splits a withdrawal of the pending answer between `stop` and `discard`: the pair shares the stop bar. Once
-  // the answer has started, a discard has nothing unstarted to take back, so it stops the answer instead.
+  // Jev splits a withdrawal of the pending answer between `stop` and `discard`: the pair shares the stop bar.
   if (
     busy &&
     thresholds.discard &&
     (verdict.action === 'stop' || verdict.action === 'discard') &&
     p('stop') + p('discard') >= thresholds.stop.p
   )
-    return verdict.action === 'discard' && !agentSpeaking(state) && !latestWake(state)?.started ? 'discard' : 'stop';
+    return verdict.action;
   if (busy && over('stop')) return 'stop';
   if (state.cutOffAfter !== null && !agentSpeaking(state) && over('continue')) return 'continue';
   // The spoken commands, offered on a voice call only (their thresholds with them).

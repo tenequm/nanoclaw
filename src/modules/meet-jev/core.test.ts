@@ -659,7 +659,7 @@ describe('spoken commands on a voice call', () => {
     expect(only(dropped, 'cue')).toEqual([{ kind: 'cue', cue: 'discard' }]);
     expect(only(dropped, 'turn')).toEqual([]);
     expect(only(dropped, 'revoke')).toEqual([]);
-    expect(call.lastLog('command')).toMatchObject({ command: 'discard', dropped: true, revokedTurn: false });
+    expect(call.lastLog('command')).toMatchObject({ command: 'discard', dropped: true, withdrawn: false });
     expect(judged(call, 'c', 'zulu', 'send').filter((c) => c.kind === 'cue')).toEqual([{ kind: 'cue', cue: 'nope' }]);
     expect(only(judged(call, 'd', 'What time is it?', 'answer'), 'turn').map((c) => c.message)).toEqual([
       'What time is it?',
@@ -692,7 +692,7 @@ describe('spoken commands on a voice call', () => {
     expect(only(result, 'cue')).toEqual([{ kind: 'cue', cue: 'discard' }]);
     expect(only(result, 'stop_playback')).toEqual([]);
     expect(call.statuses.map((c) => c.status)).toEqual(['idle']);
-    expect(call.lastLog('command')).toMatchObject({ command: 'discard', revokedTurn: true, revoked: ['r1'] });
+    expect(call.lastLog('command')).toMatchObject({ command: 'discard', withdrawn: true, revoked: ['r1'] });
   });
 
   it('takes back a sent turn whose answer has not come: the answer is shown only', () => {
@@ -705,7 +705,21 @@ describe('spoken commands on a voice call', () => {
     ]);
   });
 
-  it('stops a line already playing on a discard, which has nothing unstarted to take back', () => {
+  it('stops a line already playing on a discard with nothing unsent, as a stop does', () => {
+    const call = new Call();
+    wakeAndSpeak(call, 'what time is it?', 'Noon.', 1);
+    const result = withdrawn(call, 'u2', 'Scratch that.', {
+      discard: 0.61,
+      stop: 0.34,
+      stay_silent: 0.04,
+      answer: 0.01,
+    });
+    expect(only(result, 'stop_playback')).toHaveLength(1);
+    expect(only(result, 'cue')).toEqual([{ kind: 'cue', cue: 'discard' }]);
+    expect(call.lastLog('command')).toMatchObject({ command: 'discard', dropped: false, withdrawn: true });
+  });
+
+  it('drops only the unsent words said over a playing line: the line plays on', () => {
     const call = new Call();
     wakeAndSpeak(call, 'what time is it?', 'Noon.', 1);
     const result = withdrawn(call, 'u2', 'And book a taxi, scratch that.', {
@@ -714,13 +728,31 @@ describe('spoken commands on a voice call', () => {
       stay_silent: 0.04,
       answer: 0.01,
     });
-    expect(only(result, 'stop_playback')).toHaveLength(1);
-    expect(only(result, 'cue')).toEqual([]);
-    expect(call.lastLog('decision')).toMatchObject({ action: 'stop' });
-    // The withdrawn words never join a later turn.
-    call.feed({ kind: 'playback', replyId: 'r1', state: 'cut_off', delivered: 'No' });
+    expect(only(result, 'stop_playback')).toEqual([]);
+    expect(only(result, 'revoke')).toEqual([]);
+    expect(only(result, 'cue')).toEqual([{ kind: 'cue', cue: 'discard' }]);
+    expect(call.lastLog('command')).toMatchObject({ command: 'discard', dropped: true, withdrawn: false });
+    // The dropped words never join a later turn.
+    call.feed({ kind: 'playback', replyId: 'r1', state: 'completed' });
     expect(judged(call, 'u3', 'zulu', 'send').filter((c) => c.kind === 'cue' || c.kind === 'turn')).toEqual([
       { kind: 'cue', cue: 'nope' },
+    ]);
+  });
+
+  it('drops the words said after a sent question, and that question is still answered', () => {
+    const call = new Call();
+    const [turn] = only(call.sayAnswered(caller, 'a', 'What is the weather in Kyiv tomorrow?'), 'turn');
+    call.feed({ kind: 'turn', key: turn.key, turnId: 't1' });
+    const result = withdrawn(call, 'b', 'And book me a taxi for nine. No, scratch that.', {
+      discard: 0.62,
+      answer: 0.33,
+      stay_silent: 0.03,
+      stop: 0.02,
+    });
+    expect(only(result, 'cue')).toEqual([{ kind: 'cue', cue: 'discard' }]);
+    expect(result.filter((c) => c.kind === 'turn' || c.kind === 'revoke' || c.kind === 'stop_playback')).toEqual([]);
+    expect(call.feed({ kind: 'reply', replyId: 'r1', turnId: 't1', text: 'Sunny.' })).toEqual([
+      { kind: 'speak', replyId: 'r1', turnId: 't1', text: 'Sunny.' },
     ]);
   });
 
