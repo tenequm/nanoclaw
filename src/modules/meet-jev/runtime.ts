@@ -74,6 +74,8 @@ interface PendingTurn {
   message: string;
   note: string;
   abort: AbortController;
+  /** Aborted by a newer turn: its failure is reported as `superseded`, whatever the host answered. */
+  superseded?: true;
 }
 
 export function createCallRuntime<S>(core: CallCore<S>, policy: CallPolicy, ports: RuntimePorts): CallRuntime {
@@ -240,6 +242,7 @@ export function createCallRuntime<S>(core: CallCore<S>, policy: CallPolicy, port
         turnQueue.splice(queued, 1);
         enqueue({ event: { kind: 'turn_failed', key: replaced, reason: 'superseded', at: ports.now() } });
       } else if (turnInFlight?.key === replaced) {
+        turnInFlight.superseded = true;
         turnInFlight.abort.abort();
       }
     }
@@ -267,7 +270,7 @@ export function createCallRuntime<S>(core: CallCore<S>, policy: CallPolicy, port
         enqueue({
           event: result.ok
             ? { kind: 'turn', key: next.key, turnId: result.turnId, stored: result.stored, at }
-            : { kind: 'turn_failed', key: next.key, reason: result.reason, at },
+            : { kind: 'turn_failed', key: next.key, reason: next.superseded ? 'superseded' : result.reason, at },
         });
         pumpTurns();
       });

@@ -3,7 +3,7 @@
  * the judge in flight), so `reduce` makes it and records its commands in the state; `decide`
  * returns them. Replaying the event log through `reduce` reproduces every decision.
  */
-import { nameSkeleton, phraseEnd, spokenWord, trimSeparators } from './spoken.js';
+import { nameSkeleton, phraseEnd, spokenWord, spokenWords, trimSeparators } from './spoken.js';
 import type {
   Action,
   CallEvent,
@@ -63,6 +63,16 @@ const STOP_WORDS = new Set([
   '\u043f\u043e\u0447\u0435\u043a\u0430\u0439',
   '\u0437\u0430\u0447\u0435\u043a\u0430\u0439',
 ]);
+/**
+ * Words said before a discard phrase that only lead into it ("No, scratch that", "Ні, scratch that"), as spoken
+ * words (Cyrillic in its Latin sounds: `ni` is \u043d\u0456, `chekay` is \u0447\u0435\u043a\u0430\u0439).
+ */
+const DISCARD_LEAD_INS = new Set(
+  (
+    'no nope nah wait actually sorry oh ok okay alright well so hmm hm oops um uh ah erm hold on ' +
+    'ni oy stop chekay zachekay pochekay vybach vybachte hocha tak nu dobre okey'
+  ).split(' '),
+);
 
 export function reduce(prev: CallState, event: CallEvent): CallState {
   const state = structuredClone<CallState>({ ...prev, commands: [] });
@@ -294,7 +304,9 @@ function finishToggleOff(state: CallState): CallState {
     nextState = reduce(nextState, next);
     out.push(...nextState.commands);
   }
-  nextState.commands = out;
+  // A judge asked and dropped within the replay (a toggle-on queued behind a final) would only spend a Jev call.
+  const judging = nextState.judging;
+  nextState.commands = out.filter((c) => c.kind !== 'judge' || c.windowVersion === judging?.version);
   return nextState;
 }
 
@@ -626,10 +638,13 @@ function decideLatest(state: CallState, speakerId: string): boolean {
 
 function continuationPieces(state: CallState, wake: Wake) {
   const trigger = state.utterances.findIndex((u) => u.speakerId === wake.speakerId && u.uttId === wake.triggerUttId);
+  // Pieces a command closed after the trigger (dropped words, a command alone) are no part of the held turn.
+  const closedAt = state.speakers[wake.speakerId]?.closedAt ?? 0;
   return state.utterances
     .filter(
       (u, i) =>
         u.speakerId === wake.speakerId &&
+        (closedAt <= wake.triggerAt || u.startedAt > closedAt) &&
         (u.startedAt > wake.triggerAt || (u.startedAt === wake.triggerAt && i > trigger)),
     )
     .sort((a, b) => a.startedAt - b.startedAt);
@@ -731,7 +746,8 @@ function onVerdict(state: CallState, version: number, verdict: Verdict | null, m
     }
     return;
   }
-  const action = chosen(state, verdict, judging.addressedByName);
+  const said = utteranceOf(state, judging.speakerId, judging.uttId)?.text ?? judging.trigger;
+  const action = chosen(state, verdict, judging.addressedByName, said);
   log(state, 'decision', {
     ...trigger,
     jev: { choice: verdict.action, probabilities: verdict.probabilities, confidence: verdict.confidence },
@@ -782,11 +798,20 @@ function unsentWords(state: CallState, judging: Judging, command: CommandAction)
   for (let i = texts.length - 1; i >= 0; i--) {
     const said = spokenCommand(texts[i], state.policy);
     if (said?.command !== command) break;
-    texts[i] = said.rest;
-    if (hasWords(said.rest)) break;
+    // "No, scratch that": the lead-in belongs to the take-back, it is no words to drop.
+    texts[i] = command === 'discard' && onlyLeadIn(said.rest) ? '' : said.rest;
+    if (hasWords(texts[i])) break;
   }
   return texts.filter(hasWords).join(' ');
 }
+
+/** The command `text` is made of alone, with no other words. */
+function loneCommand(state: CallState, text: string): CommandAction | undefined {
+  const said = spokenCommand(text, state.policy);
+  return said && !hasWords(said.rest) ? said.command : undefined;
+}
+
+const onlyLeadIn = (text: string): boolean => spokenWords(text).every(({ word }) => DISCARD_LEAD_INS.has(word));
 
 /**
  * Jev heard the caller end their turn with a send word: the unsent words go to the agent now (with a held turn's
@@ -924,8 +949,9 @@ const sinceTrigger = (state: CallState, wake: Wake): number =>
 /**
  * The action to take: `stop` and `continue` only when the facts allow them, each over its threshold. Answering
  * a lone human or a vocative is low-risk, so both take the one-caller bar; named hold-backs score near zero.
+ * `said` is the judged utterance itself.
  */
-function chosen(state: CallState, verdict: Verdict, addressedByName: boolean): Action {
+function chosen(state: CallState, verdict: Verdict, addressedByName: boolean, said: string): Action {
   const { thresholds, oneCaller } = state.policy;
   const alone = humansInRoom(state) <= 1;
   const lowRisk = alone || addressedByName;
@@ -954,6 +980,9 @@ function chosen(state: CallState, verdict: Verdict, addressedByName: boolean): A
   if (over('discard')) return 'discard';
   // A send word after the turn's words splits Jev's probability between `send` and `answer` the same way.
   if (thresholds.send && verdict.action === 'send' && p('send') + p('answer') >= thresholds.send.p) return 'send';
+  // A send word said alone is the command itself: Jev leaves a lone "Zulu." with nothing before it at stay_silent
+  // (send 0.34-0.45), and `send` still sends what is unsent, confirms a turn on its way, or answers `nope`.
+  if (thresholds.send && p('send') > p('answer') && loneCommand(state, said) === 'send') return 'send';
   if (over('answer')) return 'answer';
   // One human has nobody else to talk to: a fair chance of `answer` is enough while the agent is idle.
   if (

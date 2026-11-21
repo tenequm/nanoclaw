@@ -559,6 +559,8 @@ describe('the request to Jev', () => {
     for (const { say } of CALL_COMMAND_WORDS.discard) expect(criteria.discard.what).toContain(`"${say}"`);
     expect(criteria.send.not_for).toContain('"send me a copy"');
     expect(criteria.discard.not_for).toContain('scratch that idea');
+    // Which answer still plays is the reducer's; Jev reads a take-back, which an "answer still comes" made it doubt.
+    expect(criteria.discard.what).toContain('an answer Dan has not started saying is no longer wanted');
     expect(judgeQuestions('Dan', undefined, true).action).toStrictEqual(sent.questions.action);
   });
 

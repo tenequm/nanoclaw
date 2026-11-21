@@ -2660,7 +2660,7 @@ describe('/voice jev on the call core', () => {
     await worker.post('jev', { events: [final('u1', 'Dan, first?')] });
     await vi.waitFor(() => expect(h.routing.hung).toHaveLength(1));
     await worker.post('jev', { events: [final('u2', 'instead: Dan, second?')] });
-    expect(await turnEvent('u1')).toMatchObject({ kind: 'turn_failed', reason: '409: The turn was superseded' });
+    expect(await turnEvent('u1')).toMatchObject({ kind: 'turn_failed', reason: 'superseded' });
     await vi.waitFor(() => expect(h.routing.hung).toHaveLength(2));
     h.routing.hung[1](true);
     expect(await turnEvent('u2')).toMatchObject({ kind: 'turn', turnId: '2' });

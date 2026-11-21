@@ -98,7 +98,7 @@ function commandOptions(agent: string): ChoiceDecision['options'] {
       not_for: `A send word used as an ordinary word or inside the sentence ("send me a copy", "copy that file", "я записався на прийом до лікаря"), or quoted ("he always says zulu"); a finished question with no send word at its end (that is answer); a discard phrase at the end (that is discard).`,
     },
     discard: {
-      what: `The caller takes back what they just said with a spoken discard phrase at the very end of \`latest\`: ${quoted(CALL_COMMAND_WORDS.discard)}, after English or Ukrainian words ("забронюй столик на сьому, scratch that"). Only the words said since the caller's last turn went to ${agent} are dropped; an answer to that turn still comes.`,
+      what: `The caller takes back what they just said with a spoken discard phrase at the very end of \`latest\`: ${quoted(CALL_COMMAND_WORDS.discard)}, after English or Ukrainian words ("забронюй столик на сьому, scratch that"). The words ${agent} has not answered yet are dropped, and an answer ${agent} has not started saying is no longer wanted.`,
       not_for: `A discard phrase inside a sentence or quoted ("scratch that idea and call the plumber", "він сказав scratch that і пішов"), or said about something else ("scratch that off the list"); telling ${agent} to stop or be quiet while it speaks (that is stop).`,
     },
   };

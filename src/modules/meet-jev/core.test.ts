@@ -430,6 +430,22 @@ describe('listen until over', () => {
     });
   });
 
+  it('asks Jev nothing on words a queued toggle-on takes into the new draft', () => {
+    const call = listening();
+    call.feed(
+      { kind: 'speech', speaker: caller, uttId: 'a', on: true },
+      { kind: 'utterance', speaker: caller, uttId: 'a', text: 'First', final: false },
+    );
+    call.feed({ kind: 'listen', on: false });
+    const [timer] = only(call.feed({ kind: 'speech', speaker: caller, on: false }), 'wait');
+    call.say(caller, 'b', 'What next?');
+    call.feed({ kind: 'listen', on: true });
+    const replayed = call.feed({ kind: 'timer', key: timer.key });
+    expect(only(replayed, 'turn').map((turn) => turn.message)).toEqual(['First']);
+    expect(only(replayed, 'judge')).toEqual([]);
+    expect(only(call.say(caller, 'c', 'Zulu.'), 'turn').map((turn) => turn.message)).toEqual(['What next?']);
+  });
+
   it('ignores listen settings in a meeting', () => {
     const call = new Call('meet');
     call.feed({ kind: 'listen', on: true });
@@ -763,6 +779,101 @@ describe('spoken commands on a voice call', () => {
     expect(call.feed({ kind: 'reply', replyId: 'r1', turnId: 't1', text: 'Sunny.' })).toEqual([
       { kind: 'speak', replyId: 'r1', turnId: 't1', text: 'Sunny.' },
     ]);
+  });
+
+  it.each([
+    'No, scratch that.',
+    'Wait, scratch that.',
+    'Okay, scratch that.',
+    'Sorry, scratch that.',
+    'Ні, scratch that.',
+  ])('takes back a sent turn on "%s": a lead-in is no words to drop, and the answer is shown only', (text) => {
+    const call = new Call();
+    const [turn] = only(call.sayAnswered(caller, 'a', 'Book a table for eight tonight.'), 'turn');
+    call.feed({ kind: 'turn', key: turn.key, turnId: 't1' });
+    const result = withdrawn(call, 'b', text, { discard: 0.8, stop: 0.1, stay_silent: 0.06, answer: 0.04 });
+    expect(only(result, 'cue')).toEqual([{ kind: 'cue', cue: 'discard' }]);
+    expect(call.lastLog('command')).toMatchObject({ command: 'discard', dropped: false, withdrawn: true });
+    expect(call.feed({ kind: 'reply', replyId: 'r1', turnId: 't1', text: 'Booked.' })).toEqual([
+      { kind: 'show', replyId: 'r1', text: 'Booked.' },
+    ]);
+  });
+
+  it('takes back a merged turn on "No, scratch that." said after it was sent', () => {
+    const call = new Call();
+    const [first] = only(call.sayAnswered(caller, 'a', 'What is the weather in Kyiv tomorrow?'), 'turn');
+    call.feed({ kind: 'turn', key: first.key, turnId: 't1' });
+    const [merged] = only(call.sayAnswered(caller, 'b', 'And book me a taxi for nine.'), 'turn');
+    expect(merged.message).toBe('What is the weather in Kyiv tomorrow? And book me a taxi for nine.');
+    call.feed({ kind: 'turn', key: merged.key, turnId: 't2' });
+    const result = withdrawn(call, 'c', 'No, scratch that.', {
+      discard: 0.7,
+      stop: 0.2,
+      stay_silent: 0.06,
+      answer: 0.04,
+    });
+    expect(only(result, 'cue')).toEqual([{ kind: 'cue', cue: 'discard' }]);
+    expect(call.lastLog('command')).toMatchObject({ command: 'discard', dropped: false, withdrawn: true });
+    expect(call.feed({ kind: 'reply', replyId: 'r2', turnId: 't2', text: 'Sunny; the taxi is booked.' })).toEqual([
+      { kind: 'show', replyId: 'r2', text: 'Sunny; the taxi is booked.' },
+    ]);
+  });
+
+  it('stops a playing line on "No, scratch that.", as a stop does', () => {
+    const call = new Call();
+    wakeAndSpeak(call, 'what time is it?', 'Noon.', 1);
+    const result = withdrawn(call, 'u2', 'No, scratch that.', {
+      discard: 0.5,
+      stop: 0.35,
+      stay_silent: 0.1,
+      answer: 0.05,
+    });
+    expect(only(result, 'stop_playback')).toHaveLength(1);
+    expect(only(result, 'cue')).toEqual([{ kind: 'cue', cue: 'discard' }]);
+    expect(call.lastLog('command')).toMatchObject({ command: 'discard', dropped: false, withdrawn: true });
+  });
+
+  it('keeps dropped words out of the next turn while the earlier answer is still pending', () => {
+    const call = new Call();
+    const [turn] = only(call.sayAnswered(caller, 'a', 'What is the weather in Kyiv tomorrow?'), 'turn');
+    call.feed({ kind: 'turn', key: turn.key, turnId: 't1' });
+    withdrawn(call, 'b', 'And book me a taxi for nine', { stay_silent: 0.6, answer: 0.25, stop: 0.1, discard: 0.05 });
+    withdrawn(call, 'c', 'No, scratch that.', { discard: 0.62, answer: 0.3, stay_silent: 0.05, stop: 0.03 });
+    expect(call.lastLog('command')).toMatchObject({ command: 'discard', dropped: true, withdrawn: false });
+    const [judge] = only(call.say(caller, 'd', 'And what about Lviv?'), 'judge');
+    expect(judge.state.latest?.text).toBe('What is the weather in Kyiv tomorrow? And what about Lviv?');
+    expect(only(call.verdict(judge.windowVersion, 'answer'), 'turn').map((c) => c.message)).toEqual([
+      'What is the weather in Kyiv tomorrow? And what about Lviv?',
+    ]);
+  });
+
+  // Jev's lone "Zulu." with nothing before it, live: stay_silent 0.47-0.57, send 0.34-0.45, answer 0.06-0.10.
+  it('answers a lone send word with nothing unsent and nothing on its way with nope, below the send bar', () => {
+    const call = new Call();
+    const result = withdrawn(call, 'a', 'Zulu.', {
+      stay_silent: 0.53,
+      send: 0.37,
+      answer: 0.08,
+      stop: 0.01,
+      discard: 0.01,
+    });
+    expect(result.filter((c) => c.kind === 'cue' || c.kind === 'turn')).toEqual([{ kind: 'cue', cue: 'nope' }]);
+    expect(call.lastLog('command')).toMatchObject({ command: 'send', outcome: 'nothing' });
+  });
+
+  it('confirms a turn on its way on a lone send word below the send bar', () => {
+    const call = new Call();
+    const [turn] = only(call.sayAnswered(caller, 'a', 'What is the weather in Kyiv tomorrow?'), 'turn');
+    call.feed({ kind: 'turn', key: turn.key, turnId: 't1' });
+    const result = withdrawn(call, 'b', 'Zulu.', {
+      stay_silent: 0.53,
+      send: 0.37,
+      answer: 0.08,
+      stop: 0.01,
+      discard: 0.01,
+    });
+    expect(result.filter((c) => c.kind === 'cue' || c.kind === 'turn')).toEqual([{ kind: 'cue', cue: 'sent' }]);
+    expect(call.lastLog('command')).toMatchObject({ command: 'send', outcome: 'confirmed' });
   });
 
   /** `say`, then Jev's verdict with `probabilities` (its top one the choice) on the judge it asked for. */

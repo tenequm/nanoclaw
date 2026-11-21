@@ -258,6 +258,10 @@ describe('createCallRuntime', () => {
     });
     turns[0].resolve({ ok: false, reason: '409: The turn was superseded' });
     await vi.waitFor(() => expect(turns.map((t) => t.message)).toEqual(['one', 'three']));
+    // The aborted turn reports `superseded` too, not the host's refusal: the core keeps its words only once.
+    expect(core.seen.filter((e) => e.kind === 'turn_failed' && e.key === 'k-one')).toEqual([
+      { kind: 'turn_failed', key: 'k-one', reason: 'superseded', at: expect.any(Number) },
+    ]);
   });
 
   it('keeps running after the core or a port throws', () => {
