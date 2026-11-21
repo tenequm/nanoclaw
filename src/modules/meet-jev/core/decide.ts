@@ -57,7 +57,16 @@ export function reduce(prev: CallState, event: CallEvent): CallState {
   }
   const out = state.commands;
   switch (event.kind) {
+    case 'overlap': {
+      const latest = { speaker: event.speaker.name, text: event.text };
+      const input = toJevState(state, latest, addressedByName(state, event.text));
+      // Only the prefix already heard belongs in the playing line.
+      for (const line of input.window) if (line.agent && line.partial) line.text = event.played;
+      out.push({ kind: 'overlap', requestId: event.requestId, windowVersion: state.windowVersion, state: input });
+      break;
+    }
     case 'utterance':
+      if (event.contextOnly) break;
       if (event.final && hasWords(event.text)) out.push({ kind: 'status', status: 'heard' });
       // An older final can settle the last open piece of a pending turn.
       if (
@@ -218,7 +227,7 @@ function boundary(state: CallState, speakerId: string): void {
 function decideLatest(state: CallState, speakerId: string): boolean {
   const speaker = state.speakers[speakerId];
   const utt = latestUtterance(state, speakerId);
-  if (!speaker || !utt || !hasWords(utt.text) || isHandled(speaker, utt.uttId)) return false;
+  if (!speaker || !utt || utt.contextOnly || !hasWords(utt.text) || isHandled(speaker, utt.uttId)) return false;
   markHandled(speaker, utt.uttId);
   // A newer decision sees the deferred utterance in its window; it is not decided again after it.
   const deferred = state.deferred;

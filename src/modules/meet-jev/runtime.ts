@@ -24,6 +24,7 @@ import type {
 export type JevTurnResult = { ok: true; turnId: string; stored?: SessionStamp } | { ok: false; reason: string };
 
 export interface RuntimePorts {
+  overlap(command: Extract<Command, { kind: 'overlap' }>, signal: AbortSignal): Promise<void>;
   now(): number;
   /** Never rejects in practice (askAction answers null on any failure); a rejection counts as a null verdict. */
   judge(state: JevState, signal: AbortSignal, windowVersion: number): Promise<{ verdict: Verdict | null; ms: number }>;
@@ -128,6 +129,17 @@ export function createCallRuntime<S>(core: CallCore<S>, policy: CallPolicy, port
 
   const execute = (command: Command): void => {
     switch (command.kind) {
+      case 'overlap': {
+        const abort = new AbortController();
+        rechecks.add(abort);
+        void ports
+          .overlap(command, abort.signal)
+          .catch((err: unknown) =>
+            safely('log', () => ports.log('port_error', { command: command.kind, err: errText(err) })),
+          )
+          .finally(() => rechecks.delete(abort));
+        return;
+      }
       case 'status':
         return ports.status(command.status);
       case 'judge':
