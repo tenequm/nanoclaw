@@ -175,8 +175,8 @@ function shadowDecisions(agent: string): Record<string, ProbabilityDecision> {
 /**
  * On a voice call, whether the caller said new words before a discard phrase, asked beside `action` and read only on a
  * `discard` verdict: with none, nothing is unsent and the discard takes back the answer on its way. The question quotes
- * the caller's newest line: `latest` also carries a held turn's words, sent before it, and asked about `latest` (or
- * told to look at the last line of `window`) Jev counts those (live, 0.74-0.98 on "Dan, scratch that" after one).
+ * the caller's newest line: `latest` also carries a held turn's words, sent before it, and Jev counts those (live,
+ * a lead-in after a held turn scored 0.74-0.98 asked about `latest`, 0.27-0.92 told to read the last line of `window`).
  */
 function newWordsDecision(agent: string, line: string): ProbabilityDecision {
   return {
