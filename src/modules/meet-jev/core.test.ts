@@ -1621,6 +1621,26 @@ describe('continuing a turn before playback', () => {
       call.feed(spoke(olena, false, verdictAt + 2_500));
       expect(only(call.until(verdictAt + 3_000), 'recheck').map((c) => c.wakeKey)).toEqual(['w1']);
     });
+
+    it('a wordless sound from the held speaker under another speaker does not keep a decided hold waiting', () => {
+      const call = new Call('meet');
+      call.realTimers = true;
+      call.feed(...[speaker, olena, anna].map((who): Fed => ({ kind: 'presence', speaker: who, joined: true })));
+      call.sayAnswered(speaker, 'a', 'Can you check the release notes');
+      call.feed({ kind: 'turn', key: 'w1', turnId: 't1' }, reply, { kind: 'speech', speaker, on: true, uttId: 'b' });
+      call.feed(ready(), spoke(speaker, false, call.state.now + 400));
+      const [judge] = only(call.feed(say('b', 'thanks in advance')), 'judge');
+      expect(call.verdict(judge.windowVersion, 'stay_silent')).toEqual([{ kind: 'wait', key: 'hold:w1', ms: 3000 }]);
+      const verdictAt = call.state.now;
+      // Olena talks across the whole hold; the held speaker coughs under her and STT settles it with an empty final.
+      call.feed(
+        spoke(olena, true, verdictAt + 400),
+        { kind: 'speech', speaker, on: true, uttId: 'c', at: verdictAt + 900 },
+        spoke(speaker, false, verdictAt + 1_200),
+        say('c', '', verdictAt + 1_600),
+      );
+      expect(only(call.until(verdictAt + 3_000), 'recheck').map((c) => c.wakeKey)).toEqual(['w1']);
+    });
   });
 
   it('bounds a hold whose last words were held over an older playing line (context only) from their final', () => {

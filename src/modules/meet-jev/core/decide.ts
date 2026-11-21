@@ -169,7 +169,9 @@ export function reduce(prev: CallState, event: CallEvent): CallState {
           !!latest &&
           pieces.includes(latest) &&
           !latest.contextOnly &&
-          !isHandled(state.speakers[held.speakerId], latest.uttId);
+          !isHandled(state.speakers[held.speakerId], latest.uttId) &&
+          // A wordless piece adds nothing to a merged turn Jev already judged.
+          (hasWords(latest.text) || openTurnOf(state, held.speakerId).text !== held.judged);
         if (undecided) {
           // Words still undecided wait for the floor and any judge in flight; that verdict reaches them itself.
           if (floorTaken(state) || state.judging) holdBriefly(state, held.speakerId);
