@@ -51,6 +51,8 @@ export interface JevCallHost {
   /** The worker lowers the line's gain during a barge-in instead of pausing it. */
   jevDuck?: boolean;
   callerName: string;
+  /** Save unreleased words to this call's thread. */
+  postCaller?(text: string): void;
   agentName: string;
   /** Other names the agent goes by (the vocabulary file's wake names). */
   agentAliases: readonly string[];
@@ -81,6 +83,10 @@ export interface JevCall {
   words(): void;
   /** An agent message for this call: `turnId` is the turn it answers, null when unprompted. */
   reply(text: string, turnId: string | null, produced?: SessionStamp): void;
+  /** Holds the draft for transcripts already in transit when the caller hung up. */
+  drainDraft(): boolean;
+  /** Close transcript input and wait for explicit turns already released. */
+  finishDraft(): Promise<void> | undefined;
   end(reason: string): void;
 }
 
@@ -196,6 +202,7 @@ export function createJevCall(host: JevCallHost, deps: Partial<JevDeps> = {}): J
       });
       return { verdict: null, ms: 0 };
     },
+    postCaller: host.postCaller,
     turn: ({ message, note }, signal) => host.submitTurn(message, note, signal),
     speak: (replyId, text, turn) => {
       host.push({ type: 'reply', text, turn, replyId });
@@ -254,6 +261,17 @@ export function createJevCall(host: JevCallHost, deps: Partial<JevDeps> = {}): J
     reply(text, turnId, produced) {
       runtime.feed({ kind: 'reply', replyId: `r${++replies}`, turnId, text, produced, at: host.now() });
     },
-    end: (reason) => runtime.end(reason),
+    drainDraft() {
+      if (!runtime.hasListenDraft) return false;
+      runtime.feed({ kind: 'hangup', draining: true, at: host.now() });
+      return true;
+    },
+    finishDraft() {
+      runtime.feed({ kind: 'hangup', at: host.now() });
+      return runtime.turnsSettled();
+    },
+    end(reason) {
+      runtime.end(reason);
+    },
   };
 }

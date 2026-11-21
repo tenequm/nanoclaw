@@ -7,6 +7,7 @@
  * Times (`at`) are host epoch milliseconds; an ingress converts its source's clock (Recall's
  * frame timestamps, the worker's marks) on arrival.
  */
+import type { EndPhrase } from './spoken.js';
 
 export type CallStatus = 'heard' | 'thinking' | 'speaking' | 'idle';
 
@@ -47,6 +48,10 @@ export interface SessionStamp {
 }
 
 export type CallEvent =
+  /** Change explicit release mode on a voice call. */
+  | { kind: 'listen'; on: boolean; at: number }
+  /** Drain in-flight transcripts, or finish the draft once input closes. */
+  | { kind: 'hangup'; draining?: boolean; at: number }
   | { kind: 'presence'; speaker: Speaker; joined: boolean; at: number }
   /** A participant's words: partials update the utterance, the final replaces it. */
   | { kind: 'utterance'; speaker: Speaker; uttId: string; text: string; final: boolean; contextOnly?: true; at: number }
@@ -82,6 +87,8 @@ export type CallEvent =
     };
 
 export type Command =
+  /** Save unsubmitted words to the caller's thread at call end. */
+  | { kind: 'post_caller'; text: string }
   | { kind: 'overlap'; requestId: string; state: JevState; windowVersion: number }
   | { kind: 'status'; status: CallStatus }
   /** Ask Jev about the window as of `windowVersion`; the answer comes back as a `verdict`. */
@@ -172,6 +179,8 @@ export interface ActionThreshold {
 
 /** Everything that differs between the two kinds; the core knows nothing else about them. */
 export interface CallPolicy {
+  /** Voice: the words that end a listen-until-over draft (the spoken send words). */
+  releaseWords?: EndPhrase[];
   kind: CallKind;
   /** The agent's name as people say it, for the vocative fact, the stop rule and the state. */
   agentName: string;
@@ -205,6 +214,8 @@ export interface CallPolicy {
  * `core/window.ts` and `core/decide.ts` implement it; the runtime is generic over `S`.
  */
 export interface CallCore<S> {
+  /** Whether the current call needs its input drained before it ends. */
+  hasListenDraft?(state: S): boolean;
   initial(policy: CallPolicy, at: number): S;
   reduce(state: S, event: CallEvent): S;
   decide(state: S, event: CallEvent): Command[];

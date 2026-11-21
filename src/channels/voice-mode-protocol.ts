@@ -96,6 +96,8 @@ export interface LiveKitJobMetadata {
   callerIdentity: string;
   /** The host confirms each Jev reply immediately before its first audio. */
   confirmPlayout?: true;
+  /** Jev voice calls supporting explicit turn release: OVER_WORDS, in display order. */
+  overWords?: string[];
   /** A call started through the app API. */
   appCall?: boolean;
   /** Spelling hints for the transcription: VOICE_MODE_VOCABULARY plus the agent's voice.vocabulary.txt. */
@@ -134,6 +136,10 @@ export interface LiveKitJobMetadata {
  * on `/voice jev` everything heard is the caller.
  */
 export type JevWorkerEvent =
+  /** The worker is finishing its outstanding transcriptions. */
+  | { type: 'hangup'; at: number }
+  /** Ordered with speech so both ends apply the setting at the same boundary. */
+  | { type: 'listen'; on: boolean; at: number }
   /** Words heard: partials of one `uttId` update it, its final replaces it. */
   | { type: 'utterance'; uttId: string; text: string; final: boolean; contextOnly?: true; at: number }
   | { type: 'overlap'; requestId: string; replyId: string; played: string; text: string; at: number }
@@ -335,6 +341,14 @@ export const CALL_COMMAND_WORDS: CallCommandWords = {
   discard: [{ say: 'scratch that', hint: true }, { say: 'discard turn' }, { say: 'discard this turn' }],
 };
 /**
+ * Listen until over's release words as the app shows them (it quotes the first): the send words,
+ * the `hint` ones first. The jev loop releases a draft on the same words by the same rules.
+ */
+export const OVER_WORDS: readonly string[] = [
+  ...CALL_COMMAND_WORDS.send.filter((word) => word.hint),
+  ...CALL_COMMAND_WORDS.send.filter((word) => !word.hint),
+].map((word) => word.say);
+/**
  * The worker's participant attribute with CALL_COMMAND_WORDS as compact JSON, set with
  * CALL_COMMANDS_ATTRIBUTE.
  */
@@ -412,6 +426,8 @@ export interface CallReviewState {
 
 /** `gen` is the page's own operation counter, echoed back; `draft` names the draft an operation is for. */
 export interface ReviewRequest {
+  /** Jev voice settings only. Omission preserves the current mode. */
+  listenUntilOver?: boolean;
   gen: number;
   draft?: number;
   /** For `mode`: the mode to switch to; absent, the worker only sends its state again. */
@@ -434,6 +450,14 @@ export interface ReviewRequest {
  * to review, a turn auto mode had already sent after `afterTurn`. `error`: why nothing happened.
  */
 export interface ReviewReply {
+  /** Together with overWords, confirms support for explicit release. */
+  listenUntilOver?: boolean;
+  /** The call's release words in display order (OVER_WORDS). */
+  overWords?: string[];
+  /** Current sound cue preference. */
+  cues?: boolean;
+  /** Current typing sound preference. */
+  typing?: boolean;
   gen: number;
   ok: boolean;
   seq: number;

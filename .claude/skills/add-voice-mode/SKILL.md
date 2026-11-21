@@ -315,14 +315,33 @@ line to the wake phrase and send word until the caller sends `/voice` (or
 returns the line to jev. A client's `?jev=0` on `livekit/token` makes one call
 plain, and `?jev=1` one jev call. Without the key every call is plain.
 
+On a Jev voice call, enable **Listen until over** to dictate across pauses.
+The agent waits for a send word, the same words and rules as auto mode's:
+`zulu` or `прийом` at the end of an utterance (in either script), `copy` or
+`copy that` only as their own sentence. It receives one message with the
+marker removed. A marker alone releases a pending draft
+and is silent when the draft is empty. Switching the mode off sends the draft
+once the utterance being said ends.
+At call end, unfinished words are posted to the caller's thread unless access
+was revoked. At hangup the worker waits up to 3 s for outstanding finals, so a
+marker said just before it still sends the turn.
+Replies are spoken and the caller can interrupt them or say
+`stop`. Typing, the working indicator and the end-of-turn cue stay silent.
+The mode starts off on each call. Meetings use their usual Jev policy.
+
+Jev app calls advertise commands version `3`. The app sends `listenUntilOver`
+with its settings and shows the toggle when the reply contains both the current
+boolean and the display list `overWords` (the send words, `zulu` first).
+Omitting the switch keeps its value.
+
 If the speaker who prompted an answer continues before playback, the host holds
 the reply's first audio through their final transcript; one that never comes
 counts as heard so far once the boundary timer fires. Jev judges the original
 request and the continuation together. An answer replaces the pending turn, a
 stop drops it, and an acknowledgement alone releases the original answer. When
-Jev chooses silence the answer is released after a few seconds of quiet, and
-when Jev fails at once; either way it goes through the usual answer-ready
-check. The worker synthesizes a held reply meanwhile. Before its first audio,
+Jev chooses silence, or nothing new is left to judge (a cough, words held over
+a playing line), the answer is released after a few seconds of quiet, and when
+Jev fails at once; either way it goes through the usual answer-ready check. The worker synthesizes a held reply meanwhile. Before its first audio,
 each queued line waits for the host to confirm it can play. Fresh caller
 speech invalidates that confirmation.
 

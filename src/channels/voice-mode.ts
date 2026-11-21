@@ -560,8 +560,8 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
     try {
       // The shared webhook server has no unregister; after teardown the routes stay reachable
       // and must refuse rather than start calls for a channel that is no longer running.
+      if (setup && route.startsWith('livekit/agent/')) return await livekit.handleAgentHttp(req, res, route, url);
       if (!connected || !setup) return reply(res, 503, 'Voice is not running');
-      if (route.startsWith('livekit/agent/')) return await livekit.handleAgentHttp(req, res, route, url);
       if (route === 'livekit' || route.startsWith('livekit/')) return await callPage.handle(req, res, route, url);
       if (route === 'info') {
         // Who answers this line, so the page can greet by name before the call.

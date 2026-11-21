@@ -1,4 +1,5 @@
 /** What differs between `/voice jev` and `/meet <link> jev`: the policy paragraph and the numbers. */
+import { CALL_COMMAND_WORDS } from '../../channels/voice-mode-protocol.js';
 import type { CallKind, CallPolicy } from './core/types.js';
 
 export function policyFor(kind: CallKind, agentName: string, agentAliases: string[]): CallPolicy {
@@ -9,6 +10,15 @@ export function policyFor(kind: CallKind, agentName: string, agentAliases: strin
       : `${agentName} is an AI assistant in a live meeting with several people. ${agentName} speaks only when someone addresses it by name or invites it to answer, and nobody else is taking it up; otherwise it stays silent. A finished question from the person in \`facts.in_exchange_with\` is usually a follow-up to ${agentName}, even without the name.`;
   return {
     kind,
+    // Listen until over releases a draft on the spoken send words, by their rules.
+    ...(kind === 'voice'
+      ? {
+          releaseWords: CALL_COMMAND_WORDS.send.map(({ say, ownSentence }) => ({
+            say,
+            ...(ownSentence ? { ownSentence } : {}),
+          })),
+        }
+      : {}),
     agentName,
     agentAliases,
     paragraph,
