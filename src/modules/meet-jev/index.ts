@@ -50,6 +50,8 @@ export interface JevCallHost {
   jevOverlapVerdict?: boolean;
   /** The worker lowers the line's gain during a barge-in instead of pausing it. */
   jevDuck?: boolean;
+  /** Spoken send and discard outside listening mode on a voice call (VOICE_MODE_JEV_COMMANDS); off when left out. */
+  jevCommands?: boolean;
   callerName: string;
   /** Save unreleased words to this call's thread. */
   postCaller?(text: string): void;
@@ -96,14 +98,15 @@ export function createJevCall(host: JevCallHost, deps: Partial<JevDeps> = {}): J
   const recheck = deps.recheck ?? askStillWanted;
   const kind = host.kind ?? 'voice';
   const judgeOverlap = kind === 'voice' && host.jevOverlapVerdict !== false;
-  const policy = policyFor(kind, host.agentName, [...host.agentAliases]);
+  const commands = kind === 'voice' && host.jevCommands === true;
+  const policy = policyFor(kind, host.agentName, [...host.agentAliases], commands);
   const ingress = createWorkerIngress({ name: host.callerName }, host.maxTextBytes);
   let replies = 0;
   const fields = { callId: host.callId };
   const overlapQuestion = judgeOverlap ? (host.jevDuck ? 'ducked' : 'paused') : undefined;
   log.info('meet-jev: questions', {
     ...fields,
-    questions: judgeQuestions(host.agentName, overlapQuestion, kind === 'voice'),
+    questions: judgeQuestions(host.agentName, overlapQuestion, commands),
   });
   const judgedAt: number[] = [];
   const overlapsAt: number[] = [];
@@ -170,8 +173,8 @@ export function createJevCall(host: JevCallHost, deps: Partial<JevDeps> = {}): J
       }
       if (!signal.aborted) host.push({ type: 'overlap', requestId, verdict, ...(reason ? { reason } : {}) });
     },
-    judge: async (state, signal, windowVersion) => {
-      if (!capped()) return judge(state, { signal, ...fields, windowVersion, commands: kind === 'voice' });
+    judge: async (state, signal, windowVersion, discardLine) => {
+      if (!capped()) return judge(state, { signal, ...fields, windowVersion, commands, discardLine });
       log.warn('meet-jev: Jev rate cap reached, judged without Jev', { ...fields, perMinute: MAX_JUDGES_PER_MINUTE });
       log.info('meet-jev: judge', {
         ...fields,

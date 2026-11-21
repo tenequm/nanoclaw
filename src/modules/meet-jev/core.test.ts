@@ -29,8 +29,9 @@ class Call {
   /** Fire every due timer, earliest first, before each fed event, as the runtime would. */
   realTimers = false;
 
-  constructor(kind: CallKind = 'voice') {
-    this.state = callCore.initial(policyFor(kind, 'Dan', ['Ден']), 0);
+  /** `commands`: spoken send and discard outside listening mode (VOICE_MODE_JEV_COMMANDS), on unless a test says. */
+  constructor(kind: CallKind = 'voice', commands = true) {
+    this.state = callCore.initial(policyFor(kind, 'Dan', ['Ден'], commands), 0);
   }
 
   /** Feed events (each 100 ms after the last unless it says otherwise); returns the action commands. */
@@ -845,6 +846,149 @@ describe('spoken commands on a voice call', () => {
     expect(call.feed({ kind: 'reply', replyId: 'r1', turnId: 't1', text: 'Booked.' })).toEqual([
       { kind: 'show', replyId: 'r1', text: 'Booked.' },
     ]);
+  });
+
+  it.each(['before its final', 'while its judge is in flight'])(
+    'asks Jev about "No, scratch that." and takes back the sent turn when a wordless sound starts %s',
+    (when) => {
+      const call = new Call();
+      const [turn] = only(call.sayAnswered(caller, 'a', 'Book a table for eight tonight.'), 'turn');
+      call.feed({ kind: 'turn', key: turn.key, turnId: 't1' });
+      const discard: Verdict = {
+        action: 'discard',
+        probabilities: { discard: 0.95, stop: 0.02, stay_silent: 0.02, answer: 0.01, continue: 0, send: 0 },
+        confidence: 0.9,
+        newWords: 0.03,
+      };
+      const line = { kind: 'utterance', speaker: caller, uttId: 'b', text: 'No, scratch that.', final: true } as const;
+      const breath: Fed[] = [
+        { kind: 'speech', speaker: caller, on: false },
+        { kind: 'utterance', speaker: caller, uttId: 'c', text: '', final: true },
+      ];
+      let judges: Extract<Command, { kind: 'judge' }>[];
+      if (when === 'before its final') {
+        judges = only(
+          call.feed(
+            { kind: 'speech', speaker: caller, on: true, uttId: 'b' },
+            { ...line, text: 'No, scr', final: false },
+            { kind: 'speech', speaker: caller, on: false },
+            { kind: 'speech', speaker: caller, on: true, uttId: 'c' },
+            line,
+            ...breath,
+          ),
+          'judge',
+        );
+      } else {
+        const [first] = only(call.say(caller, 'b', line.text), 'judge');
+        call.feed({ kind: 'speech', speaker: caller, on: true, uttId: 'c' });
+        call.feed({ kind: 'verdict', windowVersion: first.windowVersion, verdict: discard, ms: 300 });
+        judges = only(call.feed(...breath), 'judge');
+      }
+      // The judged piece is the empty one; the line Jev is asked about, and the one its answer applies to, is not.
+      expect(call.state.judging?.uttId).toBe('c');
+      const judge = judges.at(-1)!;
+      expect(judge.discardLine).toBe('No, scratch that.');
+      call.feed({ kind: 'verdict', windowVersion: judge.windowVersion, verdict: discard, ms: 300 });
+      expect(call.lastLog('command')).toMatchObject({ command: 'discard', dropped: false, withdrawn: true });
+      expect(call.feed({ kind: 'reply', replyId: 'r1', turnId: 't1', text: 'Booked.' })).toEqual([
+        { kind: 'show', replyId: 'r1', text: 'Booked.' },
+      ]);
+    },
+  );
+
+  it.each([
+    ['Dan, scratch that.', 'Dan, scratch that.'],
+    ['Book a table for six, discard this turn.', 'Book a table for six, discard this turn.'],
+    ['What time is it?', undefined],
+    ['Scratch that.', undefined],
+    ['Dan, zulu.', undefined],
+  ])('hands Jev the line "%s" for its new-words question only when words lead into a discard', (text, discardLine) => {
+    const call = new Call();
+    const [judge] = only(call.say(caller, 'a', text), 'judge');
+    expect(judge.discardLine).toBe(discardLine);
+    expect(call.state.judging?.discard).toEqual(discardLine && { uttId: 'a', text: discardLine });
+  });
+
+  describe('with the spoken commands off outside listening mode (VOICE_MODE_JEV_COMMANDS unset)', () => {
+    it('has no command bars and hands Jev no discard line', () => {
+      const call = new Call('voice', false);
+      expect(call.state.policy.thresholds).not.toHaveProperty('send');
+      expect(call.state.policy.thresholds).not.toHaveProperty('discard');
+      expect(call.state.policy).not.toHaveProperty('newWords');
+      const [judge] = only(call.say(caller, 'a', 'Dan, scratch that.'), 'judge');
+      expect(judge).not.toHaveProperty('discardLine');
+    });
+
+    it('decides a take-back of a pending answer as main does: a stop on its own bar, no cue', () => {
+      const call = new Call('voice', false);
+      const [turn] = only(call.sayAnswered(caller, 'a', 'Book a table for eight tonight.'), 'turn');
+      call.feed({ kind: 'turn', key: turn.key, turnId: 't1' });
+      const result = withdrawn(call, 'b', 'No, scratch that.', { stop: 0.7, stay_silent: 0.2, answer: 0.1 });
+      expect(only(result, 'cue')).toEqual([]);
+      expect(call.lastLog('command')).toBeUndefined();
+      expect(call.lastLog('decision')).toMatchObject({ action: 'stop' });
+    });
+
+    it('splits nothing between stop and discard, nor send and answer, and plays no cue on a stray command answer', () => {
+      const call = new Call('voice', false);
+      const [turn] = only(call.sayAnswered(caller, 'a', 'Book a table for eight tonight.'), 'turn');
+      call.feed({ kind: 'turn', key: turn.key, turnId: 't1' });
+      // Main's bars alone: stop 0.45 is under its 0.6 bar whatever discard adds.
+      const taken = withdrawn(call, 'b', 'No, scratch that.', { stop: 0.45, discard: 0.4, stay_silent: 0.15 });
+      expect(only(taken, 'cue')).toEqual([]);
+      expect(call.lastLog('decision')).toMatchObject({ action: 'stay_silent' });
+      const sent = withdrawn(call, 'c', 'And a taxi, zulu.', { send: 0.5, answer: 0.3, stay_silent: 0.2 });
+      expect(only(sent, 'cue')).toEqual([]);
+      expect(call.lastLog('command')).toBeUndefined();
+    });
+
+    it('leaves a lone send word to main: stay_silent, no nope', () => {
+      const call = new Call('voice', false);
+      const result = withdrawn(call, 'a', 'Zulu.', { stay_silent: 0.53, answer: 0.08, stop: 0.39 });
+      expect(result.filter((c) => c.kind === 'cue' || c.kind === 'turn')).toEqual([]);
+      expect(call.lastLog('decision')).toMatchObject({ action: 'stay_silent' });
+    });
+
+    it('still releases and discards a listen-until-over draft on the spoken words, with their cues', () => {
+      const call = new Call('voice', false);
+      call.feed({ kind: 'listen', on: true });
+      expect(call.say(caller, 'a', 'Book a table')).toEqual([]);
+      expect(call.say(caller, 'b', 'scratch that.')).toEqual([{ kind: 'cue', cue: 'discard' }]);
+      expect(call.say(caller, 'c', 'Book a taxi, zulu.')).toEqual([
+        expect.objectContaining({ kind: 'turn', message: 'Book a taxi' }),
+        { kind: 'cue', cue: 'sent' },
+      ]);
+      expect(call.say(caller, 'd', 'Copy that.')).toEqual([{ kind: 'cue', cue: 'nope' }]);
+    });
+  });
+
+  it('hands a meeting judge no discard line', () => {
+    const call = new Call('meet');
+    const [judge] = only(call.say(caller, 'a', 'Dan, scratch that.'), 'judge');
+    expect(judge).not.toHaveProperty('discardLine');
+  });
+
+  it('keeps an earlier take-back Jev heard as a lead-in out of the words a later discard drops', () => {
+    const call = new Call();
+    const [turn] = only(call.sayAnswered(caller, 'a', 'Book a table for eight tonight.'), 'turn');
+    call.feed({ kind: 'turn', key: turn.key, turnId: 't1' });
+    // Jev hears no new words in the first take-back but does not act on it.
+    withdrawn(call, 'b', 'Ні, scratch that.', { stay_silent: 0.6, discard: 0.3, answer: 0.1 }, 0.05);
+    expect(call.lastLog('command')).toBeUndefined();
+    withdrawn(call, 'c', 'Okay, discard this turn.', { discard: 0.8, stop: 0.1, stay_silent: 0.1 }, 0.03);
+    expect(call.lastLog('command')).toMatchObject({ command: 'discard', dropped: false, withdrawn: true });
+    expect(call.feed({ kind: 'reply', replyId: 'r1', turnId: 't1', text: 'Booked.' })).toEqual([
+      { kind: 'show', replyId: 'r1', text: 'Booked.' },
+    ]);
+  });
+
+  it('counts an earlier take-back as words again once its text changes after Jev heard it', () => {
+    const call = new Call();
+    withdrawn(call, 'b', 'Ні, scratch that.', { stay_silent: 0.6, discard: 0.3, answer: 0.1 }, 0.05);
+    expect(call.state.utterances.find((u) => u.uttId === 'b')?.leadIn).toBe('Ні, scratch that.');
+    call.feed({ kind: 'utterance', speaker: caller, uttId: 'b', text: 'Book a taxi, scratch that.', final: true });
+    withdrawn(call, 'c', 'Okay, discard this turn.', { discard: 0.8, stop: 0.1, stay_silent: 0.1 }, 0.03);
+    expect(call.lastLog('command')).toMatchObject({ command: 'discard', dropped: true, withdrawn: false });
   });
 
   it('takes back a merged turn on "No, scratch that." said after it was sent', () => {

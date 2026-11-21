@@ -242,6 +242,8 @@ export interface LiveKitVoiceConfig {
   /** Caller words on a Jev voice call need Silero's evidence of real speech; on unless false. */
   jevSpeechGate?: boolean;
   jevDuck?: boolean;
+  /** Spoken send and discard outside listening mode on a Jev voice call (VOICE_MODE_JEV_COMMANDS); off unless true. */
+  jevCommands?: boolean;
   /** The wake phrase's name (wakePhraseName): what a jev call's people call the agent, over the line's agent name. */
   wakeName?: string;
   /** VOICE_MODE_LANGUAGES as parseVoiceLanguages read it; DEFAULT_VOICE_LANGUAGES when unset. */
@@ -1381,6 +1383,7 @@ export function createLiveKitVoice(config: LiveKitVoiceConfig, host: LiveKitHost
         kind,
         jevOverlapVerdict: config.jevOverlapVerdict,
         jevDuck: config.jevDuck,
+        jevCommands: config.jevCommands,
         callerName: call.line.caller.name,
         agentName: config.wakeName ?? call.line.agent.name,
         agentAliases: [call.line.agent.name, ...(call.line.agent.wakeNames ?? [])].filter(

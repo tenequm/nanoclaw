@@ -27,8 +27,16 @@ export type JevTurnResult = { ok: true; turnId: string; stored?: SessionStamp } 
 export interface RuntimePorts {
   overlap(command: Extract<Command, { kind: 'overlap' }>, signal: AbortSignal): Promise<void>;
   now(): number;
-  /** Never rejects in practice (askAction answers null on any failure); a rejection counts as a null verdict. */
-  judge(state: JevState, signal: AbortSignal, windowVersion: number): Promise<{ verdict: Verdict | null; ms: number }>;
+  /**
+   * Never rejects in practice (askAction answers null on any failure); a rejection counts as a null verdict.
+   * `discardLine`: the judge command's, the caller's line Jev's `new_words` question is about.
+   */
+  judge(
+    state: JevState,
+    signal: AbortSignal,
+    windowVersion: number,
+    discardLine?: string,
+  ): Promise<{ verdict: Verdict | null; ms: number }>;
   /** The answer-ready check; never rejects in practice either, and a rejection counts as a null verdict. */
   recheck(
     state: RecheckState,
@@ -157,7 +165,7 @@ export function createCallRuntime<S>(core: CallCore<S>, policy: CallPolicy, port
       case 'cue':
         return ports.cue?.(command.cue);
       case 'judge':
-        return judge(command.windowVersion, command.state);
+        return judge(command.windowVersion, command.state, command.discardLine);
       case 'recheck':
         return recheck(command.wakeKey, command.state, command.windowVersion);
       case 'wait':
@@ -188,13 +196,13 @@ export function createCallRuntime<S>(core: CallCore<S>, policy: CallPolicy, port
   };
 
   /** Only the newest window's verdict can be acted on, so a new judge aborts the ones in flight. */
-  const judge = (windowVersion: number, jevState: JevState): void => {
+  const judge = (windowVersion: number, jevState: JevState, discardLine?: string): void => {
     for (const inFlight of judges) inFlight.abort();
     judges.clear();
     const abort = new AbortController();
     judges.add(abort);
     void Promise.resolve()
-      .then(() => ports.judge(jevState, abort.signal, windowVersion))
+      .then(() => ports.judge(jevState, abort.signal, windowVersion, discardLine))
       .catch(() => ({ verdict: null, ms: 0 }))
       .then(({ verdict, ms }) => {
         judges.delete(abort);

@@ -173,10 +173,12 @@ function shadowDecisions(agent: string): Record<string, ProbabilityDecision> {
 }
 
 /**
- * On a voice call, whether the caller said new words before a discard phrase, asked beside `action` and read only on a
- * `discard` verdict: with none, nothing is unsent and the discard takes back the answer on its way. The question quotes
- * the caller's newest line: `latest` also carries a held turn's words, sent before it, and Jev counts those (live,
- * a lead-in after a held turn scored 0.74-0.98 asked about `latest`, 0.27-0.92 told to read the last line of `window`).
+ * On a voice call with spoken commands, whether the caller said new words before a discard phrase, asked beside
+ * `action` only when the reducer hands over the caller's line that ends in one (the judge command's `discardLine`, the
+ * piece Jev's answer then applies to), and read on a `discard` verdict only: with none, nothing is unsent and the
+ * discard takes back the answer on its way. The question quotes that line: `latest` also carries a held turn's words,
+ * sent before it, and Jev counts those (live, a lead-in after a held turn scored 0.74-0.98 asked about `latest`,
+ * 0.27-0.92 told to read the last line of `window`).
  */
 function newWordsDecision(agent: string, line: string): ProbabilityDecision {
   return {
@@ -187,13 +189,6 @@ function newWordsDecision(agent: string, line: string): ProbabilityDecision {
       false: `Nothing before the phrase in that line, or only filler, ${agent}'s name, an acknowledgement or a saying like "you know what" or "never mind", in English ("${agent}, scratch that", "No, scratch that", "Yeah, no, scratch that", "You know what, scratch that") or Ukrainian ("Та ні, scratch that", "Ні, забудь, scratch that", "Знаєш що, scratch that").`,
     },
   };
-}
-
-/** The newest finished line of `latest`'s speaker, as JSON for the new_words question. */
-function newestLine(state: JevState): string | undefined {
-  const speaker = state.latest?.speaker;
-  const line = [...state.window].reverse().find((l) => !l.agent && !l.partial && l.speaker === speaker);
-  return line && JSON.stringify(line.text);
 }
 
 function stillWantedDecision(agent: string): ChoiceDecision {
@@ -245,7 +240,7 @@ export const judgeQuestions = (agent: string, overlap?: 'paused' | 'ducked', com
     Object.entries({
       action: actionDecision(agent, commands),
       ...shadowDecisions(agent),
-      // Each request quotes the caller's line where this placeholder stands.
+      // Each request that asks it quotes the caller's line where this placeholder stands.
       ...(commands ? { new_words: newWordsDecision(agent, '"{the caller\'s newest line}"') } : {}),
       still_wanted: stillWantedDecision(agent),
       ...(overlap ? { barge_in: bargeInDecision(agent, overlap === 'ducked') } : {}),
@@ -357,8 +352,10 @@ function shadowLog(response: DecisionResponse | null) {
 
 interface JudgeOptions {
   signal?: AbortSignal;
-  /** A voice call: the `action` Choice offers the spoken commands. */
+  /** A voice call with spoken commands (VOICE_MODE_JEV_COMMANDS): the `action` Choice offers them. */
   commands?: boolean;
+  /** The caller's line that ends in a discard phrase, named by the reducer: `new_words` asks about it. */
+  discardLine?: string;
   callId?: string;
   windowVersion?: number;
 }
@@ -404,7 +401,7 @@ async function ask<V>(
 
 /** Ask Jev what the agent should do about the window. Never throws; null on any failure. */
 export function askAction(state: JevState, opts: JudgeOptions = {}): Promise<{ verdict: Verdict | null; ms: number }> {
-  const line = opts.commands ? newestLine(state) : undefined;
+  const line = opts.commands && opts.discardLine ? JSON.stringify(opts.discardLine) : undefined;
   return ask(
     state,
     {

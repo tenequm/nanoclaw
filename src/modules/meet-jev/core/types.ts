@@ -112,8 +112,11 @@ export type Command =
   | { kind: 'post_caller'; text: string }
   | { kind: 'overlap'; requestId: string; state: JevState; windowVersion: number }
   | { kind: 'status'; status: CallStatus }
-  /** Ask Jev about the window as of `windowVersion`; the answer comes back as a `verdict`. */
-  | { kind: 'judge'; windowVersion: number; state: JevState }
+  /**
+   * Ask Jev about the window as of `windowVersion`; the answer comes back as a `verdict`. `discardLine`: the caller's
+   * newest line, when it ends in a discard phrase with words before it; Jev is asked whether those words are new.
+   */
+  | { kind: 'judge'; windowVersion: number; state: JevState; discardLine?: string }
   /** Ask Jev whether the wake's landed answer is still wanted; the answer comes back as a `recheck_verdict`. */
   | { kind: 'recheck'; windowVersion: number; wakeKey: string; state: RecheckState }
   /** Fire a `timer` event with `key` after `ms`; a new `wait` with the same key replaces it. */

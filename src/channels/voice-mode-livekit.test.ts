@@ -2623,6 +2623,27 @@ describe('/voice jev on the call core', () => {
     worker.close();
   });
 
+  it.each([
+    [undefined, false, undefined],
+    [true, true, 'Dan, book it, scratch that.'],
+  ] as const)(
+    'asks Jev about spoken commands on a voice call only with jevCommands (%s): %s',
+    async (jevCommands, commands, discardLine) => {
+      await h.stop();
+      const judge = vi.fn(async (..._args: unknown[]) => ({ verdict: null, ms: 0 }));
+      h = await startHarness(
+        { accessCheckIntervalMs: 60_000 },
+        { mirrorApi: chat.api, ...(jevCommands ? { jevCommands } : {}), jev: { judge } },
+      );
+      const worker = await startJevCall();
+      await worker.post('jev', { events: [final('u1', 'Dan, book it, scratch that.')] });
+      await vi.waitFor(() => expect(judge).toHaveBeenCalled());
+      expect(judge.mock.calls[0][1]).toMatchObject({ commands });
+      expect((judge.mock.calls[0][1] as { discardLine?: string }).discardLine).toBe(discardLine);
+      worker.close();
+    },
+  );
+
   it('starts a plain call for jev=1 on a host without the Jev key', async () => {
     jevKey.value = '';
     try {

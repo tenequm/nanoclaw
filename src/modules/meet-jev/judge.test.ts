@@ -564,18 +564,18 @@ describe('the request to Jev', () => {
     expect(judgeQuestions('Dan', undefined, true).action).toStrictEqual(sent.questions.action);
   });
 
-  it("asks a voice call's new_words Noul about the caller's newest line, quoted, beside the shadows", async () => {
+  it("asks a voice call's new_words Noul about the discard line the reducer names, quoted, beside the shadows", async () => {
     const said = {
       ...state,
       latest: { speaker: 'Misha', text: 'Book a table for eight tonight. Dan, scratch that.' },
       window: [
         { t: 3.4, speaker: 'Misha', text: 'Book a table for eight tonight.' },
         { t: 1.1, speaker: 'Misha', text: 'Dan, scratch that.' },
-        { t: 0.2, speaker: 'Misha', text: 'And', partial: true as const },
+        { t: 0.2, speaker: 'Misha', text: '', partial: true as const },
       ],
     };
     const fetchMock = respond({});
-    await askAction(said, { commands: true });
+    await askAction(said, { commands: true, discardLine: 'Dan, scratch that.' });
     const sent = JSON.parse((fetchMock.mock.calls[0] as [string, RequestInit])[1].body as string);
     expect(sent.state).toEqual(said);
     expect(Object.keys(sent.questions)).toEqual([
@@ -600,17 +600,22 @@ describe('the request to Jev', () => {
     expect(judgeQuestions('Dan')).not.toHaveProperty('new_words');
   });
 
-  it('asks no new_words without a finished caller line, nor on a meeting', async () => {
+  it('asks no new_words without a discard line: the voice request is the action Choice and the shadows alone', async () => {
     const fetchMock = respond({});
-    await askAction(
-      { ...state, latest: null, window: [{ t: 1, speaker: 'Dan', text: 'Hello.', agent: true }] },
-      {
-        commands: true,
-      },
-    );
-    await askAction(state);
-    for (const [, init] of fetchMock.mock.calls as [string, RequestInit][])
-      expect(JSON.parse(init.body as string).questions).not.toHaveProperty('new_words');
+    await askAction(state, { commands: true });
+    const sent = JSON.parse((fetchMock.mock.calls[0] as [string, RequestInit])[1].body as string);
+    const { new_words: _template, still_wanted: _recheck, ...asked } = judgeQuestions('Dan', undefined, true);
+    expect(sent.questions).toStrictEqual(asked);
+  });
+
+  it("sends main's four-option request on a voice call with the spoken commands off, even with a discard line", async () => {
+    const fetchMock = respond({});
+    await askAction(state, { commands: false, discardLine: 'Dan, scratch that.' });
+    expect(JSON.parse((fetchMock.mock.calls[0] as [string, RequestInit])[1].body as string)).toStrictEqual({
+      state,
+      model: 'jev-1.14',
+      questions: pinnedActionQuestions,
+    });
   });
 
   it.each([
@@ -621,7 +626,7 @@ describe('the request to Jev', () => {
   ])("reads the new-words answer from %s into a voice call's verdict", async (_label, newWords, expected) => {
     const probabilities = { answer: 0.03, stay_silent: 0.05, stop: 0.12, continue: 0, send: 0, discard: 0.8 };
     respond({ answers: { action: { ...choice, choice: 'discard', probabilities }, new_words: newWords } });
-    const { verdict } = await askAction(state, { commands: true });
+    const { verdict } = await askAction(state, { commands: true, discardLine: 'Dan, scratch that.' });
     expect(verdict).toEqual({
       action: 'discard',
       probabilities,

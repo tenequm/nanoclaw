@@ -23,6 +23,8 @@ export interface Utterance {
   contextOnly?: boolean;
   startedAt: number;
   at: number;
+  /** The text Jev heard only lead into the discard phrase it ends with ("Dan, scratch that"): no words to drop. */
+  leadIn?: string;
 }
 
 /** An agent line and how the caller received it. */
@@ -116,6 +118,8 @@ export interface Judging {
   addressedByName: boolean;
   seq: number;
   retried: boolean;
+  /** The piece the judge's `discardLine` quotes, as quoted: Jev's `newWords` is about it, whatever piece is judged. */
+  discard?: { uttId: string; text: string };
 }
 
 export interface ListenPiece {

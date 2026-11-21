@@ -205,11 +205,13 @@ describe('createJevCall', () => {
   });
 
   it.each([
-    ['voice', true, [[{ type: 'cue', cue: 'nope' }]]],
-    ['meet', false, []],
+    ['voice', true, true, [[{ type: 'cue', cue: 'nope' }]]],
+    // Off, only listening mode's cues reach the worker; the Jev request is main's.
+    ['voice', undefined, false, [[{ type: 'cue', cue: 'nope' }]]],
+    ['meet', true, false, []],
   ] as const)(
-    'asks Jev with the spoken commands and pushes their cues on a %s call only: %s',
-    async (kind, commands, cues) => {
+    'asks Jev with the spoken commands on a %s call with VOICE_MODE_JEV_COMMANDS %s: %s; cues reach a voice worker',
+    async (kind, jevCommands, commands, cues) => {
       const push = vi.fn();
       const judge = vi.fn(async () => ({ verdict: null, ms: 1 }));
       const core: CallCore<null> = {
@@ -219,7 +221,7 @@ describe('createJevCall', () => {
           event.kind === 'reply'
             ? [
                 { kind: 'cue', cue: 'nope' },
-                { kind: 'judge', windowVersion: 1, state: {} as never },
+                { kind: 'judge', windowVersion: 1, state: {} as never, discardLine: 'Andy, scratch that.' },
               ]
             : [],
       };
@@ -227,6 +229,7 @@ describe('createJevCall', () => {
         {
           callId: 'c1',
           kind,
+          jevCommands,
           callerName: 'Ethan',
           agentName: 'Andy',
           agentAliases: [],
@@ -239,7 +242,7 @@ describe('createJevCall', () => {
       );
       call.reply('Hello.', null);
       await flush();
-      expect(judge).toHaveBeenCalledWith({}, expect.objectContaining({ commands }));
+      expect(judge).toHaveBeenCalledWith({}, expect.objectContaining({ commands, discardLine: 'Andy, scratch that.' }));
       expect(push.mock.calls.filter(([event]) => event.type === 'cue')).toEqual(cues);
       call.end('test');
     },

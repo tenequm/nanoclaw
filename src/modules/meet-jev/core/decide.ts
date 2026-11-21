@@ -43,6 +43,7 @@ import {
   type CallState,
   type ListenPiece,
   type Judging,
+  type Utterance,
   type Wake,
 } from './window.js';
 
@@ -639,20 +640,17 @@ function continuationPieces(state: CallState, wake: Wake) {
     .sort((a, b) => a.startedAt - b.startedAt);
 }
 
-/** The speaker's open turn as one text, and whether any of it calls the agent by name with words after. */
-function openTurnOf(state: CallState, speakerId: string): { text: string; named: boolean } {
+/**
+ * The speaker's open turn as one text, whether any of it calls the agent by name with words after, and its newest
+ * piece with words (`line`; a held turn's sent trigger is none).
+ */
+function openTurnOf(state: CallState, speakerId: string): { text: string; named: boolean; line?: Utterance } {
   const wake = latestWake(state);
-  const pieces =
-    wake?.continuation && wake.speakerId === speakerId
-      ? [
-          wake.trigger,
-          ...continuationPieces(state, wake)
-            .filter((u) => hasWords(u.text))
-            .map((u) => u.text),
-        ]
-      : openTurn(state, speakerId).map((utterance) => utterance.text);
+  const held = wake?.continuation && wake.speakerId === speakerId;
+  const said = (held ? continuationPieces(state, wake) : openTurn(state, speakerId)).filter((u) => hasWords(u.text));
+  const pieces = [...(held ? [wake.trigger] : []), ...said.map((u) => u.text)];
   const text = pieces.join(' ');
-  return { text, named: [...pieces, text].some((said) => addressedByName(state, said)) };
+  return { text, named: [...pieces, text].some((piece) => addressedByName(state, piece)), line: said.at(-1) };
 }
 
 /** The agent called by name with words after it ("Dan, ..."), not the name alone. */
@@ -666,7 +664,10 @@ function judge(state: CallState, speakerId: string, uttId: string, retried: bool
   if (previous && previous.speakerId !== speakerId && continuationFor(state, previous.speakerId)) {
     unmarkHandled(state.speakers[previous.speakerId], previous.uttId);
   }
-  const { text: trigger, named } = openTurnOf(state, speakerId);
+  const { text: trigger, named, line } = openTurnOf(state, speakerId);
+  // The line Jev's `newWords` is asked about is named here, so the piece it blanks is the piece Jev read.
+  const said = state.policy.newWords && line && spokenCommand(line.text, state.policy);
+  const discard = said?.command === 'discard' && hasWords(said.rest) ? line : undefined;
   state.judging = {
     version: state.windowVersion,
     speakerId,
@@ -675,12 +676,14 @@ function judge(state: CallState, speakerId: string, uttId: string, retried: bool
     addressedByName: named,
     seq: state.seq,
     retried,
+    ...(discard ? { discard: { uttId: discard.uttId, text: discard.text } } : {}),
   };
   const latest = { speaker: state.speakers[speakerId]?.name ?? speakerId, text: trigger };
   state.commands.push({
     kind: 'judge',
     windowVersion: state.windowVersion,
     state: toJevState(state, latest, named),
+    ...(discard ? { discardLine: discard.text } : {}),
   });
 }
 
@@ -691,6 +694,8 @@ function onVerdict(state: CallState, version: number, verdict: Verdict | null, m
     return;
   }
   state.judging = null;
+  // About the line's words alone: it holds whether or not this verdict is acted on.
+  markLeadIn(state, judging, verdict?.newWords);
   const speaker = state.speakers[judging.speakerId];
   const trigger = { trigger: judging.trigger, speaker: speaker?.name };
 
@@ -765,11 +770,23 @@ function onVerdict(state: CallState, version: number, verdict: Verdict | null, m
 }
 
 /**
- * The caller's words not sent to the agent yet, with the command they end with stripped: a held turn's pieces after
- * its trigger, or else everything since their last closed turn or the agent's last line. `leadInOnly`: the words
- * before a discard phrase in the judged piece only lead into it ("Dan, scratch that"), no words to drop.
+ * Jev's `newWords` about the line it was asked about, kept on that piece while its text is unchanged: under the bar its
+ * words only lead into the discard ("Dan, scratch that"), also for a later discard that finds it still unsent.
  */
-function unsentWords(state: CallState, judging: Judging, command: CommandAction, leadInOnly = false): string {
+function markLeadIn(state: CallState, judging: Judging, newWords: number | undefined): void {
+  const bar = state.policy.newWords?.p;
+  const utt = judging.discard && utteranceOf(state, judging.speakerId, judging.discard.uttId);
+  if (!utt || utt.text !== judging.discard?.text || newWords === undefined || bar === undefined) return;
+  if (newWords < bar) utt.leadIn = utt.text;
+  else delete utt.leadIn;
+}
+
+/**
+ * The caller's words not sent to the agent yet, with the command they end with stripped: a held turn's pieces after
+ * its trigger, or else everything since their last closed turn or the agent's last line. A piece Jev heard only lead
+ * into its discard phrase has no words to drop.
+ */
+function unsentWords(state: CallState, judging: Judging, command: CommandAction): string {
   const { speakerId } = judging;
   const held = continuationFor(state, speakerId);
   const closedAt = Math.max(
@@ -795,7 +812,7 @@ function unsentWords(state: CallState, judging: Judging, command: CommandAction,
   for (let i = texts.length - 1; i >= 0; i--) {
     const said = spokenCommand(texts[i], state.policy);
     if (said?.command !== command) break;
-    texts[i] = leadInOnly && kept[i].uttId === judging.uttId ? '' : said.rest;
+    texts[i] = kept[i].leadIn === kept[i].text ? '' : said.rest;
     if (hasWords(texts[i])) break;
   }
   return texts.filter(hasWords).join(' ');
@@ -856,13 +873,12 @@ function sendUnsent(state: CallState, judging: Judging): boolean {
  * answer on its way to that turn still plays. With no such words, an answer pending or playing is withdrawn as by a
  * stop (queued lines revoked, a reply still to come shown only). With neither, false and the `nope` cue.
  *
- * Words before the phrase in the judged piece count only when Jev's `newWords` clears its bar: under it they lead
- * into the take-back ("Dan, scratch that"). Without that answer they count, so no answer is taken back on a guess.
+ * Words before the phrase in a line Jev was asked about count only when its `newWords` cleared its bar: under it
+ * they lead into the take-back ("Dan, scratch that"). Without that answer they count, so no answer is taken back on a
+ * guess.
  */
 function discardUnsent(state: CallState, judging: Judging, newWords: number | undefined): boolean {
-  const bar = state.policy.newWords?.p;
-  const leadInOnly = newWords !== undefined && bar !== undefined && newWords < bar;
-  const dropped = hasWords(unsentWords(state, judging, 'discard', leadInOnly));
+  const dropped = hasWords(unsentWords(state, judging, 'discard'));
   const withdrawn = !dropped && (agentSpeaking(state) || pendingAnswer(state));
   const revoked: string[] = [];
   if (withdrawn) {
