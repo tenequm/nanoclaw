@@ -5484,6 +5484,10 @@ export class JevLoop {
       (err: unknown) => {
         this.deps.log.warn('voice-mode worker: an utterance has no final', { err });
         if (audio) this.deps.recorded?.(utterance.segment, audio, utterance.text, 'stt');
+        if (utterance.text && !this.heardSpeech(utterance, utterance.text)) {
+          this.ignoreNoise(utterance, utterance.text);
+          return;
+        }
         if (beforePlayback && !utterance.phoneWords) this.finishUtterance(utterance, utterance.text);
         utterance.needsPhoneFinal = true;
         // No final will come: a keep on its partial is its last word.
@@ -5569,7 +5573,10 @@ export class JevLoop {
   /** A segment whose words had no evidence of real speech: logged for tuning, and otherwise a wordless sound. */
   private ignoreNoise(utterance: JevUtterance, text: string): void {
     utterance.noise = true;
-    utterance.needsPhoneFinal = false;
+    utterance.needsPhoneFinal = true;
+    // Settle the host's placeholder even if the local overlap still holds unverified words.
+    if (!this.closed)
+      this.deps.report({ type: 'utterance', uttId: utterance.uttId, text: '', final: true, at: this.now() });
     const { strong, peak, voiced } = evidenceOf(utterance);
     this.deps.log.info('voice-mode worker: noise segment ignored', {
       text,
@@ -5849,7 +5856,7 @@ export class JevLoop {
       if (this.overlap?.utterance !== utterance && !utterance.releasing && utterance.keptText !== spokenKey(text))
         utterance.contextOnly = false;
     }
-    if (this.deps.speechEvidence) {
+    if (this.deps.speechEvidence && text) {
       const { strong, peak, voiced } = evidenceOf(utterance);
       this.deps.log.info('voice-mode worker: utterance evidence', {
         segment: utterance.segment,
