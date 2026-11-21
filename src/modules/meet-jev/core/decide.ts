@@ -714,8 +714,11 @@ function onVerdict(state: CallState, version: number, verdict: Verdict | null, m
     ms,
     action,
   });
-  if (action === 'stop') stop(state);
-  else if (action === 'answer') wake(state, judging.speakerId, judging.uttId, judging.trigger);
+  if (action === 'stop') {
+    stop(state);
+    // A discard turned stop still withdraws the caller's unsent words: they never join a later turn.
+    if (verdict.action === 'discard') closeTurn(state, judging);
+  } else if (action === 'answer') wake(state, judging.speakerId, judging.uttId, judging.trigger);
   else if (action === 'continue') {
     const cutOff = `You were cut off after "${state.cutOffAfter ?? ''}"; ${speaker?.name ?? 'the caller'} asked you to go on. Continue briefly from there.`;
     wake(state, judging.speakerId, judging.uttId, judging.trigger, cutOff);
@@ -743,29 +746,40 @@ function unsentWords(state: CallState, speakerId: string, command: 'send' | 'dis
     : state.utterances
         .filter((u) => u.speakerId === speakerId && u.startedAt > closedAt)
         .sort((a, b) => a.startedAt - b.startedAt);
-  const text = pieces
-    .filter((u) => !u.contextOnly && hasWords(u.text))
-    .map((u) => u.text)
-    .join(' ');
-  const rest = spokenCommand(text, state.policy);
-  return rest?.command === command ? rest.rest : text;
+  const texts = pieces.filter((u) => !u.contextOnly && hasWords(u.text)).map((u) => u.text);
+  // A piece boundary is a sentence boundary: the command is stripped from the pieces it ends, never across a join.
+  for (let i = texts.length - 1; i >= 0; i--) {
+    const said = spokenCommand(texts[i], state.policy);
+    if (said?.command !== command) break;
+    texts[i] = said.rest;
+    if (hasWords(said.rest)) break;
+  }
+  return texts.filter(hasWords).join(' ');
 }
 
 /**
  * Jev heard the caller end their turn with a send word: the unsent words go to the agent now (with a held turn's
- * trigger, which the new turn replaces), with the `sent` cue. False, with the `nope` cue, when nothing is unsent.
+ * trigger, which the new turn replaces), with the `sent` cue. With nothing unsent, a turn of theirs still on its way
+ * is confirmed (`sent`, its answer plays without a recheck); with none either, false and the `nope` cue.
  */
 function sendUnsent(state: CallState, judging: Judging): boolean {
   const words = unsentWords(state, judging.speakerId, 'send');
-  log(state, 'command', { command: 'send', outcome: hasWords(words) ? 'sent' : 'nothing' });
-  if (!hasWords(words)) {
-    closeTurn(state, judging);
+  const pending = hasWords(words) ? undefined : unstartedWake(state, judging.speakerId);
+  log(state, 'command', { command: 'send', outcome: hasWords(words) ? 'sent' : pending ? 'confirmed' : 'nothing' });
+  if (hasWords(words)) {
+    const held = continuationFor(state, judging.speakerId);
+    cue(state, 'sent');
+    wake(state, judging.speakerId, judging.uttId, held ? `${held.trigger} ${words}` : words);
+    return true;
+  }
+  closeTurn(state, judging);
+  if (!pending) {
     cue(state, 'nope');
     return false;
   }
-  const held = continuationFor(state, judging.speakerId);
+  pending.rechecked = { outcome: 'speak', since: sinceTrigger(state, pending) };
   cue(state, 'sent');
-  wake(state, judging.speakerId, judging.uttId, held ? `${held.trigger} ${words}` : words);
+  if (pending.continuation) release(state, pending);
   return true;
 }
 
@@ -892,6 +906,7 @@ function chosen(state: CallState, verdict: Verdict, addressedByName: boolean): A
   const alone = humansInRoom(state) <= 1;
   const lowRisk = alone || addressedByName;
   const busy = agentSpeaking(state) || pendingAnswer(state);
+  const p = (action: Action) => verdict.probabilities[action] ?? 0;
   const over = (action: Exclude<Action, 'stay_silent'>) => {
     const threshold =
       action === 'answer' && lowRisk
@@ -899,13 +914,23 @@ function chosen(state: CallState, verdict: Verdict, addressedByName: boolean): A
         : action === 'continue' && alone
           ? oneCaller.continue
           : thresholds[action];
-    return !!threshold && verdict.action === action && (verdict.probabilities[action] ?? 0) >= threshold.p;
+    return !!threshold && verdict.action === action && p(action) >= threshold.p;
   };
+  // Jev splits a withdrawal of the pending answer between `stop` and `discard`: the pair shares the stop bar. Once
+  // the answer has started, a discard has nothing unstarted to take back, so it stops the answer instead.
+  if (
+    busy &&
+    thresholds.discard &&
+    (verdict.action === 'stop' || verdict.action === 'discard') &&
+    p('stop') + p('discard') >= thresholds.stop.p
+  )
+    return verdict.action === 'discard' && !agentSpeaking(state) && !latestWake(state)?.started ? 'discard' : 'stop';
   if (busy && over('stop')) return 'stop';
   if (state.cutOffAfter !== null && !agentSpeaking(state) && over('continue')) return 'continue';
   // The spoken commands, offered on a voice call only (their thresholds with them).
   if (over('discard')) return 'discard';
-  if (over('send')) return 'send';
+  // A send word after the turn's words splits Jev's probability between `send` and `answer` the same way.
+  if (thresholds.send && verdict.action === 'send' && p('send') + p('answer') >= thresholds.send.p) return 'send';
   if (over('answer')) return 'answer';
   // One human has nobody else to talk to: a fair chance of `answer` is enough while the agent is idle.
   if (
