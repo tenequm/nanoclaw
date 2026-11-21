@@ -24,6 +24,10 @@ class Call {
   logs: Extract<Command, { kind: 'log' }>[] = [];
   statuses: Extract<Command, { kind: 'status' }>[] = [];
   private at = 1_000;
+  /** Armed `wait`s and when each comes due; a re-armed key replaces its timer, as the runtime does. */
+  private timers = new Map<string, number>();
+  /** Fire every due timer, earliest first, before each fed event, as the runtime would. */
+  realTimers = false;
 
   constructor(kind: CallKind = 'voice') {
     this.state = callCore.initial(policyFor(kind, 'Dan', ['Ден']), 0);
@@ -33,14 +37,35 @@ class Call {
   feed(...events: Fed[]): Command[] {
     const out: Command[] = [];
     for (const partial of events) {
-      this.at = partial.at ?? this.at + 100;
-      const event = { ...partial, at: this.at } as CallEvent;
-      this.state = callCore.reduce(this.state, event);
-      for (const command of callCore.decide(this.state, event)) {
-        if (command.kind === 'log') this.logs.push(command);
-        else if (command.kind === 'status') this.statuses.push(command);
-        else out.push(command);
-      }
+      const at = partial.at ?? this.at + 100;
+      if (this.realTimers) out.push(...this.until(at));
+      this.at = at;
+      out.push(...this.reduce({ ...partial, at } as CallEvent));
+    }
+    return out;
+  }
+
+  /** Fire the timers due by `at` in the order they come due; returns their action commands. */
+  until(at: number): Command[] {
+    const out: Command[] = [];
+    for (;;) {
+      const [next] = [...this.timers].filter(([, due]) => due <= at).sort((a, b) => a[1] - b[1]);
+      if (!next) return out;
+      this.at = Math.max(this.at, next[1]);
+      out.push(...this.reduce({ kind: 'timer', key: next[0], at: this.at }));
+    }
+  }
+
+  private reduce(event: CallEvent): Command[] {
+    const out: Command[] = [];
+    if (event.kind === 'timer') this.timers.delete(event.key);
+    this.state = callCore.reduce(this.state, event);
+    for (const command of callCore.decide(this.state, event)) {
+      if (command.kind === 'wait') this.timers.set(command.key, event.at + command.ms);
+      if (command.kind === 'cancel_wait') this.timers.delete(command.key);
+      if (command.kind === 'log') this.logs.push(command);
+      else if (command.kind === 'status') this.statuses.push(command);
+      else out.push(command);
     }
     return out;
   }
@@ -1416,35 +1441,86 @@ describe('continuing a turn before playback', () => {
     expect(only(call.verdict(judge.windowVersion, 'answer'), 'revoke').map((c) => c.replyId)).toEqual(['r1']);
   });
 
-  it("in a meeting, decides a held speaker's words and cough that ended while another spoke, once the floor is free", () => {
+  it.each([
+    ['words', false, 'I think the web one shipped on Monday'],
+    ['words and a cough', true, 'I think the web one shipped on Monday'],
+    ['words and a cough, the other sound wordless', true, null],
+  ] as const)(
+    "in a meeting, a held speaker's %s under another speaker wait for the floor, then the merged turn is judged",
+    (_, cough, olenaSays) => {
+      const call = new Call('meet');
+      call.realTimers = true;
+      call.feed({ kind: 'presence', speaker: olena, joined: true }, { kind: 'presence', speaker, joined: true });
+      call.sayAnswered(speaker, 'a', 'Can you check the release notes');
+      call.feed({ kind: 'turn', key: 'w1', turnId: 't1' }, { kind: 'speech', speaker, on: true, uttId: 'b' });
+      const quietAt = call.state.now + 6_000;
+      const underOlena = call.feed(
+        reply,
+        ready(),
+        { kind: 'speech', speaker: olena, on: true },
+        { kind: 'speech', speaker, on: false },
+        say('b', 'for the mobile app'),
+        ...(cough
+          ? ([
+              { kind: 'speech', speaker, on: true, uttId: 'c' },
+              { kind: 'speech', speaker, on: false },
+              say('c', ''),
+            ] as Fed[])
+          : []),
+        // Olena talks on, well past the hold's 3 s.
+        { kind: 'speech', speaker: olena, on: false, at: quietAt },
+      );
+      // Nothing is released into the answer-ready check or played while Olena has the floor.
+      expect(underOlena.filter((c) => c.kind !== 'wait')).toEqual([speakR1]);
+      const merged = 'Can you check the release notes for the mobile app';
+      let judges: Extract<Command, { kind: 'judge' }>[];
+      if (olenaSays) {
+        const [olenaJudge] = only(
+          call.feed({ kind: 'utterance', speaker: olena, uttId: 'o1', text: olenaSays, final: true }),
+          'judge',
+        );
+        expect(olenaJudge.state.latest?.text).toBe(olenaSays);
+        judges = only(call.verdict(olenaJudge.windowVersion, 'stay_silent'), 'judge');
+      } else {
+        // Olena's sound had no words: her boundary or the hold's bound, whichever comes first, decides the held turn.
+        judges = only(call.until(call.state.now + 5_000), 'judge');
+      }
+      expect(judges.map((j) => j.state.latest?.text)).toEqual([merged]);
+      const result = call.verdict(judges[0].windowVersion, 'answer');
+      expect(only(result, 'revoke').map((c) => c.replyId)).toEqual(['r1']);
+      expect(only(result, 'turn').map((c) => c.message)).toEqual([merged]);
+    },
+  );
+
+  it("in a meeting, a held speaker's addition judged stay_silent after the floor freed releases the answer 3 s later", () => {
     const call = new Call('meet');
+    call.realTimers = true;
     call.feed({ kind: 'presence', speaker: olena, joined: true }, { kind: 'presence', speaker, joined: true });
     call.sayAnswered(speaker, 'a', 'Can you check the release notes');
     call.feed({ kind: 'turn', key: 'w1', turnId: 't1' }, { kind: 'speech', speaker, on: true, uttId: 'b' });
-    expect(call.feed(reply, ready())).toEqual([speakR1]);
-    call.feed({ kind: 'speech', speaker: olena, on: true }, { kind: 'speech', speaker, on: false });
-    // Deferred for the floor; the hold is bounded meanwhile.
-    expect(only(call.feed(say('b', 'for the mobile app')), 'wait')).toEqual([
-      { kind: 'wait', key: 'hold:w1', ms: 3000 },
-    ]);
-    call.feed({ kind: 'speech', speaker, on: true, uttId: 'c' }, { kind: 'speech', speaker, on: false });
-    expect(only(call.feed(say('c', '')), 'judge')).toEqual([]);
-    // Olena's sound had no words: her boundary is her fallback timer.
-    const [olenaTimer] = only(call.feed({ kind: 'speech', speaker: olena, on: false }), 'wait');
-    const [judge] = only(call.feed({ kind: 'timer', key: olenaTimer.key }), 'judge');
-    expect(judge?.state.latest?.text).toBe('Can you check the release notes for the mobile app');
+    const quietAt = call.state.now + 6_000;
+    call.feed(
+      reply,
+      ready(),
+      { kind: 'speech', speaker: olena, on: true },
+      { kind: 'speech', speaker, on: false },
+      say('b', 'for the mobile app'),
+      { kind: 'speech', speaker: olena, on: false, at: quietAt },
+    );
+    const [judge] = only(call.until(call.state.now + 5_000), 'judge');
     expect(call.verdict(judge.windowVersion, 'stay_silent')).toEqual([{ kind: 'wait', key: 'hold:w1', ms: 3000 }]);
-    expect(only(call.feed({ kind: 'timer', key: 'hold:w1' }), 'recheck')).toHaveLength(1);
+    expect(only(call.until(call.state.now + 3_000), 'recheck')).toHaveLength(1);
   });
 
-  it('bounds a hold whose last words were held over an older playing line (context only)', () => {
+  it('bounds a hold whose last words were held over an older playing line (context only) from their final', () => {
     const call = new Call();
+    call.realTimers = true;
     wakeAndSpeak(call, 'Read me the news.', 'First, the weather.', 1);
     // An interjection between two lines of the answer, judged a new turn.
     call.sayAnswered(misha, 'u2', 'And the traffic?');
     call.feed({ kind: 'turn', key: 'w2', turnId: 't2' }, { kind: 'speech', speaker: misha, on: true, uttId: 'u3' });
-    const [boundaryTimer] = only(call.feed({ kind: 'speech', speaker: misha, on: false }), 'wait');
-    call.feed({
+    call.feed({ kind: 'speech', speaker: misha, on: false });
+    const settled = call.feed({
       kind: 'utterance',
       speaker: misha,
       uttId: 'u3',
@@ -1452,12 +1528,11 @@ describe('continuing a turn before playback', () => {
       final: true,
       contextOnly: true,
     });
+    expect(only(settled, 'wait')).toEqual([{ kind: 'wait', key: 'hold:w2', ms: 3000 }]);
     call.feed({ kind: 'reply', replyId: 'r2', turnId: 't2', text: 'Traffic is light.' });
     expect(call.feed({ kind: 'play_ready', replyId: 'r2', requestId: 'q2' })).toEqual([]);
-    expect(only(call.feed({ kind: 'timer', key: boundaryTimer.key }), 'wait')).toEqual([
-      { kind: 'wait', key: 'hold:w2', ms: 3000 },
-    ]);
-    expect(only(call.feed({ kind: 'timer', key: 'hold:w2' }), 'recheck').map((c) => c.wakeKey)).toEqual(['w2']);
+    // Three seconds after the final, before the boundary's fallback timer.
+    expect(only(call.until(call.state.now + 2_800), 'recheck').map((c) => c.wakeKey)).toEqual(['w2']);
   });
 
   it('a late final with the words its timer already settled does not hold the released answer again', () => {
@@ -1487,16 +1562,56 @@ describe('continuing a turn before playback', () => {
     expect(only(call.feed({ kind: 'timer', key: 'hold:w1' }), 'recheck')).toHaveLength(1);
   });
 
-  it('a cough while the merged turn is judged keeps that verdict, which still ends the hold', () => {
+  it('a cough while the merged turn is judged asks Jev again on it, and that verdict ends the hold', () => {
     const call = resumed();
     call.feed({ kind: 'speech', speaker, on: false }, reply, ready());
     const [judge] = only(call.feed(say('b', 'the opening hours')), 'judge');
     call.feed({ kind: 'speech', speaker, on: true, uttId: 'c' }, { kind: 'speech', speaker, on: false });
-    expect(only(call.feed(say('c', '')), 'judge')).toEqual([]);
-    expect(only(call.verdict(judge.windowVersion, 'stay_silent'), 'wait')).toEqual([
+    const [again] = only(call.feed(say('c', '')), 'judge');
+    expect(again.state.latest?.text).toBe('Can you check the opening hours');
+    expect(call.verdict(judge.windowVersion, 'stay_silent')).toEqual([]);
+    expect(only(call.verdict(again.windowVersion, 'stay_silent'), 'wait')).toEqual([
       { kind: 'wait', key: 'hold:w1', ms: 3000 },
     ]);
     expect(only(call.feed({ kind: 'timer', key: 'hold:w1' }), 'recheck')).toHaveLength(1);
+  });
+
+  it.each([
+    ['starts and ends before the verdict', 'before'],
+    ['is still on when the verdict lands', 'during'],
+    ['has ended without its empty final when the verdict lands', 'unsettled'],
+  ] as const)('a wordless sound that %s does not lose the answer to the merged turn', (_, when) => {
+    const call = resumed();
+    call.realTimers = true;
+    call.feed({ kind: 'speech', speaker, on: false }, reply, ready());
+    const [judge] = only(call.feed(say('b', 'the opening hours')), 'judge');
+    const out: Command[] = [];
+    const verdict = () => out.push(...call.verdict(judge.windowVersion, 'answer'));
+    out.push(...call.feed({ kind: 'speech', speaker, on: true, uttId: 'c' }));
+    if (when === 'during') verdict();
+    out.push(...call.feed({ kind: 'speech', speaker, on: false }));
+    if (when === 'unsettled') verdict();
+    out.push(...call.feed(say('c', '')));
+    if (when === 'before') verdict();
+    // Jev answers whatever it is asked again.
+    for (let i = 0; call.state.judging && i < 3; i++) out.push(...call.verdict(call.state.judging.version, 'answer'));
+    out.push(...call.until(call.state.now + 10_000));
+    expect(only(out, 'recheck')).toEqual([]);
+    expect(only(out, 'allow_play')).toEqual([]);
+    expect(only(out, 'revoke').map((c) => c.replyId)).toEqual(['r1']);
+    expect(only(out, 'turn').map((c) => c.message)).toEqual(['Can you check the opening hours']);
+  });
+
+  it('a hold re-opened after its release waits its full quiet again', () => {
+    const { call } = heldAfter('stay_silent');
+    expect(only(call.feed({ kind: 'timer', key: 'hold:w1' }), 'recheck')).toHaveLength(1);
+    call.feed(
+      { kind: 'speech', speaker, on: true, uttId: 'c', at: 20_000 },
+      { kind: 'speech', speaker, on: false, at: 20_500 },
+    );
+    expect(only(call.feed({ kind: 'utterance', speaker, uttId: 'c', text: '', final: true }), 'wait')).toEqual([
+      { kind: 'wait', key: 'hold:w1', ms: 3000 },
+    ]);
   });
 
   it('a further reply to a multi-message older turn, written after the newer turn was stored, is spoken for it', () => {

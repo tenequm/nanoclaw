@@ -82,7 +82,7 @@ export interface Wake {
   started?: boolean;
   /** The speaker is finishing the pending turn: its lines get no playback grant until that turn's boundary decides. */
   continuation?: true;
-  /** The merged turn text the last judge during a hold was asked on: a wordless piece that leaves it is not re-asked. */
+  /** The merged turn a verdict during the hold found needs no new answer: a wordless piece leaving it asks nothing. */
   judged?: string;
   /** When the hold is released at the latest without a new verdict (`now` clock). */
   holdUntil?: number;

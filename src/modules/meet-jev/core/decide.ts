@@ -101,7 +101,12 @@ export function reduce(prev: CallState, event: CallEvent): CallState {
         capturePiece(state, event.speaker.id, event.uttId, event);
         break;
       }
-      if (event.contextOnly) break;
+      if (event.contextOnly) {
+        // Words held over an older line settle a held piece too: its bounded hold starts from this final.
+        if (event.final && continuationFor(state, event.speaker.id) && !stillSpeaking(state, event.speaker.id))
+          boundary(state, event.speaker.id);
+        break;
+      }
       if (event.final && hasWords(event.text)) out.push({ kind: 'status', status: 'heard' });
       // An older final can settle the last open piece of a pending turn.
       if (
@@ -155,13 +160,13 @@ export function reduce(prev: CallState, event: CallEvent): CallState {
         boundary(state, speakerId);
       } else if (event.key.startsWith(HOLD_TIMER)) {
         const held = latestWake(state);
-        if (
-          held?.continuation &&
-          event.key === HOLD_TIMER + held.key &&
-          !stillSpeaking(state, held.speakerId) &&
-          state.judging?.speakerId !== held.speakerId &&
-          continuationPieces(state, held).every((u) => u.final)
-        )
+        // The held speaker's own speech is timed again by their next boundary.
+        if (!held?.continuation || event.key !== HOLD_TIMER + held.key || stillSpeaking(state, held.speakerId)) break;
+        // The quiet counts only with the floor free: another speaker's turn is decided first.
+        if (floorTaken(state)) holdBriefly(state, held.speakerId);
+        // Words deferred for the floor are decided with the merged turn before anything is released.
+        else if (state.deferred?.speakerId === held.speakerId) decideDeferred(state);
+        else if (state.judging?.speakerId !== held.speakerId && continuationPieces(state, held).every((u) => u.final))
           release(state, held);
       }
       break;
@@ -218,7 +223,7 @@ export function reduce(prev: CallState, event: CallEvent): CallState {
       break;
   }
   const pending = latestWake(state);
-  if (pending?.continuation && !pendingAnswer(state)) delete pending.continuation;
+  if (pending?.continuation && !pendingAnswer(state)) endHold(pending);
   if (!pending?.continuation) {
     for (const [replyId, line] of Object.entries(state.playout)) {
       if (!line.requestId || line.held) continue;
@@ -287,7 +292,7 @@ function setListening(state: CallState, on: boolean): void {
     // Lines held for the continuation are queued already and play once it ends; the rest are spoken now.
     const held = state.recheck?.replies ?? [];
     state.recheck = null;
-    delete wake.continuation;
+    endHold(wake);
     for (const reply of held) {
       const line = state.playout[reply.replyId];
       if (line) delete line.held;
@@ -467,11 +472,11 @@ function boundary(state: CallState, speakerId: string): void {
   if (hasWords(current.text)) {
     if (!decideLatest(state, speakerId)) decideDeferred(state);
   } else if (floorTaken(state)) {
-    // Decided again through this boundary once the floor is free.
-    state.deferred = { speakerId, uttId: current.uttId };
+    // Decided again through this boundary once the floor is free; a worded piece deferred before it stays.
+    if (state.deferred?.speakerId !== speakerId) state.deferred = { speakerId, uttId: current.uttId };
   } else if (!isHandled(speaker, current.uttId)) {
     // A wordless last activity can settle after a substantive fragment from the same turn; it adds nothing to a
-    // merged turn Jev already judged.
+    // merged turn Jev already found needs no new answer.
     markHandled(speaker, current.uttId);
     if (openTurnOf(state, speakerId).text !== wake.judged) judge(state, speakerId, current.uttId, false);
   }
@@ -579,8 +584,6 @@ function judge(state: CallState, speakerId: string, uttId: string, retried: bool
     unmarkHandled(state.speakers[previous.speakerId], previous.uttId);
   }
   const { text: trigger, named } = openTurnOf(state, speakerId);
-  const held = continuationFor(state, speakerId);
-  if (held) held.judged = trigger;
   state.judging = {
     version: state.windowVersion,
     speakerId,
@@ -621,12 +624,7 @@ function onVerdict(state: CallState, version: number, verdict: Verdict | null, m
   const wakeInProgress = latestWake(state);
   if (wakeInProgress?.continuation && wakeInProgress.speakerId === judging.speakerId) {
     const current = latestUtterance(state, judging.speakerId);
-    // A later piece with words is judged at its own boundary; a wordless one leaves the judged text as it was.
-    if (
-      !current?.final ||
-      (current.uttId !== judging.uttId && openTurnOf(state, judging.speakerId).text !== judging.trigger)
-    )
-      return;
+    if (!current?.final || current.uttId !== judging.uttId) return;
   }
   if (version !== state.windowVersion) {
     const wokeSince = state.wakes.some((w) => w.seq > judging.seq);
@@ -666,7 +664,11 @@ function onVerdict(state: CallState, version: number, verdict: Verdict | null, m
   else if (action === 'continue') {
     const cutOff = `You were cut off after "${state.cutOffAfter ?? ''}"; ${speaker?.name ?? 'the caller'} asked you to go on. Continue briefly from there.`;
     wake(state, judging.speakerId, judging.uttId, judging.trigger, cutOff);
-  } else holdBriefly(state, judging.speakerId);
+  } else {
+    const held = continuationFor(state, judging.speakerId);
+    if (held) held.judged = judging.trigger;
+    holdBriefly(state, judging.speakerId);
+  }
 }
 
 /**
@@ -680,12 +682,18 @@ function holdBriefly(state: CallState, speakerId: string, fresh = true): void {
   state.commands.push({ kind: 'wait', key: HOLD_TIMER + held.key, ms: Math.max(0, held.holdUntil - state.now) });
 }
 
+/** The hold on a wake ends: a hold opened again later gets its full quiet. */
+function endHold(wake: Wake): void {
+  delete wake.continuation;
+  delete wake.holdUntil;
+}
+
 /**
  * The hold on a wake ends without a new turn: its queued lines play, after the answer-ready check when people
  * spoke since the trigger.
  */
 function release(state: CallState, wake: Wake): void {
-  delete wake.continuation;
+  endHold(wake);
   // A granted line is on its way to the room: nothing to hold back.
   const queued = Object.entries(state.playout).filter(
     ([replyId, line]) =>
@@ -968,7 +976,7 @@ function onRecheck(state: CallState, wakeKey: string, verdict: RecheckVerdict | 
  */
 function endRecheck(state: CallState, reason: 'stopped' | 'replaced'): void {
   const wake = latestWake(state);
-  if (wake) delete wake.continuation;
+  if (wake) endHold(wake);
   const recheck = state.recheck;
   if (!recheck) return;
   state.recheck = null;
