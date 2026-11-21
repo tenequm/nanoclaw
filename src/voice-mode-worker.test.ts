@@ -8454,6 +8454,82 @@ describe('jev calls', () => {
     }
   });
 
+  it('plays the command cues of a listen draft: discard drops it, a lone send word is nope, a release is sent', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    const { ctx } = fakeJob({ ...JEV_META, appCall: true, overWords: [...OVER_WORDS] });
+    const submitTurn = vi.fn(async () => ({ ok: true as const, turnId: 't1' }));
+    const judge = vi.fn(async () => ({ verdict: null, ms: 0 }));
+    const call = createJevCall(
+      {
+        callId: 'listen-cues',
+        callerName: 'Caller',
+        agentName: 'Dan',
+        agentAliases: [],
+        maxTextBytes: 4096,
+        now: Date.now,
+        submitTurn,
+        push: (event) => host.emit(event),
+      },
+      { judge, recheck: judge },
+    );
+    const host = fakeHostFetch(200, 202, call);
+    const v = fakeVoice();
+    const played = () => v.voice.playCue.mock.calls.map(([kind]) => kind).filter((kind) => kind !== 'listening');
+    let start = 0;
+    const segment = async (text: string) => {
+      v.events.onSpeech(true, start);
+      v.interim(text);
+      v.transcription.results.push(heard('', text));
+      v.events.onSpeech(false, start + 16000);
+      start += 32000;
+      await vi.advanceTimersByTimeAsync(1);
+    };
+    await runCall(ctx, callDeps(host.fetchImpl, v));
+    try {
+      await v.rpc('settings', { listenUntilOver: true });
+      await segment('Book a table.');
+      await segment('For eight, scratch that.');
+      expect(played()).toEqual(['discard']);
+      await segment('Zulu.');
+      expect(played()).toEqual(['discard', 'nope']);
+      await segment('Call Anna, zulu.');
+      expect(submitTurn).toHaveBeenCalledExactlyOnceWith('Call Anna', expect.any(String), expect.any(AbortSignal));
+      await vi.advanceTimersByTimeAsync(1);
+      expect(played()).toEqual(['discard', 'nope', 'sent']);
+      expect(judge).not.toHaveBeenCalled();
+    } finally {
+      call.end('done');
+      host.emit({ type: 'end', reason: 'done' });
+      await vi.advanceTimersByTimeAsync(1);
+    }
+  });
+
+  it("plays a command cue the host names, listening or not, and no cue that is not the host's to ask for", async () => {
+    const { ctx } = fakeJob({ ...JEV_META, appCall: true, overWords: [...OVER_WORDS] });
+    const host = fakeHostFetch();
+    const v = fakeVoice();
+    const played = () => v.voice.playCue.mock.calls.map(([kind]) => kind).filter((kind) => kind !== 'listening');
+    await runCall(ctx, callDeps(host.fetchImpl, v));
+    host.emit({ type: 'cue', cue: 'turn' });
+    host.emit({ type: 'cue', cue: 'sent' });
+    await vi.waitFor(() => expect(played()).toEqual(['sent']));
+    await v.rpc('settings', { listenUntilOver: true });
+    host.emit({ type: 'cue', cue: 'discard' });
+    host.emit({ type: 'cue', cue: 'nope' });
+    await vi.waitFor(() => expect(played()).toEqual(['sent', 'discard', 'nope']));
+    host.endStream();
+  });
+
+  it('gives a jev voice call the transcription vocabulary of a plain call: the names and the commands', async () => {
+    const { ctx } = fakeJob({ ...JEV_META });
+    const host = fakeHostFetch();
+    const v = fakeVoice();
+    const make = vi.fn(() => v.transcription);
+    await runCall(ctx, { ...callDeps(host.fetchImpl, v), transcriber: make });
+    expect(make).toHaveBeenCalledWith(expect.objectContaining({ vocabulary: ['NanoClaw', ...COMMAND_VOCABULARY] }));
+    host.endStream();
+  });
+
   it('plays the pending answer as soon as a passing car is dismissed', async () => {
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
     const { ctx } = fakeJob({ ...JEV_META, jevSpeechGate: true, jevOverlapVerdict: true });

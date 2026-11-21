@@ -124,7 +124,8 @@ export interface ListenPiece {
   interrupted: boolean;
   /** A timer will settle this activity if its final is lost. */
   settling?: true;
-  releases?: boolean;
+  /** The piece ends with a spoken command: `send` releases the draft through it, `discard` drops it. */
+  command?: 'send' | 'discard';
 }
 
 export interface CallState {

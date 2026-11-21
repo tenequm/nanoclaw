@@ -13,6 +13,7 @@ import type {
   CallPolicy,
   CallStatus,
   Command,
+  CommandCue,
   JevState,
   RecheckState,
   RecheckVerdict,
@@ -44,6 +45,8 @@ export interface RuntimePorts {
   stopPlayback(): void;
   postCaller?(text: string): void;
   status(status: CallStatus): void;
+  /** A spoken command's cue; a call without cues leaves it out. */
+  cue?(cue: CommandCue): void;
   log(event: string, fields: Record<string, unknown>): void;
   /** Every event as it is processed, numbered from 1: the call's replayable log. */
   record(seq: number, event: CallEvent): void;
@@ -149,6 +152,8 @@ export function createCallRuntime<S>(core: CallCore<S>, policy: CallPolicy, port
       }
       case 'status':
         return ports.status(command.status);
+      case 'cue':
+        return ports.cue?.(command.cue);
       case 'judge':
         return judge(command.windowVersion, command.state);
       case 'recheck':

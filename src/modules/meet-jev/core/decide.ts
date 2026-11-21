@@ -4,7 +4,16 @@
  * returns them. Replaying the event log through `reduce` reproduces every decision.
  */
 import { endPhrases, phraseEnd, spokenWord, type EndPhrase } from './spoken.js';
-import type { Action, CallEvent, Command, RecheckVerdict, SessionStamp, Verdict } from './types.js';
+import type {
+  Action,
+  CallEvent,
+  CallPolicy,
+  Command,
+  CommandCue,
+  RecheckVerdict,
+  SessionStamp,
+  Verdict,
+} from './types.js';
 import {
   agentSpeaking,
   applyWindow,
@@ -31,6 +40,7 @@ import {
   utterancesSince,
   type CallState,
   type ListenPiece,
+  type Judging,
   type Wake,
 } from './window.js';
 
@@ -310,9 +320,10 @@ function setListening(state: CallState, on: boolean): void {
   }
 }
 
-function flushDraft(state: CallState, pieces: ListenPiece[], hangup: boolean): void {
+/** Send the pieces as one turn (or save them as the caller's at hangup); false when they had no words. */
+function flushDraft(state: CallState, pieces: ListenPiece[], hangup: boolean): boolean {
   const last = pieces.at(-1);
-  if (!last) return;
+  if (!last) return false;
   const text = pieces
     .map((piece) => piece.text)
     .filter(hasWords)
@@ -320,9 +331,27 @@ function flushDraft(state: CallState, pieces: ListenPiece[], hangup: boolean): v
   for (const piece of pieces) {
     markHandled(state.speakers[piece.speakerId], piece.uttId);
   }
-  if (!text) return;
+  if (!text) return false;
   if (hangup) state.commands.push({ kind: 'post_caller', text });
   else wake(state, last.speakerId, last.uttId, text);
+  return true;
+}
+
+/** Drop the pieces unsent; false when they had no words. Their words never join a later turn. */
+function dropDraft(state: CallState, pieces: ListenPiece[]): boolean {
+  for (const piece of pieces) {
+    const speaker = state.speakers[piece.speakerId];
+    markHandled(speaker, piece.uttId);
+    speaker.closedAt = Math.max(speaker.closedAt, piece.startedAt);
+  }
+  const dropped = pieces.some((piece) => hasWords(piece.text));
+  log(state, 'listen_discard', { pieces: pieces.length, dropped });
+  return dropped;
+}
+
+/** A command's cue for the caller; none once the call is hanging up. */
+function cue(state: CallState, kind: CommandCue): void {
+  if (!state.hangingUp) state.commands.push({ kind: 'cue', cue: kind });
 }
 
 function capturePiece(
@@ -365,9 +394,11 @@ function capturePiece(
     markHandled(state.speakers[speakerId], uttId);
     draft.splice(draft.indexOf(piece), 1);
   } else {
-    const rest = beforeMarker(piece.text, state.policy.releaseWords ?? []);
-    piece.releases = rest !== null;
-    if (rest !== null) piece.text = rest;
+    const said = spokenCommand(piece.text, state.policy);
+    if (said) {
+      piece.command = said.command;
+      piece.text = said.rest;
+    } else delete piece.command;
   }
   releaseMarkers(state);
 }
@@ -402,12 +433,31 @@ function armPiece(state: CallState, piece: ListenPiece): void {
 
 function releaseMarkers(state: CallState): void {
   const draft = state.listenDraft!;
-  // A later activity can finalize first. A marker only releases through its own position.
+  // A later activity can finalize first. A command only acts through its own position: a send releases the draft
+  // up to it, a discard drops it, and an empty one has nothing to act on.
   for (let i = 0; i < draft.length && draft[i].final; i++) {
-    if (!draft[i].releases) continue;
-    flushDraft(state, draft.splice(0, i + 1), false);
+    const command = draft[i].command;
+    if (!command) continue;
+    const pieces = draft.splice(0, i + 1);
+    if (command === 'send') cue(state, flushDraft(state, pieces, false) ? 'sent' : 'nope');
+    else cue(state, dropDraft(state, pieces) ? 'discard' : 'nope');
     i = -1;
   }
+}
+
+/**
+ * The spoken command a transcript ends with (`send` by the release words, `discard` by the discard words, each
+ * repeat stripped) and the words before it, or null when it ends with neither.
+ */
+export function spokenCommand(
+  text: string,
+  policy: Pick<CallPolicy, 'releaseWords' | 'discardWords'>,
+): { command: 'send' | 'discard'; rest: string } | null {
+  const send = beforeMarker(text, policy.releaseWords ?? []);
+  const discard = beforeMarker(text, policy.discardWords ?? []);
+  // Both only when one phrase ends the other: the longer phrase, the shorter rest, was said.
+  if (discard !== null && (send === null || discard.length < send.length)) return { command: 'discard', rest: discard };
+  return send === null ? null : { command: 'send', rest: send };
 }
 
 /**
@@ -669,11 +719,102 @@ function onVerdict(state: CallState, version: number, verdict: Verdict | null, m
   else if (action === 'continue') {
     const cutOff = `You were cut off after "${state.cutOffAfter ?? ''}"; ${speaker?.name ?? 'the caller'} asked you to go on. Continue briefly from there.`;
     wake(state, judging.speakerId, judging.uttId, judging.trigger, cutOff);
-  } else {
+  } else if (
+    !(action === 'send' ? sendUnsent(state, judging) : action === 'discard' && discardUnsent(state, judging))
+  ) {
     const held = continuationFor(state, judging.speakerId);
     if (held) held.judged = judging.trigger;
     holdBriefly(state, judging.speakerId);
   }
+}
+
+/**
+ * The caller's words not sent to the agent yet, with the command they end with stripped: a held turn's pieces after
+ * its trigger, or else everything since their last closed turn or the agent's last line.
+ */
+function unsentWords(state: CallState, speakerId: string, command: 'send' | 'discard'): string {
+  const held = continuationFor(state, speakerId);
+  const closedAt = Math.max(
+    state.speakers[speakerId]?.closedAt ?? 0,
+    ...state.agentLines.filter((line) => line.state !== 'shown').map((line) => line.at),
+  );
+  const pieces = held
+    ? continuationPieces(state, held)
+    : state.utterances
+        .filter((u) => u.speakerId === speakerId && u.startedAt > closedAt)
+        .sort((a, b) => a.startedAt - b.startedAt);
+  const text = pieces
+    .filter((u) => !u.contextOnly && hasWords(u.text))
+    .map((u) => u.text)
+    .join(' ');
+  const rest = spokenCommand(text, state.policy);
+  return rest?.command === command ? rest.rest : text;
+}
+
+/**
+ * Jev heard the caller end their turn with a send word: the unsent words go to the agent now (with a held turn's
+ * trigger, which the new turn replaces), with the `sent` cue. False, with the `nope` cue, when nothing is unsent.
+ */
+function sendUnsent(state: CallState, judging: Judging): boolean {
+  const words = unsentWords(state, judging.speakerId, 'send');
+  log(state, 'command', { command: 'send', outcome: hasWords(words) ? 'sent' : 'nothing' });
+  if (!hasWords(words)) {
+    closeTurn(state, judging);
+    cue(state, 'nope');
+    return false;
+  }
+  const held = continuationFor(state, judging.speakerId);
+  cue(state, 'sent');
+  wake(state, judging.speakerId, judging.uttId, held ? `${held.trigger} ${words}` : words);
+  return true;
+}
+
+/**
+ * Jev heard the caller discard: their unsent words are dropped, and the latest turn's answer, when it has not
+ * started, is taken back (a reply still to come is shown only, as after a stop), with the `discard` cue. False,
+ * with the `nope` cue, when there was neither.
+ */
+function discardUnsent(state: CallState, judging: Judging): boolean {
+  const dropped = hasWords(unsentWords(state, judging.speakerId, 'discard'));
+  const latest = latestWake(state);
+  const revocable =
+    !!latest &&
+    latest.speakerId === judging.speakerId &&
+    !latest.dropped &&
+    !latest.started &&
+    (awaitingAgent(state) ||
+      state.recheck?.wakeKey === latest.key ||
+      Object.values(state.playout).some((line) => line.wakeKey === latest.key));
+  const revoked: string[] = [];
+  if (revocable) {
+    state.stoppedSeq = state.seq;
+    endRecheck(state, 'discarded');
+    for (const replyId of takeBackUnstarted(state)) {
+      revoked.push(replyId);
+      state.commands.push({ kind: 'revoke', replyId });
+      log(state, 'reply', { replyId, outcome: 'revoked', reason: 'discarded' });
+    }
+    state.commands.push({ kind: 'status', status: 'idle' });
+  }
+  log(state, 'command', { command: 'discard', dropped, revokedTurn: revocable, revoked });
+  closeTurn(state, judging);
+  if (!dropped && !revocable) {
+    cue(state, 'nope');
+    return false;
+  }
+  const held = continuationFor(state, judging.speakerId);
+  if (held) release(state, held);
+  cue(state, 'discard');
+  return true;
+}
+
+/** The judged utterance closes the caller's turn: dropped words, or a command alone, never join a later one. */
+function closeTurn(state: CallState, judging: Judging): void {
+  const speaker = state.speakers[judging.speakerId];
+  const startedAt = state.utterances.find(
+    (u) => u.speakerId === judging.speakerId && u.uttId === judging.uttId,
+  )?.startedAt;
+  if (speaker) speaker.closedAt = Math.max(speaker.closedAt, startedAt ?? state.now);
 }
 
 /**
@@ -758,13 +899,23 @@ function chosen(state: CallState, verdict: Verdict, addressedByName: boolean): A
         : action === 'continue' && alone
           ? oneCaller.continue
           : thresholds[action];
-    return verdict.action === action && verdict.probabilities[action] >= threshold.p;
+    return !!threshold && verdict.action === action && (verdict.probabilities[action] ?? 0) >= threshold.p;
   };
   if (busy && over('stop')) return 'stop';
   if (state.cutOffAfter !== null && !agentSpeaking(state) && over('continue')) return 'continue';
+  // The spoken commands, offered on a voice call only (their thresholds with them).
+  if (over('discard')) return 'discard';
+  if (over('send')) return 'send';
   if (over('answer')) return 'answer';
   // One human has nobody else to talk to: a fair chance of `answer` is enough while the agent is idle.
-  if (alone && !busy && verdict.action !== 'stop' && verdict.probabilities.answer >= oneCaller.speak.p) return 'answer';
+  if (
+    alone &&
+    !busy &&
+    verdict.action !== 'stop' &&
+    verdict.action !== 'discard' &&
+    verdict.probabilities.answer >= oneCaller.speak.p
+  )
+    return 'answer';
   return 'stay_silent';
 }
 
@@ -979,7 +1130,7 @@ function onRecheck(state: CallState, wakeKey: string, verdict: RecheckVerdict | 
  * A stop or a newer wake ends the hold and the answer-ready check, whose verdict is then ignored. Held replies
  * not yet queued are shown; the caller takes back the queued ones.
  */
-function endRecheck(state: CallState, reason: 'stopped' | 'replaced'): void {
+function endRecheck(state: CallState, reason: 'stopped' | 'replaced' | 'discarded'): void {
   const wake = latestWake(state);
   if (wake) endHold(wake);
   const recheck = state.recheck;

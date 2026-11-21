@@ -5,9 +5,9 @@
 import { describe, expect, it } from 'vitest';
 
 import { CALL_COMMAND_WORDS } from '../../channels/voice-mode-protocol.js';
-import { beforeMarker, vocativeOf } from './core/decide.js';
+import { beforeMarker, spokenCommand, vocativeOf } from './core/decide.js';
 import { callCore, type CallState } from './core/index.js';
-import type { Action, CallEvent, CallKind, Command, Speaker } from './core/types.js';
+import type { Action, CallEvent, CallKind, Command, Speaker, Verdict } from './core/types.js';
 import { renderWindow, toJevState } from './core/window.js';
 import { policyFor } from './policy.js';
 
@@ -84,10 +84,12 @@ class Call {
   }
 
   verdict(windowVersion: number, action: Action | null, p = 0.9, confidence = 0.8): Command[] {
-    const probabilities = { answer: 0, stay_silent: 0, stop: 0, continue: 0 };
-    if (action) {
-      for (const a of Object.keys(probabilities) as Action[]) probabilities[a] = a === action ? p : (1 - p) / 3;
-    }
+    // A voice call's Choice offers the spoken commands too; a fixture names them only when it picks one.
+    const offered: Action[] = ['answer', 'stay_silent', 'stop', 'continue'];
+    if (action === 'send' || action === 'discard') offered.push('send', 'discard');
+    const probabilities = Object.fromEntries(
+      offered.map((a) => [a, action ? (a === action ? p : (1 - p) / (offered.length - 1)) : 0]),
+    ) as Verdict['probabilities'];
     return this.feed({
       kind: 'verdict',
       windowVersion,
@@ -153,12 +155,15 @@ describe('listen until over', () => {
     'Copy!',
     'copy that.',
     'Copy that',
-  ])('strips a final %s and ignores a marker alone', (marker) => {
+  ])('strips a final %s and answers a marker alone with nope', (marker) => {
     const call = listening();
-    expect(call.say(caller, 'empty', marker)).toEqual([]);
+    expect(call.say(caller, 'empty', marker)).toEqual([{ kind: 'cue', cue: 'nope' }]);
     expect(call.say(caller, 'one', 'Go over the handover')).toEqual([]);
     const commands = call.say(caller, 'two', 'Next, ' + marker);
-    expect(commands).toEqual([expect.objectContaining({ kind: 'turn', message: 'Go over the handover Next' })]);
+    expect(commands).toEqual([
+      expect.objectContaining({ kind: 'turn', message: 'Go over the handover Next' }),
+      { kind: 'cue', cue: 'sent' },
+    ]);
     expect(call.statuses).not.toContainEqual({ kind: 'status', status: 'thinking' });
   });
 
@@ -172,7 +177,10 @@ describe('listen until over', () => {
     speech('b', true);
     speech('b', false);
     expect(final('b', 'Plan, copy that.')).toEqual([]);
-    expect(final('a', 'Look over')).toEqual([expect.objectContaining({ kind: 'turn', message: 'Look over Plan' })]);
+    expect(final('a', 'Look over')).toEqual([
+      expect.objectContaining({ kind: 'turn', message: 'Look over Plan' }),
+      { kind: 'cue', cue: 'sent' },
+    ]);
     call.feed({ kind: 'turn', key: 'w1', turnId: 't1' });
     expect(final('c', 'Next draft')).toEqual([]);
     expect(call.feed({ kind: 'reply', replyId: 'r1', turnId: 't1', text: 'Confirmed.' })).toEqual([
@@ -212,7 +220,7 @@ describe('listen until over', () => {
 
   it('strips consecutive markers', () => {
     const call = listening();
-    expect(call.say(caller, 'a', 'Прийом, прийом.')).toEqual([]);
+    expect(call.say(caller, 'a', 'Прийом, прийом.')).toEqual([{ kind: 'cue', cue: 'nope' }]);
     expect(call.say(caller, 'b', 'hand it over')).toEqual([]);
     expect(only(call.say(caller, 'c', 'Прийом, прийом.'), 'turn')[0]?.message).toBe('hand it over');
   });
@@ -404,12 +412,234 @@ describe('listen until over', () => {
     expect(only(call.verdict(judge.windowVersion, 'answer'), 'turn')).toHaveLength(1);
   });
 
+  it('takes the discard words from the spoken commands, on a voice call only', () => {
+    expect(new Call().state.policy.discardWords).toEqual(CALL_COMMAND_WORDS.discard.map(({ say }) => ({ say })));
+    expect(new Call('meet').state.policy.discardWords).toBeUndefined();
+  });
+
+  it.each(CALL_COMMAND_WORDS.discard.map(({ say }) => say))(
+    'drops the whole unsent draft on a final %s, sends nothing, cues discard and keeps listening',
+    (phrase) => {
+      const call = listening();
+      expect(call.say(caller, 'a', 'Book a table')).toEqual([]);
+      expect(call.say(caller, 'b', `for eight, ${phrase}.`)).toEqual([{ kind: 'cue', cue: 'discard' }]);
+      expect(call.state.listenDraft).toEqual([]);
+      // Listening goes on: the next draft goes out without the dropped words.
+      expect(call.say(caller, 'c', 'Call Anna, zulu')).toEqual([
+        expect.objectContaining({ kind: 'turn', message: 'Call Anna' }),
+        { kind: 'cue', cue: 'sent' },
+      ]);
+      expect(call.feed({ kind: 'hangup' })).toEqual([]);
+    },
+  );
+
+  it.each(['Scratch that.', 'discard turn', 'Discard this turn!', 'scratch that, scratch that'])(
+    'answers %s with an empty draft with nope',
+    (said) => {
+      const call = listening();
+      expect(call.say(caller, 'a', said)).toEqual([{ kind: 'cue', cue: 'nope' }]);
+      expect(call.say(caller, 'b', 'Next, zulu.')).toEqual([
+        expect.objectContaining({ kind: 'turn', message: 'Next' }),
+        { kind: 'cue', cue: 'sent' },
+      ]);
+    },
+  );
+
+  it('waits for an earlier final before a later discard acts, and keeps what was said after it', () => {
+    const call = listening();
+    const speech = (uttId: string, on: boolean) => call.feed({ kind: 'speech', speaker: caller, uttId, on });
+    const final = (uttId: string, text: string) =>
+      call.feed({ kind: 'utterance', speaker: caller, uttId, text, final: true });
+    for (const uttId of ['a', 'b', 'c']) {
+      speech(uttId, true);
+      speech(uttId, false);
+    }
+    expect(final('b', 'Scratch that.')).toEqual([]);
+    expect(final('c', 'Call Anna')).toEqual([]);
+    expect(final('a', 'Book a table')).toEqual([{ kind: 'cue', cue: 'discard' }]);
+    expect(call.state.listenDraft?.map((piece) => piece.text)).toEqual(['Call Anna']);
+    expect(only(call.say(caller, 'd', 'zulu'), 'turn').map((turn) => turn.message)).toEqual(['Call Anna']);
+  });
+
+  it('keeps a discard phrase inside a sentence as words', () => {
+    const call = listening();
+    expect(call.say(caller, 'a', 'scratch that idea and call the plumber')).toEqual([]);
+    expect(only(call.say(caller, 'b', 'zulu'), 'turn').map((turn) => turn.message)).toEqual([
+      'scratch that idea and call the plumber',
+    ]);
+  });
+
+  it('saves no discarded words as the caller at hangup, and plays no cue while hanging up', () => {
+    const call = listening();
+    call.say(caller, 'a', 'Book a table, scratch that.');
+    call.say(caller, 'b', 'Keep this');
+    call.feed({ kind: 'hangup', draining: true });
+    expect(call.say(caller, 'c', 'and this, zulu')).toEqual([
+      expect.objectContaining({ kind: 'turn', message: 'Keep this and this' }),
+    ]);
+  });
+
+  it.each([
+    ['Book it, scratch that.', { command: 'discard', rest: 'Book it' }],
+    ['call the plumber discard turn', { command: 'discard', rest: 'call the plumber' }],
+    ['Discard this turn', { command: 'discard', rest: '' }],
+    ['Book it, zulu', { command: 'send', rest: 'Book it' }],
+    ['Scratch that, zulu', { command: 'send', rest: 'Scratch that' }],
+    ['scratch that idea', null],
+    ['send me a copy', null],
+  ])('reads %s as %j', (text, command) => {
+    expect(spokenCommand(text, new Call().state.policy)).toEqual(command);
+  });
+
   it('ignores a judge verdict already in flight when listening starts', () => {
     const call = new Call();
     const [judge] = only(call.say(caller, 'a', 'What time is it?'), 'judge');
     call.feed({ kind: 'listen', on: true });
     expect(call.verdict(judge.windowVersion, 'answer')).toEqual([]);
     expect(only(call.feed({ kind: 'listen', on: false }), 'turn')[0]?.message).toBe('What time is it?');
+  });
+});
+
+describe('spoken commands on a voice call', () => {
+  const caller: Speaker = { id: 'caller', name: 'Caller' };
+  /** `say`, then Jev's verdict `action` on the judge it asked for. */
+  function judged(call: Call, uttId: string, text: string, action: Action, p = 0.9): Command[] {
+    const said = call.say(caller, uttId, text);
+    const [judge] = only(said, 'judge');
+    expect(judge).toBeDefined();
+    return [...said, ...call.verdict(judge.windowVersion, action, p)];
+  }
+
+  it('sends the words judged silent since the last turn on send, without the send word, with the sent cue', () => {
+    const call = new Call();
+    expect(only(judged(call, 'a', 'I have to be there at 17:12.', 'stay_silent'), 'turn')).toEqual([]);
+    const sent = judged(call, 'b', 'And bring the keys, прийом.', 'send');
+    expect(sent.filter((c) => c.kind === 'cue' || c.kind === 'turn')).toEqual([
+      { kind: 'cue', cue: 'sent' },
+      expect.objectContaining({ kind: 'turn', message: 'I have to be there at 17:12. And bring the keys' }),
+    ]);
+    expect(call.lastLog('command')).toMatchObject({ command: 'send', outcome: 'sent' });
+    // Those words are sent: a lone send word after them has nothing to send.
+    expect(judged(call, 'c', 'zulu', 'send').filter((c) => c.kind === 'cue' || c.kind === 'turn')).toEqual([
+      { kind: 'cue', cue: 'nope' },
+    ]);
+  });
+
+  it('answers a send with nothing unsent with nope and nothing else', () => {
+    const call = new Call();
+    expect(judged(call, 'a', 'Copy that.', 'send')).toEqual([
+      expect.objectContaining({ kind: 'judge' }),
+      { kind: 'cue', cue: 'nope' },
+    ]);
+    expect(call.lastLog('command')).toMatchObject({ command: 'send', outcome: 'nothing' });
+  });
+
+  it("sends a held turn's continuation with its trigger on send, replacing the answer not started yet", () => {
+    const call = new Call();
+    call.sayAnswered(caller, 'a', 'What is the weather');
+    call.feed({ kind: 'turn', key: 'w1', turnId: 't1' }, { kind: 'speech', speaker: caller, uttId: 'b', on: true });
+    call.feed({ kind: 'reply', replyId: 'r1', turnId: 't1', text: 'Sunny.' });
+    const result = [
+      ...call.feed(
+        { kind: 'utterance', speaker: caller, uttId: 'b', text: 'in Kyiv, zulu', final: true },
+        { kind: 'speech', speaker: caller, on: false },
+      ),
+    ];
+    const [judge] = only(result, 'judge');
+    expect(judge.state.latest?.text).toBe('What is the weather in Kyiv, zulu');
+    const sent = call.verdict(judge.windowVersion, 'send');
+    expect(only(sent, 'revoke').map((c) => c.replyId)).toEqual(['r1']);
+    expect(only(sent, 'cue')).toEqual([{ kind: 'cue', cue: 'sent' }]);
+    expect(only(sent, 'turn').map((c) => c.message)).toEqual(['What is the weather in Kyiv']);
+  });
+
+  it('drops the unsent words on discard with the discard cue; they never join a later turn', () => {
+    const call = new Call();
+    judged(call, 'a', 'Book a table', 'stay_silent');
+    const dropped = judged(call, 'b', 'for eight, scratch that.', 'discard');
+    expect(only(dropped, 'cue')).toEqual([{ kind: 'cue', cue: 'discard' }]);
+    expect(only(dropped, 'turn')).toEqual([]);
+    expect(only(dropped, 'revoke')).toEqual([]);
+    expect(call.lastLog('command')).toMatchObject({ command: 'discard', dropped: true, revokedTurn: false });
+    expect(judged(call, 'c', 'zulu', 'send').filter((c) => c.kind === 'cue')).toEqual([{ kind: 'cue', cue: 'nope' }]);
+    expect(only(judged(call, 'd', 'What time is it?', 'answer'), 'turn').map((c) => c.message)).toEqual([
+      'What time is it?',
+    ]);
+  });
+
+  it('answers a discard with nothing unsent and no answer to take back with nope', () => {
+    const call = new Call();
+    expect(judged(call, 'a', 'Scratch that.', 'discard')).toEqual([
+      expect.objectContaining({ kind: 'judge' }),
+      { kind: 'cue', cue: 'nope' },
+    ]);
+  });
+
+  it('takes back a sent turn whose answer has not started: a queued line is revoked', () => {
+    const call = new Call();
+    call.sayAnswered(caller, 'a', 'What time is it?');
+    call.feed({ kind: 'turn', key: 'w1', turnId: 't1' }, { kind: 'speech', speaker: caller, uttId: 'b', on: true });
+    call.feed({ kind: 'reply', replyId: 'r1', turnId: 't1', text: 'Noon.' });
+    const [judge] = only(
+      call.feed(
+        { kind: 'utterance', speaker: caller, uttId: 'b', text: 'Scratch that.', final: true },
+        { kind: 'speech', speaker: caller, on: false },
+      ),
+      'judge',
+    );
+    call.statuses = [];
+    const result = call.verdict(judge.windowVersion, 'discard');
+    expect(only(result, 'revoke').map((c) => c.replyId)).toEqual(['r1']);
+    expect(only(result, 'cue')).toEqual([{ kind: 'cue', cue: 'discard' }]);
+    expect(only(result, 'stop_playback')).toEqual([]);
+    expect(call.statuses.map((c) => c.status)).toEqual(['idle']);
+    expect(call.lastLog('command')).toMatchObject({ command: 'discard', revokedTurn: true, revoked: ['r1'] });
+  });
+
+  it('takes back a sent turn whose answer has not come: the answer is shown only', () => {
+    const call = new Call();
+    const [turn] = only(call.sayAnswered(caller, 'a', 'What time is it?'), 'turn');
+    call.feed({ kind: 'turn', key: turn.key, turnId: 't1' });
+    expect(only(judged(call, 'b', 'Scratch that.', 'discard'), 'cue')).toEqual([{ kind: 'cue', cue: 'discard' }]);
+    expect(call.feed({ kind: 'reply', replyId: 'r1', turnId: 't1', text: 'Noon.' })).toEqual([
+      { kind: 'show', replyId: 'r1', text: 'Noon.' },
+    ]);
+  });
+
+  it('leaves a line already playing alone: a discard with nothing unsent is nope', () => {
+    const call = new Call();
+    wakeAndSpeak(call, 'what time is it?', 'Noon.', 1);
+    const result = judged(call, 'u2', 'scratch that', 'discard');
+    expect(only(result, 'cue')).toEqual([{ kind: 'cue', cue: 'nope' }]);
+    expect(only(result, 'stop_playback')).toEqual([]);
+    expect(only(result, 'revoke')).toEqual([]);
+  });
+
+  it('does not answer a discard below its bar on p(answer)', () => {
+    const call = new Call();
+    const [judge] = only(call.say(caller, 'a', 'Book a table, scratch that'), 'judge');
+    const result = call.feed({
+      kind: 'verdict',
+      windowVersion: judge.windowVersion,
+      verdict: {
+        action: 'discard',
+        probabilities: { answer: 0.4, stay_silent: 0, stop: 0, continue: 0, send: 0, discard: 0.6 - 0.01 },
+        confidence: 0.3,
+      },
+      ms: 300,
+    });
+    expect(only(result, 'turn')).toEqual([]);
+    expect(only(result, 'cue')).toEqual([]);
+  });
+
+  it('never acts on a send or discard in a meeting, which offers neither', () => {
+    const call = new Call('meet');
+    call.feed({ kind: 'presence', speaker: olena, joined: true }, { kind: 'presence', speaker: misha, joined: true });
+    const [judge] = only(call.say(misha, 'a', 'Book a table, zulu'), 'judge');
+    for (const action of ['send', 'discard'] as const) {
+      const result = call.verdict(judge.windowVersion, action);
+      expect(result.filter((c) => c.kind === 'cue' || c.kind === 'turn' || c.kind === 'revoke')).toEqual([]);
+    }
   });
 });
 

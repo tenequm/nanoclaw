@@ -10,8 +10,8 @@
  * its VAD marks (the meeting's mixed audio) are logged, never a boundary.
  *
  * On a jev call the host pushes the worker only what the core says to: a `reply` (with its `replyId`)
- * for `speak`, a `revoke` for `revoke`, a `stop` for `stop_playback`, and on a voice call each `status`
- * and the answer to each of the worker's `overlap` requests.
+ * for `speak`, a `revoke` for `revoke`, a `stop` for `stop_playback`, and on a voice call each `status`,
+ * each spoken command's `cue` and the answer to each of the worker's `overlap` requests.
  * `show` and `drop` push nothing: the agent's message is
  * already in the call chat, since a reply reaches this module from the post-delivery hook.
  */
@@ -101,7 +101,10 @@ export function createJevCall(host: JevCallHost, deps: Partial<JevDeps> = {}): J
   let replies = 0;
   const fields = { callId: host.callId };
   const overlapQuestion = judgeOverlap ? (host.jevDuck ? 'ducked' : 'paused') : undefined;
-  log.info('meet-jev: questions', { ...fields, questions: judgeQuestions(host.agentName, overlapQuestion) });
+  log.info('meet-jev: questions', {
+    ...fields,
+    questions: judgeQuestions(host.agentName, overlapQuestion, kind === 'voice'),
+  });
   const judgedAt: number[] = [];
   const overlapsAt: number[] = [];
   /** Lines the worker reported started and not yet over: `words` reaches it only while one plays. */
@@ -168,7 +171,7 @@ export function createJevCall(host: JevCallHost, deps: Partial<JevDeps> = {}): J
       if (!signal.aborted) host.push({ type: 'overlap', requestId, verdict, ...(reason ? { reason } : {}) });
     },
     judge: async (state, signal, windowVersion) => {
-      if (!capped()) return judge(state, { signal, ...fields, windowVersion });
+      if (!capped()) return judge(state, { signal, ...fields, windowVersion, commands: kind === 'voice' });
       log.warn('meet-jev: Jev rate cap reached, judged without Jev', { ...fields, perMinute: MAX_JUDGES_PER_MINUTE });
       log.info('meet-jev: judge', {
         ...fields,
@@ -201,6 +204,10 @@ export function createJevCall(host: JevCallHost, deps: Partial<JevDeps> = {}): J
         failure: { category: 'rate_cap', message: 'Jev rate cap reached' },
       });
       return { verdict: null, ms: 0 };
+    },
+    // A voice call's worker plays it; a meeting has no cues.
+    cue: (cue) => {
+      if (kind === 'voice') host.push({ type: 'cue', cue });
     },
     postCaller: host.postCaller,
     turn: ({ message, note }, signal) => host.submitTurn(message, note, signal),

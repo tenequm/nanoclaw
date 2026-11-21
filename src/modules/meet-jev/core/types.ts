@@ -19,8 +19,14 @@ export interface Speaker {
   name: string;
 }
 
-export type Action = 'answer' | 'stay_silent' | 'stop' | 'continue';
-export const ACTIONS: readonly Action[] = ['answer', 'stay_silent', 'stop', 'continue'];
+/**
+ * `send` and `discard` are the caller's spoken commands (CALL_COMMAND_WORDS), offered on a voice call only: the
+ * caller ends the turn now, or drops what is still unsent.
+ */
+export type CommandAction = 'send' | 'discard';
+export type Action = 'answer' | 'stay_silent' | 'stop' | 'continue' | CommandAction;
+/** The options of every call's `action` Choice; a voice call's adds the `CommandAction`s. */
+export const ACTIONS: readonly Exclude<Action, CommandAction>[] = ['answer', 'stay_silent', 'stop', 'continue'];
 
 /** Jev's answer to a Choice: the chosen option, every option's probability (sums to 1) and the confidence. */
 export interface Choice<A extends string> {
@@ -30,8 +36,13 @@ export interface Choice<A extends string> {
   confidence: number;
 }
 
-/** Jev's answer to the `action` Choice; null when the call failed or timed out (silence, or a wake on a vocative). */
-export type Verdict = Choice<Action>;
+/**
+ * Jev's answer to the `action` Choice; null when the call failed or timed out (silence, or a wake on a vocative).
+ * A meeting's has no `send` or `discard` probability: its Choice does not offer them.
+ */
+export type Verdict = Omit<Choice<Action>, 'probabilities'> & {
+  probabilities: Record<Exclude<Action, CommandAction>, number> & Partial<Record<CommandAction, number>>;
+};
 
 /** Whether the agent goes on with its line or yields the turn, when the caller talks over it. */
 export type OverlapAction = 'yield' | 'keep_talking';
@@ -86,7 +97,12 @@ export type CallEvent =
       at: number;
     };
 
+/** A sound cue a voice call's worker plays for a spoken command (its `CueKind`s of the same names). */
+export type CommandCue = 'sent' | 'discard' | 'nope';
+
 export type Command =
+  /** Play a command's cue on a voice call: a turn sent on the caller's word, words dropped, nothing to act on. */
+  | { kind: 'cue'; cue: CommandCue }
   /** Save unsubmitted words to the caller's thread at call end. */
   | { kind: 'post_caller'; text: string }
   | { kind: 'overlap'; requestId: string; state: JevState; windowVersion: number }
@@ -181,6 +197,8 @@ export interface ActionThreshold {
 export interface CallPolicy {
   /** Voice: the words that end a listen-until-over draft (the spoken send words). */
   releaseWords?: EndPhrase[];
+  /** Voice: the spoken discard words, which drop the unsent draft or turn. */
+  discardWords?: EndPhrase[];
   kind: CallKind;
   /** The agent's name as people say it, for the vocative fact, the stop rule and the state. */
   agentName: string;
@@ -204,7 +222,9 @@ export interface CallPolicy {
   /** The window keeps this much history and at most `windowBytes` of text. */
   windowMs: number;
   windowBytes: number;
-  thresholds: Record<Exclude<Action, 'stay_silent'>, ActionThreshold>;
+  /** The `CommandAction`s' only where the call offers them. */
+  thresholds: Record<Exclude<Action, 'stay_silent' | CommandAction>, ActionThreshold> &
+    Partial<Record<CommandAction, ActionThreshold>>;
   /** A landed answer is shown instead of spoken only when the recheck says `show` over this. */
   recheckShow: ActionThreshold;
 }

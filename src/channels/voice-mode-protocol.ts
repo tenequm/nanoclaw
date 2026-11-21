@@ -565,8 +565,13 @@ export type CallEndReason = (typeof CALL_END_REASONS)[number];
  * already playing plays on unless the reflex paused it, which cuts it); `words` says a participant's
  * words beyond acknowledgements arrived (`takesTurn`), the reflex's text confirmation where the
  * worker has no transcript of its own. A jev voice call also gets the loop's
- * `status` and the agent's `thinking` ticks, which its worker plays its cues and typing sound from.
+ * `status`, the agent's `thinking` ticks and each spoken command's `cue`, which its worker plays its
+ * cues and typing sound from.
  */
+/** The cues a jev voice call's host asks its worker to play (the worker's `CueKind`s of the same names). */
+export const JEV_COMMAND_CUES = ['sent', 'discard', 'nope'] as const;
+export type JevCommandCue = (typeof JEV_COMMAND_CUES)[number];
+
 /** Why the host answers an overlap request without a verdict. */
 export type OverlapFallback = 'cap' | 'error' | 'mid_band' | 'not_playing' | 'off';
 
@@ -583,6 +588,11 @@ export type LiveKitHostEvent =
   | { type: 'working' }
   /** A jev voice call's state as the host's loop sees it: the worker plays its cues from it. */
   | { type: 'status'; status: 'heard' | 'thinking' | 'speaking' | 'idle' }
+  /**
+   * A jev voice call's spoken command, as the host's loop acted on it: `sent` as a turn goes out on a send word,
+   * `discard` when a discard dropped words, `nope` when the command had nothing to act on.
+   */
+  | { type: 'cue'; cue: JevCommandCue }
   | { type: 'chat'; chat: boolean }
   | { type: 'turn-stored'; turnKey: string; id: string }
   | { type: 'end'; reason: string }

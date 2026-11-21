@@ -6,6 +6,7 @@
  * (fail-silent like the chat gate) unless the agent was called by name, which still wakes it; speech for
  * `still_wanted` (the answer was wanted a moment ago); the worker's word list for `barge_in`.
  */
+import { CALL_COMMAND_WORDS, type CallCommandWord } from '../../channels/voice-mode-protocol.js';
 import { log } from '../../log.js';
 import { postSystemOne, type JevFailure } from '../jev-gate/jev.js';
 import {
@@ -85,18 +86,41 @@ interface DecisionModel {
   }): Promise<DecisionResponse>;
 }
 
-function actionDecision(agent: string): ChoiceDecision {
+const quoted = (words: readonly CallCommandWord[]): string => words.map(({ say }) => `"${say}"`).join(', ');
+
+/** A voice call's spoken commands as `action` options, their words from CALL_COMMAND_WORDS. */
+function commandOptions(agent: string): ChoiceDecision['options'] {
+  const anywhere = quoted(CALL_COMMAND_WORDS.send.filter((word) => !word.ownSentence));
+  const ownSentence = quoted(CALL_COMMAND_WORDS.send.filter((word) => word.ownSentence));
+  return {
+    send: {
+      what: `The caller ends their turn on purpose with a spoken send word at the very end of \`latest\`: ${anywhere} (in either script, after any words), or ${ownSentence} as their own sentence (the whole utterance, or after punctuation: "..., copy."). ${agent} should answer now what the caller said since ${agent} last answered, without the send word. People speak Ukrainian and English, often mixed ("розкажи про погоду в Києві, прийом").`,
+      not_for: `A send word used as an ordinary word or inside the sentence ("send me a copy", "copy that file", "я записався на прийом до лікаря"), or quoted ("he always says zulu"); a finished question with no send word at its end (that is answer); a discard phrase at the end (that is discard).`,
+    },
+    discard: {
+      what: `The caller takes back what they just said with a spoken discard phrase at the very end of \`latest\`: ${quoted(CALL_COMMAND_WORDS.discard)}, after English or Ukrainian words ("забронюй столик на сьому, scratch that"). The words ${agent} has not answered yet are dropped, and an answer ${agent} has not started saying is no longer wanted.`,
+      not_for: `A discard phrase inside a sentence or quoted ("scratch that idea and call the plumber", "він сказав scratch that і пішов"), or said about something else ("scratch that off the list"); telling ${agent} to stop or be quiet while it speaks (that is stop).`,
+    },
+  };
+}
+
+/** `commands`: a voice call, whose caller can end or drop a turn by a spoken command (`send`, `discard`). */
+function actionDecision(agent: string, commands = false): ChoiceDecision {
+  const words = quoted([...CALL_COMMAND_WORDS.send, ...CALL_COMMAND_WORDS.discard]);
+  const bare = commands
+    ? ` A spoken command alone (${words}) is no question or request to ${agent}: that is send or discard.`
+    : '';
   return {
     kind: 'choice',
     prompt: `A live call. \`latest\` is the utterance just finished, the one to decide on; \`window\` is the conversation up to and including it, oldest first, for context (\`t\` = seconds ago; \`agent\` lines are what ${agent} said; \`cut_off\` marks where ${agent} was interrupted; \`partial\` lines are still being spoken). \`policy\` says when ${agent} speaks and \`facts\` what ${agent} is doing now; \`facts.addressed_by_name\` says \`latest\` calls ${agent} by name, which makes it addressed to ${agent} but not necessarily a request to answer now. What should ${agent} do about \`latest\`?`,
     options: {
       answer: {
         what: `The latest utterance is for ${agent} and needs a reply now: a question or request to ${agent} by name (facts.addressed_by_name); an answer or information the speaker gives right after ${agent} asked them something (${agent}'s last line in \`window\` is a question to them); or, as the policy allows, a question or request that nobody else is taking up; and the speaker has finished the thought. facts.latest_is_question and facts.latest_to_you are computed from the words of latest; people speak Ukrainian and English, often mixed.`,
-        not_for: `A remark to another person, a thought still being finished (also after ${agent}'s name, "${agent}, I was wondering..."), small talk, or something already answered; ${agent} merely mentioned in the third person; ${agent} told by name not to answer or to wait ("${agent}, don't answer that", "${agent}, wait for Anna").`,
+        not_for: `A remark to another person, a thought still being finished (also after ${agent}'s name, "${agent}, I was wondering..."), small talk, or something already answered; ${agent} merely mentioned in the third person; ${agent} told by name not to answer or to wait ("${agent}, don't answer that", "${agent}, wait for Anna").${bare}`,
       },
       stay_silent: {
         what: `${agent} should not speak: the utterance is addressed to a person, is small talk or a reaction, is unfinished, was already answered, people are talking among themselves, or ${agent} is told by name to hold back ("${agent}, don't answer that", "${agent}, wait for Anna", an unfinished "${agent}, I was wondering").`,
-        not_for: `A finished question or request to ${agent}, an answer to a question ${agent} just asked, or an instruction about what ${agent} is saying or about to say.`,
+        not_for: `A finished question or request to ${agent}, an answer to a question ${agent} just asked, or an instruction about what ${agent} is saying or about to say.${bare}`,
       },
       stop: {
         what: `Someone tells ${agent} to stop or be quiet, or says the answer ${agent} is giving or preparing is no longer needed.`,
@@ -106,6 +130,7 @@ function actionDecision(agent: string): ChoiceDecision {
         what: `Someone asks ${agent} to go on with what ${agent} was saying when cut off (facts.cut_off_after).`,
         not_for: `Any request when ${agent} was not cut off (facts.cut_off_after is null); a new question.`,
       },
+      ...(commands ? commandOptions(agent) : {}),
     },
   };
 }
@@ -191,10 +216,10 @@ const toJevQuestion = (decision: Decision) =>
     ? { type: 'choice', instructions: decision.prompt, criteria: decision.options }
     : { type: 'noul', instructions: decision.prompt, criteria: decision.criteria };
 
-export const judgeQuestions = (agent: string, overlap?: 'paused' | 'ducked') =>
+export const judgeQuestions = (agent: string, overlap?: 'paused' | 'ducked', commands = false) =>
   Object.fromEntries(
     Object.entries({
-      action: actionDecision(agent),
+      action: actionDecision(agent, commands),
       ...shadowDecisions(agent),
       still_wanted: stillWantedDecision(agent),
       ...(overlap ? { barge_in: bargeInDecision(agent, overlap === 'ducked') } : {}),
@@ -306,6 +331,8 @@ function shadowLog(response: DecisionResponse | null) {
 
 interface JudgeOptions {
   signal?: AbortSignal;
+  /** A voice call: the `action` Choice offers the spoken commands. */
+  commands?: boolean;
   callId?: string;
   windowVersion?: number;
 }
@@ -352,7 +379,7 @@ async function ask<V>(
 export const askAction = (state: JevState, opts: JudgeOptions = {}): Promise<{ verdict: Verdict | null; ms: number }> =>
   ask(
     state,
-    { action: actionDecision(state.agent_name), ...shadowDecisions(state.agent_name) },
+    { action: actionDecision(state.agent_name, opts.commands), ...shadowDecisions(state.agent_name) },
     (result) => verdictOf<Action>(result),
     opts,
   );

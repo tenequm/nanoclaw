@@ -89,6 +89,7 @@ import {
   CALL_TURN_TOPIC,
   CALL_UPDATING_ATTRIBUTE,
   CALL_VOICE_ATTRIBUTE,
+  JEV_COMMAND_CUES,
   MAX_JEV_EVENTS_PER_POST,
   MAX_JEV_POST_BYTES,
   MAX_TURN_TEXT_BYTES,
@@ -6256,7 +6257,8 @@ async function runJevCall(s: JevCallSetup): Promise<void> {
     : deps.transcriber({
         apiKey: s.geminiKey,
         model: meta.sttModel,
-        vocabulary: [...new Set(meta.vocabulary ?? [])],
+        // The names and the spoken commands, as a plain call's: the host acts on the commands it hears.
+        vocabulary: [...new Set([...(meta.vocabulary ?? []), ...COMMAND_VOCABULARY])],
         languageCodes: languages.codes,
         sampleRate: INPUT_SAMPLE_RATE,
         onInterim: (text) => loop.onInterim(text),
@@ -6500,7 +6502,10 @@ async function runJevCall(s: JevCallSetup): Promise<void> {
       else if (event.type === 'overlap') loop.onOverlap(event.requestId, event.verdict, event.reason);
       else if (event.type === 'revoke') loop.onRevoke(event.replyId);
       else if (event.type === 'allow_play') loop.onAllowPlay(event.replyId, event.requestId);
-      else if (!voiceCall || listenUntilOver) return;
+      // A spoken command's cue, listening or not; any other name is not the host's to ask for.
+      else if (event.type === 'cue') {
+        if ((JEV_COMMAND_CUES as readonly string[]).includes(event.cue)) cues.cue(event.cue);
+      } else if (!voiceCall || listenUntilOver) return;
       else if (event.type === 'thinking') {
         typingUntil = Date.now() + THINKING_HOLD_MS;
         refreshThinking();

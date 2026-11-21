@@ -204,6 +204,47 @@ describe('createJevCall', () => {
     call.end('done');
   });
 
+  it.each([
+    ['voice', true, [[{ type: 'cue', cue: 'nope' }]]],
+    ['meet', false, []],
+  ] as const)(
+    'asks Jev with the spoken commands and pushes their cues on a %s call only: %s',
+    async (kind, commands, cues) => {
+      const push = vi.fn();
+      const judge = vi.fn(async () => ({ verdict: null, ms: 1 }));
+      const core: CallCore<null> = {
+        initial: () => null,
+        reduce: () => null,
+        decide: (_state, event) =>
+          event.kind === 'reply'
+            ? [
+                { kind: 'cue', cue: 'nope' },
+                { kind: 'judge', windowVersion: 1, state: {} as never },
+              ]
+            : [],
+      };
+      const call = createJevCall(
+        {
+          callId: 'c1',
+          kind,
+          callerName: 'Ethan',
+          agentName: 'Andy',
+          agentAliases: [],
+          maxTextBytes: 4096,
+          submitTurn: async () => ({ ok: false, reason: 'test' }),
+          push,
+          now: () => 1_000_000,
+        },
+        { core, judge },
+      );
+      call.reply('Hello.', null);
+      await flush();
+      expect(judge).toHaveBeenCalledWith({}, expect.objectContaining({ commands }));
+      expect(push.mock.calls.filter(([event]) => event.type === 'cue')).toEqual(cues);
+      call.end('test');
+    },
+  );
+
   it('logs both question texts once per call', async () => {
     vi.mocked(log.info).mockClear();
     const { call, say } = jevCall();
