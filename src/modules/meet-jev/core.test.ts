@@ -145,6 +145,20 @@ describe('listen until over', () => {
     expect(call.feed({ kind: 'hangup' })).toEqual([{ kind: 'post_caller', text: 'Next draft' }]);
   });
 
+  it('holds an overlap marker out of the draft until the worker releases it after a cut', () => {
+    const call = listening();
+    call.say(caller, 'a', 'Draft');
+    const words = { kind: 'utterance', speaker: caller, uttId: 'b', text: 'Next, прийом.' } as const;
+    call.feed(
+      { kind: 'speech', speaker: caller, uttId: 'b', on: true },
+      { ...words, final: false },
+      { kind: 'speech', speaker: caller, on: false },
+    );
+    expect(only(call.feed({ ...words, final: true, contextOnly: true }), 'turn')).toEqual([]);
+    expect(call.state.listenDraft?.map((piece) => piece.text)).toEqual(['Draft', '']);
+    expect(only(call.feed({ ...words, final: true }), 'turn').map((turn) => turn.message)).toEqual(['Draft Next']);
+  });
+
   it('settles a lost final with its last partial and unblocks later releases', () => {
     const call = listening();
     call.feed(

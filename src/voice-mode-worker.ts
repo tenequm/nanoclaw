@@ -1267,6 +1267,8 @@ export interface CallVoice {
   speak(text: string, ready: () => Promise<void>, signal: AbortSignal): Promise<LineOutcome>;
   /** Holds the playing line at its next unplayed sample, or lets it go on from there. */
   setSpeechPaused(paused: boolean): void;
+  setSpeechDucked(ducked: boolean): void;
+  playedText(): string;
   /** The `nanoclaw.voice-mode.thinking` attribute. */
   setThinking(thinking: boolean): void;
   /** One message on the `nanoclaw.voice-mode.turn` topic. */
@@ -1319,6 +1321,8 @@ export interface CallVoiceEvents {
   onSpeech(speaking: boolean, at: number): void;
   /** The VAD analyzed the audio through stream position `at`, its last window with speech ending at `quietFrom`. */
   onVad(at: number, quietFrom: number): void;
+  /** Each VAD window's speech probability, the window ending at stream position `at`. */
+  onVadWindow?(at: number, probability: number): void;
   /** The agent's audio started or stopped playing. */
   onAgentSpeaking(speaking: boolean): void;
   onClosed(reason: string): void;
@@ -4036,6 +4040,7 @@ export class Outbox {
 const VAD_ACTIVATION = 0.5;
 /** Silero's window at 16 kHz: audio short of a whole one waits for the next frames before it is analyzed. */
 const VAD_WINDOW = 512;
+const VAD_WINDOW_MS = (VAD_WINDOW * 1000) / INPUT_SAMPLE_RATE;
 
 /** A VAD stream as CallerInput uses it: Silero's, or a test's. */
 export interface VadStream extends AsyncIterable<{
@@ -4062,7 +4067,7 @@ export class CallerInput {
 
   constructor(
     private readonly newVad: () => VadStream,
-    private readonly events: Pick<CallVoiceEvents, 'onAudio' | 'onSpeech' | 'onVad' | 'onClosed'>,
+    private readonly events: Pick<CallVoiceEvents, 'onAudio' | 'onSpeech' | 'onVad' | 'onVadWindow' | 'onClosed'>,
     private readonly log: Pick<Console, 'error'>,
   ) {}
 
@@ -4112,6 +4117,7 @@ export class CallerInput {
           const at = vad.from + ev.samplesIndex;
           if ((ev.probability ?? 0) > VAD_ACTIVATION) vad.quietFrom = at;
           this.events.onVad(at, vad.quietFrom);
+          this.events.onVadWindow?.(at, ev.probability ?? 0);
         } else if (ev.type === VADEventType.START_OF_SPEECH) {
           vad.speaking = true;
           this.events.onSpeech(true, vad.from + ev.samplesIndex - samplesOf(ev.speechDuration));
@@ -4171,7 +4177,10 @@ export interface SpeechOutputOptions {
 }
 
 /** The call's speech: its lines into the speech sink, and the caller's pick of what speaks them. */
-export function speechOutput(o: SpeechOutputOptions): Pick<CallVoice, 'say' | 'speak' | 'setSpeechPaused'> & {
+export function speechOutput(o: SpeechOutputOptions): Pick<
+  CallVoice,
+  'say' | 'speak' | 'setSpeechPaused' | 'setSpeechDucked' | 'playedText'
+> & {
   selectTts: NonNullable<CallVoice['selectTts']>;
   readonly speech: LineSpeech;
   close(): Promise<void>;
@@ -4193,18 +4202,48 @@ export function speechOutput(o: SpeechOutputOptions): Pick<CallVoice, 'say' | 's
   let closed = false;
   let hold: Promise<void> | undefined;
   let release: (() => void) | undefined;
-  /** The line's last frames sent, newest last, and those a pause took back from the sink to send again. */
-  let recent: Int16Array[] = [];
+  /**
+   * The line's last frames sent as synthesized, newest last, each with the gain it started at, and those a
+   * pause or a duck took back from the sink to send again.
+   */
+  let recent: Array<{ pcm: Int16Array; gain: number }> = [];
   let held: Int16Array[] = [];
+  let gain = 1;
+  let targetGain = 1;
+  let rampSamples = 0;
+  let playedText = () => '';
+  /** The capture in flight, and the sending of what a duck took back: one capture at a time keeps the order. */
+  let sending: Promise<void> | undefined;
+  let replaying: Promise<void> | undefined;
+  let replay = () => {};
   const releasePause = () => {
     hold = undefined;
     release?.();
     release = undefined;
   };
   const send = async (frame: Int16Array) => {
-    recent.push(frame);
+    recent.push({ pcm: frame, gain });
     if (recent.length > SPEECH_REPLAY_FRAMES) recent.shift();
-    await o.sink.captureFrame(new AudioFrame(frame, TTS_SAMPLE_RATE, 1, SPEECH_FRAME));
+    let out = frame;
+    if (gain !== 1 || rampSamples) {
+      out = new Int16Array(frame.length);
+      for (let i = 0; i < frame.length; i++) {
+        if (rampSamples > 0) gain += (targetGain - gain) / rampSamples--;
+        out[i] = Math.round(frame[i] * gain);
+      }
+    }
+    sending = o.sink.captureFrame(new AudioFrame(out, TTS_SAMPLE_RATE, 1, SPEECH_FRAME));
+    await sending;
+  };
+  /** What the sink has not played goes back in line, and the gain back to where that audio started. */
+  const takeBack = () => {
+    // Rounded up: the sink's count is an estimate, and a frame heard twice beats one never heard.
+    const unplayed = Math.min(recent.length, Math.ceil(o.sink.queuedDuration / SPEECH_FRAME_MS));
+    if (unplayed <= 0) return;
+    o.sink.clearQueue();
+    const back = recent.splice(recent.length - unplayed);
+    gain = back[0].gain;
+    held = [...back.map((frame) => frame.pcm), ...held];
   };
   /**
    * One line into the speech sink: streamed as it is synthesized, resolved once it has played. `signal`
@@ -4238,9 +4277,11 @@ export function speechOutput(o: SpeechOutputOptions): Pick<CallVoice, 'say' | 's
     /** Set by the line's abort, in whichever phase it lands: what had played by then. */
     let cutPlayedMs: number | undefined;
     // The abort silences the line at once, not at the next provider chunk or after the queue drained.
+    const playedDuration = () => Math.max(0, audioMs - o.sink.queuedDuration - held.length * SPEECH_FRAME_MS);
+    playedText = () => playedPrefix(text, playedDuration(), audioMs, complete);
     const cutNow = () => {
       if (closed || cutPlayedMs !== undefined) return;
-      cutPlayedMs = Math.max(0, audioMs - o.sink.queuedDuration - held.length * SPEECH_FRAME_MS);
+      cutPlayedMs = playedDuration();
       o.sink.clearQueue();
     };
     let abortedResolve!: () => void;
@@ -4263,11 +4304,29 @@ export function speechOutput(o: SpeechOutputOptions): Pick<CallVoice, 'say' | 's
     /** Waits out a pause, then sends again what it took back, so the line goes on at its next unplayed sample. */
     const resumed = async () => {
       for (;;) {
-        while (hold) await hold;
+        while (hold || replaying) await (hold ?? replaying);
         const frame = held.shift();
         if (!frame || lineSignal.aborted) return;
         await send(frame);
       }
+    };
+    // A duck does not wait for the next synthesized chunk: the sink would be silent until then.
+    replay = () => {
+      const prior = replaying;
+      const run: Promise<void> = (async () => {
+        await prior;
+        await sending?.catch(() => undefined);
+        while (!hold && !lineSignal.aborted) {
+          const frame = held.shift();
+          if (!frame) return;
+          await send(frame);
+        }
+      })()
+        .catch(() => undefined)
+        .finally(() => {
+          if (replaying === run) replaying = undefined;
+        });
+      replaying = run;
     };
     /** The sink's playout, again after each pause, until it played out unpaused or the line ended. */
     const drain = async () => {
@@ -4277,7 +4336,7 @@ export function speechOutput(o: SpeechOutputOptions): Pick<CallVoice, 'say' | 's
           playout.catch(() => undefined);
           await Promise.race([playout, aborted]);
         } else await playout;
-        if (lineSignal.aborted || (!hold && !held.length)) return;
+        if (lineSignal.aborted || (!hold && !held.length && !replaying)) return;
         await resumed();
       }
     };
@@ -4350,6 +4409,10 @@ export function speechOutput(o: SpeechOutputOptions): Pick<CallVoice, 'say' | 's
       return { outcome: { heard, failed, cut: false, audioMs, playedMs, complete }, said: false };
     } finally {
       lineSignal.removeEventListener('abort', onAbort);
+      gain = targetGain = 1;
+      rampSamples = 0;
+      playedText = () => '';
+      replay = () => {};
       recent = [];
       held = [];
       releasePause();
@@ -4374,17 +4437,22 @@ export function speechOutput(o: SpeechOutputOptions): Pick<CallVoice, 'say' | 's
   return {
     say,
     speak,
+    playedText: () => playedText(),
+    setSpeechDucked(ducked) {
+      const target = ducked ? 10 ** (JEV_DUCK_DB / 20) : 1;
+      if (closed || target === targetGain) return;
+      // The sink would play its queue at the old gain: the new one starts at the next unplayed sample.
+      takeBack();
+      targetGain = target;
+      rampSamples = Math.round((TTS_SAMPLE_RATE * (ducked ? JEV_DUCK_ATTACK_MS : JEV_DUCK_RELEASE_MS)) / 1000);
+      if (held.length) replay();
+    },
     setSpeechPaused(paused) {
       if (closed || paused === !!hold) return;
       if (paused) {
         hold = new Promise<void>((resolve) => (release = resolve));
-        // The sink would play its queue on through the pause: what it has not played goes back in line.
-        // Rounded up: the sink's count is an estimate, and a frame heard twice beats one never heard.
-        const unplayed = Math.min(recent.length, Math.ceil(o.sink.queuedDuration / SPEECH_FRAME_MS));
-        if (unplayed > 0) {
-          o.sink.clearQueue();
-          held = [...recent.splice(recent.length - unplayed), ...held];
-        }
+        // The sink would play its queue on through the pause.
+        takeBack();
       } else releasePause();
       o.paused?.(paused);
     },
@@ -4628,6 +4696,8 @@ async function roomVoice(
     say: speaker.say,
     speak: speaker.speak,
     setSpeechPaused: speaker.setSpeechPaused,
+    setSpeechDucked: speaker.setSpeechDucked,
+    playedText: speaker.playedText,
     selectTts: speaker.selectTts,
     setThinking: (thinking) => setAttr(CALL_THINKING_ATTRIBUTE, thinking ? '1' : '', 'the thinking state'),
     publishTurn: (status) => sendJson(CALL_TURN_TOPIC, status, 'a turn status'),
@@ -4907,10 +4977,78 @@ export function callCues(o: {
 /**
  * The reflex: this long after the VAD's speech start over a playing line, the line pauses (Jev's own
  * `min_duration`; LiveKit's default is 500 ms). Silero starts speech after about 50 ms of sound and
- * ends it about 550 ms after the sound stops, so any sound that trips it pauses the line. Words of the
- * speech that take the turn (`takesTurn`: a partial or final, or the host's `words`) cut it.
+ * ends it about 550 ms after the sound stops. Jev voice calls judge the overlap during the pause.
  */
 export const JEV_BARGE_MS = 300;
+// Leave the line audible beneath the caller while Jev decides.
+export const JEV_DUCK_DB = -12;
+// Lower the line quickly enough to give the caller room without a gain step.
+export const JEV_DUCK_ATTACK_MS = 50;
+// Restore speech gradually so a backchannel does not cause a sudden jump.
+export const JEV_DUCK_RELEASE_MS = 400;
+// Bound the wait from the first overlap request to a local word-list decision.
+export const JEV_OVERLAP_VERDICT_TIMEOUT_MS = 1500;
+/** Silero's window probability that counts as evidence of real speech: STT phantoms on noise stayed under it. */
+export const JEV_EVIDENCE_P = 0.95;
+/** Evidence windows a whole segment needs to be the caller's words: every real one had 6 or more, word-producing noise 0. */
+export const JEV_SPEECH_EVIDENCE_WINDOWS = 3;
+/** Evidence windows a partial needs to cut or ask Jev: wordless noise reached 3, the shortest real first partial 6. */
+export const JEV_BARGE_EVIDENCE_WINDOWS = 4;
+/** Evidence windows a known STT phantom (the whole text) needs, and a partial needs to be shown or sent at all. */
+export const JEV_PHANTOM_EVIDENCE_WINDOWS = 10;
+/**
+ * What speech recognition writes on noise and silence, matched against the whole normalized text only. Words a
+ * caller really says ("okay", "thank you", "bye") stay off it: they keep the ordinary segment bar.
+ */
+export const JEV_PHANTOM_PHRASES: ReadonlySet<string> = new Set([
+  'you are welcome',
+  'youre welcome',
+  'you re welcome',
+  'thanks for watching',
+  'thank you for watching',
+  'thanks for watching bye',
+  'thank you for watching bye',
+  'subtitles by',
+  'дякую за перегляд',
+  'продолжение следует',
+  'спасибо за просмотр',
+  'субтитры',
+  'you',
+]);
+/** How far back the VAD's windows are kept: the transcription's pre-roll counts toward a segment's evidence. */
+const JEV_VAD_HISTORY_MS = PRE_ROLL_MS + 200;
+
+/** Silero's evidence of real speech in one caller segment, pre-roll included. */
+export interface SpeechEvidence {
+  /** Windows at or over JEV_EVIDENCE_P. */
+  strong: number;
+  peak: number;
+  /** Windows over Silero's activation, each one VAD window long. */
+  voiced: number;
+}
+
+const evidenceOf = (utterance: { evidence?: SpeechEvidence }): SpeechEvidence =>
+  (utterance.evidence ??= { strong: 0, peak: 0, voiced: 0 });
+
+/** A whole text that is one of JEV_PHANTOM_PHRASES, ignoring case, punctuation and a trailing "subtitles by ..." credit. */
+export function isSttPhantom(text: string): boolean {
+  const words = text
+    .toLowerCase()
+    .replace(/[\u2019']/g, '')
+    .match(/[\p{L}\p{N}]+/gu);
+  if (!words) return false;
+  const whole = words.join(' ');
+  return JEV_PHANTOM_PHRASES.has(whole) || whole.startsWith('subtitles by ') || whole.startsWith('субтитры ');
+}
+
+/**
+ * Whether a caller segment's words are real speech by Silero's evidence: `windows` at or over JEV_EVIDENCE_P
+ * against `need`, and against JEV_PHANTOM_EVIDENCE_WINDOWS when the whole text is a known STT phantom.
+ */
+export function heardAsSpeech(text: string, windows: number, need = JEV_SPEECH_EVIDENCE_WINDOWS): boolean {
+  return windows >= (isSttPhantom(text) ? Math.max(need, JEV_PHANTOM_EVIDENCE_WINDOWS) : need);
+}
+
 /** Quiet this long after a pausing speech, with no words of it, resumes the line (`false_interruption_timeout`). */
 export const JEV_FALSE_INTERRUPTION_TIMEOUT_MS = 2_000;
 /**
@@ -4945,6 +5083,17 @@ export function deliveredText(text: string, share: number): string {
     out = text.slice(0, end);
   }
   return out;
+}
+
+/** Letters and digits only, lower case: "Yeah." and "yeah" are the same words. */
+const spokenKey = (text: string): string => (text.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? []).join(' ');
+
+const startsWithWords = (text: string, prefix: string): boolean =>
+  !!prefix && (text === prefix || text.startsWith(`${prefix} `));
+
+function playedPrefix(text: string, playedMs: number, audioMs: number, complete: boolean): string {
+  const totalMs = complete ? audioMs : Math.max(audioMs, (text.length * 1000) / JEV_SPEECH_CHARS_PER_SECOND);
+  return totalMs > 0 ? deliveredText(text, Math.min(playedMs, audioMs) / totalMs) : '';
 }
 
 const isPartial = (e: JevWorkerEvent): e is Extract<JevWorkerEvent, { type: 'utterance' }> =>
@@ -5090,7 +5239,7 @@ export function serveAppInterrupt(
   callerTrack: () => CallerMic | undefined,
   interrupt: CallVoiceEvents['onInterrupt'],
 ): void {
-  if (!meta.appCall || !meta.jev || meta.meeting || !interrupt) return;
+  if (!meta.appCall || !meta.jev || meta.jevOverlapVerdict || meta.jevDuck || meta.meeting || !interrupt) return;
   register(CALL_INTERRUPT, async ({ payload, callerIdentity }) => {
     if (callerIdentity !== meta.callerIdentity) return JSON.stringify({ ok: false, reason: 'unknown caller' });
     let req: Partial<AppInterrupt> | null;
@@ -5131,6 +5280,10 @@ export interface JevLoopDeps {
   speak(text: string, ready: () => Promise<void>, signal: AbortSignal, replyId: string): Promise<LineOutcome>;
   /** Holds the playing line where it is, or lets it go on from there. */
   setSpeechPaused(paused: boolean): void;
+  setSpeechDucked?(ducked: boolean): void;
+  overlapPlayedText?(): string;
+  /** The VAD's windows reach `onVadWindow`: the caller's words need Silero's evidence of real speech. */
+  speechEvidence?: boolean;
   /** One event for the host, in order. */
   report(event: JevWorkerEvent): void;
   /** The caller's caption for the utterance numbered `segment`. */
@@ -5144,6 +5297,18 @@ export interface JevLoopDeps {
 interface JevUtterance {
   /** This activity belonged to an explicit draft, even if the caller toggled off before its final. */
   listened?: boolean;
+  /** Words over a paused line, held from the host's turn decisions while the pause judges them. */
+  contextOnly?: boolean;
+  final?: boolean;
+  /** The words (`spokenKey`) a pause decided not to cut on: a final that says only these stays context. */
+  keptText?: string;
+  /** Cut for these words: the pump releases them once the line's cut is reported. */
+  releasing?: boolean;
+  evidence?: SpeechEvidence;
+  /** Its latest partial went to the host and the captions (it had the evidence). */
+  shown?: boolean;
+  /** Its final had no evidence of real speech: never a turn, a caption or a cut. */
+  noise?: boolean;
   phoneWords?: string;
   needsPhoneFinal?: boolean;
   uttId: string;
@@ -5155,6 +5320,7 @@ interface JevUtterance {
 }
 
 interface JevPlayout {
+  releaseTurn?: JevUtterance;
   phonePlayedMs?: number;
   replyId: string;
   text: string;
@@ -5195,6 +5361,22 @@ export class JevLoop {
   };
   /** The line the reflex paused, until words cut it or quiet (or JEV_MAX_PAUSE_MS) resumes it. */
   private pause?: { line: JevPlayout; since: number };
+  /** The paused line's judgement of one utterance: its requests by id, the latest, and the shared deadline. */
+  private overlap?: {
+    utterance: JevUtterance;
+    pending: Map<string, string>;
+    latestId?: string;
+    retryAfter?: string;
+    keepTalking?: boolean;
+    timer?: ReturnType<typeof setTimeout>;
+    askedAt?: number;
+    /** The last decision short of a cut: for which words, and whether it lets the line go on. */
+    kept?: { text: string; keepTalking: boolean };
+    /** Words held back from Jev until they have the evidence of real speech. */
+    blocked?: string;
+  };
+  /** The VAD's recent windows, for a new speech's pre-roll evidence. */
+  private readonly vadWindows: Array<{ at: number; p: number }> = [];
   private resumeTimer?: ReturnType<typeof setTimeout>;
   private maxPauseTimer?: ReturnType<typeof setTimeout>;
   /** This speech's pause ran out at JEV_MAX_PAUSE_MS: it does not pause the line again. */
@@ -5256,7 +5438,13 @@ export class JevLoop {
         this.capture?.start(preRoll);
         // The next activity's socket, set up while this one runs: no connect latency at the next speech.
         void transcriber.prepare();
+
+        // The pre-roll's windows count toward the speech's evidence, as its audio goes to the transcription.
+        const opened = this.utterance;
+        const from = Math.max(preRollFloor, at - samplesOf(PRE_ROLL_MS));
+        if (opened) for (const w of this.vadWindows) if (w.at > from) this.countWindow(opened, w.p);
       }
+      if (this.pause && this.deps.overlapPlayedText) this.reflex();
       clearTimeout(this.bargeTimer);
       this.bargeTimer = setTimeout(() => this.reflex(), JEV_BARGE_MS);
       this.bargeTimer.unref?.();
@@ -5274,9 +5462,12 @@ export class JevLoop {
       ...(this.speechOver ? { over: this.speechOver } : {}),
     };
     const pause = this.pause;
-    if (pause && !pause.line.abort.signal.aborted) {
+    this.resumeIfKept();
+    if (pause && pause === this.pause && !pause.line.abort.signal.aborted) {
       this.resumeTimer = setTimeout(() => {
-        if (pause === this.pause && !this.speaking) this.resume('quiet');
+        if (pause !== this.pause || this.speaking) return;
+        this.decideNow('quiet');
+        if (pause === this.pause) this.resume('quiet');
       }, JEV_FALSE_INTERRUPTION_TIMEOUT_MS);
       this.resumeTimer.unref?.();
     }
@@ -5301,10 +5492,21 @@ export class JevLoop {
           }
           return;
         }
+        if (!this.heardSpeech(utterance, text || utterance.text)) {
+          if (audio) this.deps.recorded?.(utterance.segment, audio, text || utterance.text, 'noise');
+          this.ignoreNoise(utterance, text || utterance.text);
+          return;
+        }
         // Recorded even when the call ended first: the last words before a hang-up are worth keeping.
         if (audio) this.deps.recorded?.(utterance.segment, audio, text || utterance.text);
         this.finishUtterance(utterance, text || (listening() ? utterance.text : ''));
-        if (pausedLine && this.playing === pausedLine && !pausedLine.abort.signal.aborted && takesTurn(text)) {
+        if (
+          !utterance.contextOnly &&
+          pausedLine &&
+          this.playing === pausedLine &&
+          !pausedLine.abort.signal.aborted &&
+          takesTurn(text)
+        ) {
           this.deps.log.info('voice-mode worker: the words of the speech that paused the line came; it is cut', {
             replyId: pausedLine.replyId,
           });
@@ -5314,8 +5516,17 @@ export class JevLoop {
       (err: unknown) => {
         this.deps.log.warn('voice-mode worker: an utterance has no final', { err });
         if (audio) this.deps.recorded?.(utterance.segment, audio, utterance.text, 'stt');
+        if (utterance.text && !this.heardSpeech(utterance, utterance.text)) {
+          this.ignoreNoise(utterance, utterance.text);
+          return;
+        }
         if ((beforePlayback || listening()) && !utterance.phoneWords) this.finishUtterance(utterance, utterance.text);
         utterance.needsPhoneFinal = true;
+        // No final will come: a keep on its partial is its last word.
+        if (utterance.contextOnly) {
+          utterance.final = true;
+          this.resumeIfKept();
+        }
         if (utterance.phoneWords) this.finishUtterance(utterance, utterance.text || utterance.phoneWords);
       },
     );
@@ -5327,16 +5538,97 @@ export class JevLoop {
   onInterim(text: string): void {
     const utterance = this.utterance;
     if (!utterance || text === utterance.text) return;
+    if (this.deps.overlapPlayedText) this.reflex();
     utterance.text = text;
-    this.deps.report({ type: 'utterance', uttId: utterance.uttId, text, final: false, at: this.now() });
-    this.deps.caption?.(utterance.segment, text, false);
     utterance.worded = takesTurn(text);
-    if (utterance.worded) this.reflex();
+    this.showPartial(utterance);
+    if (this.overlap?.utterance === utterance) this.checkOverlap(utterance);
+    else if (utterance.worded) this.reflex();
+  }
+
+  /** One VAD window's speech probability: kept for the next speech's pre-roll, and counted for the open one. */
+  onVadWindow(at: number, probability: number): void {
+    if (this.closed || !this.deps.speechEvidence) return;
+    this.vadWindows.push({ at, p: probability });
+    while (this.vadWindows.length && this.vadWindows[0].at <= at - samplesOf(JEV_VAD_HISTORY_MS))
+      this.vadWindows.shift();
+    const utterance = this.utterance;
+    if (!utterance) return;
+    const before = evidenceOf(utterance).strong;
+    this.countWindow(utterance, probability);
+    const now = evidenceOf(utterance).strong;
+    // Words held for want of evidence act once it arrives: a real interruption is delayed, never lost.
+    if (now !== before && (now === JEV_BARGE_EVIDENCE_WINDOWS || now === JEV_PHANTOM_EVIDENCE_WINDOWS))
+      this.evidenceArrived(utterance);
+  }
+
+  private countWindow(utterance: JevUtterance, p: number): void {
+    const e = evidenceOf(utterance);
+    e.peak = Math.max(e.peak, p);
+    if (p > VAD_ACTIVATION) e.voiced++;
+    if (p >= JEV_EVIDENCE_P) e.strong++;
+  }
+
+  private evidenceArrived(utterance: JevUtterance): void {
+    if (!utterance.text) return;
+    if (!utterance.shown) this.showPartial(utterance);
+    const overlap = this.overlap;
+    if (overlap?.utterance === utterance) {
+      if (overlap.blocked !== undefined && overlap.blocked === utterance.text.trim()) this.checkOverlap(utterance);
+    } else if (utterance.worded) this.reflex();
+  }
+
+  /**
+   * Without the gate every text counts; with it, a whole segment needs `need` windows of evidence. Words the
+   * phone heard (its interrupt) come with its own VAD's say-so and no windows here.
+   */
+  private heardSpeech(utterance: JevUtterance, text: string, need = JEV_SPEECH_EVIDENCE_WINDOWS): boolean {
+    if (!this.deps.speechEvidence || utterance.phoneWords) return true;
+    return heardAsSpeech(text, evidenceOf(utterance).strong, need);
+  }
+
+  /** What a barge-in may act on: a partial needs more evidence than a final. */
+  private bargeHeard(utterance: JevUtterance): boolean {
+    const need = utterance.final ? JEV_SPEECH_EVIDENCE_WINDOWS : JEV_BARGE_EVIDENCE_WINDOWS;
+    return this.heardSpeech(utterance, utterance.text, need);
+  }
+
+  /**
+   * The latest partial to the host and the captions, once it has the phantom bar's evidence: by then any final
+   * passes too, so nothing shown ever needs taking back (the clients drop an empty caption, not a shown one).
+   */
+  private showPartial(utterance: JevUtterance): void {
+    utterance.shown = this.heardSpeech(utterance, utterance.text, JEV_PHANTOM_EVIDENCE_WINDOWS);
+    if (!utterance.shown) return;
+    this.reportTranscript(utterance, utterance.text, false);
+    this.deps.caption?.(utterance.segment, utterance.text, false);
+  }
+
+  /** A segment whose words had no evidence of real speech: logged for tuning, and otherwise a wordless sound. */
+  private ignoreNoise(utterance: JevUtterance, text: string): void {
+    utterance.noise = true;
+    utterance.needsPhoneFinal = true;
+    // Settle the host's placeholder even if the local overlap still holds unverified words.
+    if (!this.closed)
+      this.deps.report({ type: 'utterance', uttId: utterance.uttId, text: '', final: true, at: this.now() });
+    const { strong, peak, voiced } = evidenceOf(utterance);
+    this.deps.log.info('voice-mode worker: noise segment ignored', {
+      text,
+      peak: Math.round(peak * 1000) / 1000,
+      windows: strong,
+      voicedMs: voiced * VAD_WINDOW_MS,
+    });
+    const overlap = this.overlap;
+    if (overlap?.utterance !== utterance) return;
+    clearTimeout(overlap.timer);
+    overlap.timer = overlap.latestId = overlap.retryAfter = undefined;
+    overlap.pending.clear();
+    overlap.keepTalking = false;
   }
 
   /** The host's `words`: a participant's words arrived (the reflex's confirmation where the worker has no transcript). */
   onWords(): void {
-    if (this.closed) return;
+    if (this.closed || this.deps.overlapPlayedText) return;
     if (this.speaking) {
       this.wordsHeard = true;
       this.reflex();
@@ -5449,7 +5741,7 @@ export class JevLoop {
     }
     const line = this.playing;
     if (line?.replyId !== replyId) return;
-    if (this.pause?.line === line) {
+    if (this.paused && this.pause?.line === line) {
       this.deps.log.info('voice-mode worker: the host revoked a paused line; it is cut', { replyId });
       line.abort.abort();
       return;
@@ -5463,7 +5755,7 @@ export class JevLoop {
   }
 
   get paused(): boolean {
-    return !!this.pause;
+    return !!this.pause && !this.deps.setSpeechDucked;
   }
 
   get callerSpeaking(): boolean {
@@ -5499,6 +5791,7 @@ export class JevLoop {
 
   close(): void {
     this.closed = true;
+    this.dropOverlap();
     clearTimeout(this.resumeTimer);
     clearTimeout(this.maxPauseTimer);
     clearTimeout(this.appSpeechTimer);
@@ -5515,29 +5808,49 @@ export class JevLoop {
     }
   }
 
-  /** Caller speech past JEV_BARGE_MS over a playing line: VAD alone pauses it, words cut it, paused or not. */
   private reflex(): void {
     const line = this.playing;
     if (!line?.started || !this.speaking || line.abort.signal.aborted) return;
     if (!this.pause && this.now() - this.speechSince < JEV_BARGE_MS) return;
-    if (!this.utterance?.worded && !this.wordsHeard) {
-      if (!this.pause && !this.pauseSpent) {
-        this.pause = { line, since: this.now() };
-        this.maxPauseTimer = setTimeout(() => this.resume('max_pause'), JEV_MAX_PAUSE_MS);
-        this.maxPauseTimer.unref?.();
-        this.deps.setSpeechPaused(true);
-      }
+    const utt = this.utterance;
+    const judging = !!(this.deps.overlapPlayedText && utt);
+    if (judging && this.speechOver !== line) return;
+    // After a wordless pause expires, the first late words still belong to the interrupted line.
+    const useWordList = !judging || (this.pauseSpent && !utt.contextOnly);
+    if (useWordList && ((utt?.worded && this.bargeHeard(utt)) || this.wordsHeard)) {
+      this.deps.log.info('voice-mode worker: the caller talks over the agent; the line is cut', {
+        replyId: line.replyId,
+        speechMs: this.now() - this.speechSince,
+      });
+      this.cutSpeech(line);
       return;
     }
-    this.deps.log.info('voice-mode worker: the caller talks over the agent; the line is cut', {
-      replyId: line.replyId,
-      speechMs: this.now() - this.speechSince,
-    });
-    this.cutSpeech(line);
+    if (this.pauseSpent) return;
+    if (!this.pause) {
+      this.pause = { line, since: this.now() };
+      this.maxPauseTimer = setTimeout(() => {
+        this.decideNow('max_pause');
+        this.resume('max_pause');
+      }, JEV_MAX_PAUSE_MS);
+      this.maxPauseTimer.unref?.();
+      this.holdSpeech(true);
+    }
+    if (judging && this.overlap?.utterance !== utt) {
+      // The earlier speech's undecided words get the word list's answer, not none.
+      this.decideNow('replaced');
+      if (line.abort.signal.aborted) return;
+      this.dropOverlap();
+      this.overlap = { utterance: utt, pending: new Map() };
+      utt.contextOnly = true;
+      if (utt.text) {
+        if (utt.shown) this.reportTranscript(utt, utt.text, false);
+        this.checkOverlap(utt);
+      }
+    }
   }
 
   /** A false barge-in: the paused line goes on from where it stopped. */
-  private resume(reason: 'quiet' | 'max_pause'): void {
+  private resume(reason: 'quiet' | 'max_pause' | 'backchannel'): void {
     const pause = this.pause;
     if (!pause || pause.line.abort.signal.aborted) return;
     this.endPause();
@@ -5548,20 +5861,182 @@ export class JevLoop {
       pauseMs: this.now() - pause.since,
       reason,
     });
-    this.deps.setSpeechPaused(false);
+    this.holdSpeech(false);
+  }
+
+  /** A keep resumes the line once the caller is quiet and the final it covers is in. */
+  private resumeIfKept(): void {
+    const overlap = this.overlap;
+    if (overlap?.keepTalking && overlap.utterance.final && !this.speaking) this.resume('backchannel');
+  }
+
+  /** A pause that ends gives words still awaiting a verdict the word list's answer first. */
+  private decideNow(reason: string): void {
+    if (this.overlap?.timer) this.applyOverlap(null, reason);
+  }
+
+  private holdSpeech(on: boolean): void {
+    if (this.deps.setSpeechDucked) this.deps.setSpeechDucked(on);
+    else this.deps.setSpeechPaused(on);
   }
 
   private endPause(): void {
     clearTimeout(this.resumeTimer);
     clearTimeout(this.maxPauseTimer);
     this.pause = undefined;
+    this.dropOverlap();
+  }
+
+  private dropOverlap(): void {
+    const overlap = this.overlap;
+    if (!overlap) return;
+    // Words that arrive later for a speech never judged are an ordinary turn again.
+    if (!overlap.utterance.text.trim()) overlap.utterance.contextOnly = false;
+    clearTimeout(overlap.timer);
+    this.overlap = undefined;
   }
 
   private finishUtterance(utterance: JevUtterance, text: string): void {
     utterance.needsPhoneFinal = false;
     if (this.closed) return;
-    this.deps.report({ type: 'utterance', uttId: utterance.uttId, text, final: true, at: this.now() });
+    if (utterance.contextOnly) {
+      text ||= utterance.text;
+      utterance.text = text;
+      utterance.final = true;
+      // No pause judges it any more: words beyond those it kept are an ordinary turn.
+      if (this.overlap?.utterance !== utterance && !utterance.releasing && utterance.keptText !== spokenKey(text))
+        utterance.contextOnly = false;
+    }
+    if (this.deps.speechEvidence && text) {
+      const { strong, peak, voiced } = evidenceOf(utterance);
+      this.deps.log.info('voice-mode worker: utterance evidence', {
+        segment: utterance.segment,
+        windows: strong,
+        peak: Math.round(peak * 1000) / 1000,
+        voicedMs: voiced * VAD_WINDOW_MS,
+        chars: text.length,
+      });
+    }
+    this.reportTranscript(utterance, text, true);
+    this.checkOverlap(utterance);
     if (text) this.deps.caption?.(utterance.segment, text, true);
+  }
+
+  private reportTranscript(utt: JevUtterance, text: string, final: boolean): void {
+    this.deps.report({
+      type: 'utterance',
+      uttId: utt.uttId,
+      text,
+      final,
+      ...(utt.contextOnly ? { contextOnly: true } : {}),
+      at: this.now(),
+    });
+  }
+
+  private checkOverlap(utt: JevUtterance): void {
+    const overlap = this.overlap;
+    const line = this.pause?.line;
+    if (!overlap || overlap.utterance !== utt || !line || line.abort.signal.aborted) return;
+    const text = utt.text.trim();
+    // The final says only what the pause already decided on: that decision stands.
+    if (utt.final && overlap.kept?.text === spokenKey(text)) {
+      clearTimeout(overlap.timer);
+      overlap.timer = overlap.latestId = overlap.retryAfter = undefined;
+      overlap.keepTalking = overlap.kept.keepTalking;
+      return this.resumeIfKept();
+    }
+    const current = overlap.latestId;
+    if (current && overlap.pending.get(current) === text) return;
+    overlap.keepTalking = false;
+    overlap.latestId = undefined;
+    overlap.retryAfter = undefined;
+    overlap.blocked = undefined;
+    if (!/[\p{L}\p{N}]/u.test(text)) {
+      clearTimeout(overlap.timer);
+      overlap.timer = undefined;
+      return;
+    }
+    // Not yet heard as real speech: the line stays held, and the words are asked about once the evidence comes.
+    if (!this.bargeHeard(utt)) {
+      clearTimeout(overlap.timer);
+      overlap.timer = undefined;
+      overlap.blocked = text;
+      return;
+    }
+    // Revisions share one deadline, so a stream of partials cannot postpone the fallback.
+    if (!overlap.timer) {
+      overlap.askedAt = this.now();
+      overlap.timer = setTimeout(() => this.applyOverlap(null, 'deadline'), JEV_OVERLAP_VERDICT_TIMEOUT_MS);
+      overlap.timer.unref?.();
+    }
+    for (const [id, pendingText] of overlap.pending) {
+      if (pendingText === text) {
+        overlap.retryAfter = id;
+        return;
+      }
+    }
+    const requestId = randomUUID();
+    overlap.latestId = requestId;
+    overlap.pending.set(requestId, text);
+    this.deps.report({
+      type: 'overlap',
+      requestId,
+      replyId: line.replyId,
+      played: this.deps.overlapPlayedText!(),
+      text,
+      at: this.now(),
+    });
+  }
+
+  /** The host's answer to an overlap request; `reason` says why it has no verdict. */
+  onOverlap(requestId: string, verdict: 'yield' | 'keep_talking' | null, reason?: string): void {
+    const overlap = this.overlap;
+    const judged = overlap?.pending.get(requestId);
+    if (!overlap || judged === undefined) return;
+    overlap.pending.delete(requestId);
+    if (requestId === overlap.latestId) this.applyOverlap(verdict, verdict ? undefined : (reason ?? 'error'));
+    // Words that still begin with the ones judged a yield take the turn: no need to wait for the latest.
+    else if (verdict === 'yield' && startsWithWords(spokenKey(overlap.utterance.text), spokenKey(judged)))
+      this.applyOverlap(verdict);
+    else if (requestId === overlap.retryAfter) {
+      // STT revised away from this text and back while the first request was in flight.
+      this.checkOverlap(overlap.utterance);
+    }
+  }
+
+  /** `fallback`: why the word list decides instead of a Jev verdict. */
+  private applyOverlap(verdict: 'yield' | 'keep_talking' | null, fallback?: string): void {
+    const overlap = this.overlap;
+    const line = this.pause?.line;
+    if (!overlap || !line || this.playing !== line || line.abort.signal.aborted) return;
+    clearTimeout(overlap.timer);
+    overlap.timer = undefined;
+    if (overlap.latestId) overlap.pending.delete(overlap.latestId);
+    overlap.latestId = undefined;
+    overlap.retryAfter = undefined;
+    const utt = overlap.utterance;
+    // Words not heard as real speech decide nothing: the line stays held until evidence, or quiet, comes.
+    if (utt.noise || !this.bargeHeard(utt)) return;
+    const cut = verdict === 'yield' || (verdict === null && takesTurn(utt.text));
+    this.deps.log.info('voice-mode worker: the overlap is decided', {
+      replyId: line.replyId,
+      outcome: cut ? 'yield' : 'keep',
+      source: verdict ? 'jev' : (fallback ?? 'error'),
+      ms: overlap.askedAt === undefined ? null : this.now() - overlap.askedAt,
+      chars: utt.text.length,
+    });
+    if (cut) {
+      // The turn judge needs the cut playback report in its window before it decides on these words.
+      line.releaseTurn = utt;
+      utt.releasing = true;
+      this.cutSpeech(line);
+      return;
+    }
+    utt.keptText = spokenKey(utt.text);
+    // A ducked line is restored on anything short of a cut; either way only once the speech is over.
+    overlap.keepTalking = verdict === 'keep_talking' || !!this.deps.setSpeechDucked;
+    overlap.kept = { text: utt.keptText, keepTalking: overlap.keepTalking };
+    this.resumeIfKept();
   }
 
   private cutSpeech(line: JevPlayout): void {
@@ -5578,6 +6053,12 @@ export class JevLoop {
           const line = this.queue.shift();
           if (!line || this.closed) break;
           await this.play(line);
+          const utt = line.releaseTurn;
+          if (utt && !this.closed) {
+            utt.contextOnly = utt.releasing = false;
+            // A partial without the evidence to be shown waits for its final, which the gate decides.
+            if (!utt.noise && (utt.final || utt.shown)) this.reportTranscript(utt, utt.text, !!utt.final);
+          }
         }
       } finally {
         this.pumping = false;
@@ -5597,19 +6078,23 @@ export class JevLoop {
       outcome = { heard: false, failed: true, cut: false, audioMs: 0, playedMs: 0, complete: false };
     } finally {
       const paused = !!this.pause;
+      const words = this.overlap?.utterance;
+      // A line that ended (stop, revoke, failure) before its pause decided leaves the words an ordinary turn.
+      if (words && !words.noise && spokenKey(words.text) && words.keptText === undefined && !line.releaseTurn) {
+        line.releaseTurn = words;
+        words.releasing = true;
+      }
       this.endPause();
       this.playing = undefined;
       // The speech output lets go of its hold as the line ends; a hold that outlived it would stall the next line.
-      if (paused) this.deps.setSpeechPaused(false);
+      if (paused) this.holdSpeech(false);
     }
     const at = this.now();
     if (outcome.cut || (outcome.failed && outcome.heard)) {
       // Cut by the reflex or the host, or the speech model failed mid-line: what played is reported.
-      const totalMs = outcome.complete
-        ? outcome.audioMs
-        : Math.max(outcome.audioMs, (line.text.length * 1000) / JEV_SPEECH_CHARS_PER_SECOND);
-      const playedMs = Math.min(line.phonePlayedMs ?? outcome.playedMs, outcome.audioMs);
-      const delivered = outcome.heard && totalMs > 0 ? deliveredText(line.text, playedMs / totalMs) : '';
+      const delivered = outcome.heard
+        ? playedPrefix(line.text, line.phonePlayedMs ?? outcome.playedMs, outcome.audioMs, outcome.complete)
+        : '';
       if (outcome.failed) this.deps.log.warn('voice-mode worker: a line failed mid-way', { replyId: line.replyId });
       this.deps.report({ type: 'playback', replyId: line.replyId, state: 'cut_off', delivered, at });
       return;
@@ -5749,7 +6234,18 @@ async function runJevCall(s: JevCallSetup): Promise<void> {
     muted: () => !voiceCall || ending || !cuesOn || agentSpeaking,
     log: callLog,
   });
-  const reporter = new JevReporter((events) => host.post('jev', { events }), callLog);
+  const reporter = new JevReporter(async (events) => {
+    let ok = false;
+    try {
+      const response = await host.post('jev', { events });
+      ok = response.ok;
+      return response;
+    } finally {
+      if (!ok) {
+        for (const event of events) if (event.type === 'overlap') loop.onOverlap(event.requestId, null, 'host_error');
+      }
+    }
+  }, callLog);
   const languages = callLanguages(meta.languages);
   const transcriber = meta.meeting
     ? undefined
@@ -5768,6 +6264,9 @@ async function runJevCall(s: JevCallSetup): Promise<void> {
     confirmPlayout: meta.confirmPlayout === true,
     ...(transcriber ? { transcriber } : {}),
     appCall: !!meta.appCall && voiceCall,
+    ...(meta.jevOverlapVerdict && voiceCall ? { overlapPlayedText: () => callVoice?.playedText() ?? '' } : {}),
+    ...(meta.jevDuck && voiceCall ? { setSpeechDucked: (on: boolean) => callVoice?.setSpeechDucked(on) } : {}),
+    ...(transcriber && meta.jevSpeechGate ? { speechEvidence: true } : {}),
     speak: async (text, ready, signal, replyId) => {
       if (!callVoice) return { heard: false, failed: true, cut: false, audioMs: 0, playedMs: 0, complete: false };
       speakingReplyId = replyId;
@@ -5878,6 +6377,7 @@ async function runJevCall(s: JevCallSetup): Promise<void> {
           callRecording?.push(pcm);
         },
         onVad: () => undefined,
+        onVadWindow: (at, probability) => loop.onVadWindow(at, probability),
         onSpeech: (speaking, at) => {
           if (!ending) loop.onSpeech(speaking, at);
         },
@@ -5993,6 +6493,7 @@ async function runJevCall(s: JevCallSetup): Promise<void> {
         refreshThinking();
       } else if (event.type === 'stop') loop.onStop();
       else if (event.type === 'words') loop.onWords();
+      else if (event.type === 'overlap') loop.onOverlap(event.requestId, event.verdict, event.reason);
       else if (event.type === 'revoke') loop.onRevoke(event.replyId);
       else if (event.type === 'allow_play') loop.onAllowPlay(event.replyId, event.requestId);
       else if (!voiceCall || listenUntilOver) return;

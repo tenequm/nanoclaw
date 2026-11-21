@@ -36,7 +36,18 @@ export function parseWorkerEvent(raw: unknown, maxTextBytes: number): JevWorkerE
       return typeof e.on === 'boolean' ? { type: 'listen', on: e.on, at: e.at } : null;
     case 'utterance':
       if (!isId(e.uttId) || !text(e.text) || typeof e.final !== 'boolean') return null;
-      return { type: 'utterance', uttId: e.uttId, text: e.text, final: e.final, at: e.at };
+      if (e.contextOnly !== undefined && e.contextOnly !== true) return null;
+      return {
+        ...(e.contextOnly ? { contextOnly: true } : {}),
+        type: 'utterance',
+        uttId: e.uttId,
+        text: e.text,
+        final: e.final,
+        at: e.at,
+      };
+    case 'overlap':
+      if (!isId(e.requestId) || !isId(e.replyId) || !text(e.played) || !text(e.text)) return null;
+      return { type: 'overlap', requestId: e.requestId, replyId: e.replyId, played: e.played, text: e.text, at: e.at };
     case 'speech':
       if (typeof e.on !== 'boolean' || (e.uttId !== undefined && !isId(e.uttId))) return null;
       return { type: 'speech', on: e.on, ...(e.uttId ? { uttId: e.uttId } : {}), at: e.at };
@@ -69,7 +80,25 @@ export function createWorkerIngress(caller: { name: string }, maxTextBytes: numb
       case 'listen':
         return { kind: 'listen', on: e.on, at };
       case 'utterance':
-        return { kind: 'utterance', speaker, uttId: e.uttId, text: e.text, final: e.final, at };
+        return {
+          ...(e.contextOnly ? { contextOnly: true } : {}),
+          kind: 'utterance',
+          speaker,
+          uttId: e.uttId,
+          text: e.text,
+          final: e.final,
+          at,
+        };
+      case 'overlap':
+        return {
+          kind: 'overlap',
+          speaker,
+          requestId: e.requestId,
+          replyId: e.replyId,
+          played: e.played,
+          text: e.text,
+          at,
+        };
       case 'speech':
         return { kind: 'speech', speaker, on: e.on, ...(e.uttId ? { uttId: e.uttId } : {}), at };
       case 'play_ready':

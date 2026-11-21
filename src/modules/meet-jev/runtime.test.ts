@@ -56,6 +56,7 @@ function fakePorts(overrides: Partial<RuntimePorts> = {}) {
   const turns: Array<{ message: string; note: string; signal: AbortSignal; resolve: (r: JevTurnResult) => void }> = [];
   const judges: Array<{ signal: AbortSignal; resolve: (v: { verdict: null; ms: number }) => void }> = [];
   const ports: RuntimePorts = {
+    overlap: async () => {},
     now: () => Date.now(),
     judge: (_state, signal) => new Promise((resolve) => judges.push({ signal, resolve })),
     recheck: async () => ({ verdict: null, ms: 0 }),

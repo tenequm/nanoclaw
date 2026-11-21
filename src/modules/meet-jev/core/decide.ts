@@ -83,11 +83,20 @@ export function reduce(prev: CallState, event: CallEvent): CallState {
         flushDraft(state, state.listenDraft.splice(0), !state.afterListen);
       }
       break;
+    case 'overlap': {
+      const latest = { speaker: event.speaker.name, text: event.text };
+      const input = toJevState(state, latest, addressedByName(state, event.text));
+      // Only the prefix already heard belongs in the playing line.
+      for (const line of input.window) if (line.agent && line.partial) line.text = event.played;
+      out.push({ kind: 'overlap', requestId: event.requestId, windowVersion: state.windowVersion, state: input });
+      break;
+    }
     case 'utterance':
       if (state.listenDraft) {
         capturePiece(state, event.speaker.id, event.uttId, event);
         break;
       }
+      if (event.contextOnly) break;
       if (event.final && hasWords(event.text)) out.push({ kind: 'status', status: 'heard' });
       // An older final can settle the last open piece of a pending turn.
       if (
@@ -267,7 +276,7 @@ function capturePiece(
   state: CallState,
   speakerId: string,
   uttId: string,
-  transcript?: { text: string; final: boolean },
+  transcript?: { text: string; final: boolean; contextOnly?: boolean },
 ): void {
   const draft = state.listenDraft!;
   if (isHandled(state.speakers[speakerId], uttId)) return;
@@ -287,8 +296,9 @@ function capturePiece(
     return;
   }
   if (piece.final && !transcript.final) return;
-  piece.text = transcript.text.trim();
-  piece.final = transcript.final;
+  // A held overlap can become dictation after the worker reports a cut. Until then it has no draft words.
+  piece.text = transcript.contextOnly ? '' : transcript.text.trim();
+  piece.final = transcript.final && !transcript.contextOnly;
   if (!piece.final) {
     if (!stillSpeaking(state, speakerId)) armPiece(state, piece);
     return;
@@ -415,7 +425,7 @@ function boundary(state: CallState, speakerId: string): void {
 function decideLatest(state: CallState, speakerId: string): boolean {
   const speaker = state.speakers[speakerId];
   const utt = latestUtterance(state, speakerId);
-  if (!speaker || !utt || !hasWords(utt.text) || isHandled(speaker, utt.uttId)) return false;
+  if (!speaker || !utt || utt.contextOnly || !hasWords(utt.text) || isHandled(speaker, utt.uttId)) return false;
   markHandled(speaker, utt.uttId);
   // A newer decision sees the deferred utterance in its window; it is not decided again after it.
   const deferred = state.deferred;

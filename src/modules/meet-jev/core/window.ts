@@ -19,6 +19,7 @@ export interface Utterance {
   uttId: string;
   text: string;
   final: boolean;
+  contextOnly?: boolean;
   startedAt: number;
   at: number;
 }
@@ -226,7 +227,7 @@ export function openTurn(state: CallState, speakerId: string): Utterance[] {
     ...state.agentLines.filter((line) => line.state !== 'shown').map((line) => line.at),
   );
   const earlier = state.utterances
-    .filter((u) => u.speakerId === speakerId && u.startedAt < current.startedAt && hasWords(u.text))
+    .filter((u) => u.speakerId === speakerId && !u.contextOnly && u.startedAt < current.startedAt && hasWords(u.text))
     .sort((a, b) => b.startedAt - a.startedAt);
   for (const piece of earlier) {
     if (piece.startedAt <= closedAt || pieces[0].startedAt - piece.at > state.policy.oneCaller.joinGapMs) break;
@@ -321,6 +322,7 @@ export function applyWindow(state: CallState, event: CallEvent): void {
         // A late final updates its own line; it never makes an older utterance the current one again.
         utt.text = text;
         utt.final = event.final;
+        utt.contextOnly = event.contextOnly;
         utt.at = event.at;
         break;
       }
@@ -335,6 +337,7 @@ export function applyWindow(state: CallState, event: CallEvent): void {
         uttId: event.uttId,
         text,
         final: event.final,
+        ...(event.contextOnly ? { contextOnly: true } : {}),
         startedAt: current ? Math.min(event.at, current.startedAt - 1) : event.at,
         at: event.at,
       });

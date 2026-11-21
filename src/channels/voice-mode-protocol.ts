@@ -124,6 +124,10 @@ export interface LiveKitJobMetadata {
    * the host sends.
    */
   jev?: boolean;
+  jevOverlapVerdict?: boolean;
+  /** The worker drops caller words without Silero's evidence of real speech (VOICE_MODE_JEV_SPEECH_GATE). */
+  jevSpeechGate?: boolean;
+  jevDuck?: boolean;
 }
 
 /**
@@ -137,7 +141,8 @@ export type JevWorkerEvent =
   /** Ordered with speech so both ends apply the setting at the same boundary. */
   | { type: 'listen'; on: boolean; at: number }
   /** Words heard: partials of one `uttId` update it, its final replaces it. */
-  | { type: 'utterance'; uttId: string; text: string; final: boolean; at: number }
+  | { type: 'utterance'; uttId: string; text: string; final: boolean; contextOnly?: true; at: number }
+  | { type: 'overlap'; requestId: string; replyId: string; played: string; text: string; at: number }
   /** VAD start or end of speech on the call's input. */
   | { type: 'speech'; on: boolean; uttId?: string; at: number }
   | { type: 'play_ready'; replyId: string; requestId: string; at: number }
@@ -575,11 +580,16 @@ export type CallEndReason = (typeof CALL_END_REASONS)[number];
  * worker has no transcript of its own. A jev voice call also gets the loop's
  * `status` and the agent's `thinking` ticks, which its worker plays its cues and typing sound from.
  */
+/** Why the host answers an overlap request without a verdict. */
+export type OverlapFallback = 'cap' | 'error' | 'mid_band' | 'not_playing' | 'off';
+
 export type LiveKitHostEvent =
   | { type: 'reply'; text: string; turn?: string | null; replyId?: string }
   | { type: 'stop' }
   | { type: 'revoke'; replyId: string }
   | { type: 'words' }
+  /** Jev's answer to the worker's `overlap` request; with no verdict, `reason` says why (the worker logs it). */
+  | { type: 'overlap'; requestId: string; verdict: 'yield' | 'keep_talking' | null; reason?: OverlapFallback }
   | { type: 'thinking' }
   | { type: 'allow_play'; replyId: string; requestId: string }
   | { type: 'working' }
