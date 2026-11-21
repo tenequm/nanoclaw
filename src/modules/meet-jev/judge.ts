@@ -172,6 +172,30 @@ function shadowDecisions(agent: string): Record<string, ProbabilityDecision> {
   };
 }
 
+/**
+ * On a voice call, whether the caller said new words before a discard phrase, asked beside `action` and read only on a
+ * `discard` verdict: with none, nothing is unsent and the discard takes back the answer on its way. The question quotes
+ * the caller's newest line: `latest` also carries a held turn's words, sent before it, and asked about `latest` (or
+ * told to look at the last line of `window`) Jev counts those (live, 0.74-0.98 on "Dan, scratch that" after one).
+ */
+function newWordsDecision(agent: string, line: string): ProbabilityDecision {
+  return {
+    kind: 'probability',
+    prompt: `The caller's newest line is ${line}. It may end with a discard phrase (${quoted(CALL_COMMAND_WORDS.discard)}), with which the caller takes words back. Look only at that line; \`latest\` and earlier lines do not count. Before the discard phrase in that line, does the caller say a new request, question or information, not just filler, ${agent}'s name, an acknowledgement, or a saying that leads into the take-back?`,
+    criteria: {
+      true: `A request, question or information before the phrase in that line, in English ("Book a table for eight, scratch that", "And book me a taxi for nine. No, scratch that") or Ukrainian ("Забронюй столик на сьому, scratch that", "І виклич таксі на дев'яту. Ні, scratch that").`,
+      false: `Nothing before the phrase in that line, or only filler, ${agent}'s name, an acknowledgement or a saying like "you know what" or "never mind", in English ("${agent}, scratch that", "No, scratch that", "Yeah, no, scratch that", "You know what, scratch that") or Ukrainian ("Та ні, scratch that", "Ні, забудь, scratch that", "Знаєш що, scratch that").`,
+    },
+  };
+}
+
+/** The newest finished line of `latest`'s speaker, as JSON for the new_words question. */
+function newestLine(state: JevState): string | undefined {
+  const speaker = state.latest?.speaker;
+  const line = [...state.window].reverse().find((l) => !l.agent && !l.partial && l.speaker === speaker);
+  return line && JSON.stringify(line.text);
+}
+
 function stillWantedDecision(agent: string): ChoiceDecision {
   return {
     kind: 'choice',
@@ -221,6 +245,8 @@ export const judgeQuestions = (agent: string, overlap?: 'paused' | 'ducked', com
     Object.entries({
       action: actionDecision(agent, commands),
       ...shadowDecisions(agent),
+      // Each request quotes the caller's line where this placeholder stands.
+      ...(commands ? { new_words: newWordsDecision(agent, '"{the caller\'s newest line}"') } : {}),
       still_wanted: stillWantedDecision(agent),
       ...(overlap ? { barge_in: bargeInDecision(agent, overlap === 'ducked') } : {}),
     }).map(([name, decision]) => [name, toJevQuestion(decision)]),
@@ -341,7 +367,7 @@ interface JudgeOptions {
 async function ask<V>(
   state: unknown,
   decisions: Record<string, Decision>,
-  toVerdict: (result: DecisionResult | undefined) => V | null,
+  toVerdict: (result: DecisionResult | undefined, results: Record<string, DecisionResult>) => V | null,
   opts: JudgeOptions,
 ): Promise<{ verdict: V | null; ms: number }> {
   const started = Date.now();
@@ -351,7 +377,7 @@ async function ask<V>(
   let failure: JevFailure | null = null;
   try {
     response = await jev.evaluate({ input: state, decisions, signal: opts.signal });
-    verdict = toVerdict(response.results[question]);
+    verdict = toVerdict(response.results[question], response.results);
     if (verdict === null) {
       failure = { category: 'parse', message: response.errors[question] ?? `Invalid Choice answer for ${question}` };
     }
@@ -371,18 +397,29 @@ async function ask<V>(
     ms,
     failure,
     ...(question === 'action' ? shadowLog(response) : {}),
+    ...(response && 'new_words' in response.answers ? { new_words: response.answers.new_words ?? null } : {}),
   });
   return { verdict, ms };
 }
 
 /** Ask Jev what the agent should do about the window. Never throws; null on any failure. */
-export const askAction = (state: JevState, opts: JudgeOptions = {}): Promise<{ verdict: Verdict | null; ms: number }> =>
-  ask(
+export function askAction(state: JevState, opts: JudgeOptions = {}): Promise<{ verdict: Verdict | null; ms: number }> {
+  const line = opts.commands ? newestLine(state) : undefined;
+  return ask(
     state,
-    { action: actionDecision(state.agent_name, opts.commands), ...shadowDecisions(state.agent_name) },
-    (result) => verdictOf<Action>(result),
+    {
+      action: actionDecision(state.agent_name, opts.commands),
+      ...shadowDecisions(state.agent_name),
+      ...(line ? { new_words: newWordsDecision(state.agent_name, line) } : {}),
+    },
+    (result, results) => {
+      const verdict = verdictOf<Action>(result);
+      const newWords = results.new_words;
+      return verdict && newWords?.kind === 'probability' ? { ...verdict, newWords: newWords.value } : verdict;
+    },
     opts,
   );
+}
 
 /** Ask Jev about the caller's words over the agent's line. Never throws; with no verdict, `reason` says why. */
 export async function askOverlap(

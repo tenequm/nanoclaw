@@ -564,6 +564,73 @@ describe('the request to Jev', () => {
     expect(judgeQuestions('Dan', undefined, true).action).toStrictEqual(sent.questions.action);
   });
 
+  it("asks a voice call's new_words Noul about the caller's newest line, quoted, beside the shadows", async () => {
+    const said = {
+      ...state,
+      latest: { speaker: 'Misha', text: 'Book a table for eight tonight. Dan, scratch that.' },
+      window: [
+        { t: 3.4, speaker: 'Misha', text: 'Book a table for eight tonight.' },
+        { t: 1.1, speaker: 'Misha', text: 'Dan, scratch that.' },
+        { t: 0.2, speaker: 'Misha', text: 'And', partial: true as const },
+      ],
+    };
+    const fetchMock = respond({});
+    await askAction(said, { commands: true });
+    const sent = JSON.parse((fetchMock.mock.calls[0] as [string, RequestInit])[1].body as string);
+    expect(sent.state).toEqual(said);
+    expect(Object.keys(sent.questions)).toEqual([
+      'action',
+      'wants_reply_now',
+      'for_someone_else',
+      'unfinished',
+      'already_answered',
+      'new_words',
+    ]);
+    const { new_words: noul } = sent.questions;
+    expect(noul.type).toBe('noul');
+    expect(noul.instructions).toMatch(/^The caller's newest line is "Dan, scratch that\."\. /);
+    for (const { say } of CALL_COMMAND_WORDS.discard) expect(noul.instructions).toContain(`"${say}"`);
+    expect(noul.criteria.true).toContain('Забронюй');
+    expect(noul.criteria.false).toContain('"Dan, scratch that"');
+    const template = judgeQuestions('Dan', undefined, true).new_words;
+    expect({
+      ...template,
+      instructions: template.instructions.replace('"{the caller\'s newest line}"', '"Dan, scratch that."'),
+    }).toStrictEqual(noul);
+    expect(judgeQuestions('Dan')).not.toHaveProperty('new_words');
+  });
+
+  it('asks no new_words without a finished caller line, nor on a meeting', async () => {
+    const fetchMock = respond({});
+    await askAction(
+      { ...state, latest: null, window: [{ t: 1, speaker: 'Dan', text: 'Hello.', agent: true }] },
+      {
+        commands: true,
+      },
+    );
+    await askAction(state);
+    for (const [, init] of fetchMock.mock.calls as [string, RequestInit][])
+      expect(JSON.parse(init.body as string).questions).not.toHaveProperty('new_words');
+  });
+
+  it.each([
+    ['a well-formed Noul', { type: 'noul', noul: 0.04 }, 0.04],
+    ['no Noul', undefined, undefined],
+    ['a malformed Noul', { type: 'noul', noul: 1.4 }, undefined],
+    ['a Choice in its place', choice, undefined],
+  ])("reads the new-words answer from %s into a voice call's verdict", async (_label, newWords, expected) => {
+    const probabilities = { answer: 0.03, stay_silent: 0.05, stop: 0.12, continue: 0, send: 0, discard: 0.8 };
+    respond({ answers: { action: { ...choice, choice: 'discard', probabilities }, new_words: newWords } });
+    const { verdict } = await askAction(state, { commands: true });
+    expect(verdict).toEqual({
+      action: 'discard',
+      probabilities,
+      confidence: 0.72,
+      ...(expected === undefined ? {} : { newWords: expected }),
+    });
+    expect(vi.mocked(log.info).mock.calls[0][1]).toMatchObject({ new_words: newWords ?? null });
+  });
+
   it("reads a voice call's verdict over all six options", async () => {
     const probabilities = { answer: 0.05, stay_silent: 0.05, stop: 0, continue: 0, send: 0.85, discard: 0.05 };
     respond({ answers: { action: { ...choice, choice: 'send', probabilities } } });

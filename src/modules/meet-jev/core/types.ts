@@ -42,6 +42,11 @@ export interface Choice<A extends string> {
  */
 export type Verdict = Omit<Choice<Action>, 'probabilities'> & {
   probabilities: Record<Exclude<Action, CommandAction>, number> & Partial<Record<CommandAction, number>>;
+  /**
+   * A voice call's: Jev's probability that the caller said a new request, question or information before the discard
+   * phrase in their last line, read on a `discard` only; absent when Jev gave no well-formed answer to it.
+   */
+  newWords?: number;
 };
 
 /** Whether the agent goes on with its line or yields the turn, when the caller talks over it. */
@@ -223,6 +228,11 @@ export interface CallPolicy {
   /** The `CommandAction`s' only where the call offers them. */
   thresholds: Record<Exclude<Action, 'stay_silent' | CommandAction>, ActionThreshold> &
     Partial<Record<CommandAction, ActionThreshold>>;
+  /**
+   * Voice: on a `discard`, the words before the phrase in the judged line are words to drop only with Jev's `newWords`
+   * at or over this; under it they only lead into the take-back.
+   */
+  newWords?: ActionThreshold;
   /** A landed answer is shown instead of spoken only when the recheck says `show` over this. */
   recheckShow: ActionThreshold;
 }

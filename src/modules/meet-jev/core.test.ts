@@ -649,13 +649,50 @@ describe('spoken commands on a voice call', () => {
     expect(confirmed.filter((c) => c.kind === 'turn' || c.kind === 'revoke' || c.kind === 'recheck')).toEqual([]);
   });
 
-  it('answers a send with nothing unsent with nope and nothing else', () => {
-    const call = new Call();
-    expect(judged(call, 'a', 'Copy that.', 'send')).toEqual([
-      expect.objectContaining({ kind: 'judge' }),
-      { kind: 'cue', cue: 'nope' },
+  it.each(['Zulu.', 'Прийом.', 'Прийом. Copy.'])(
+    'answers "%s" with nothing unsent and nothing on its way with nope',
+    (text) => {
+      const call = new Call();
+      expect(judged(call, 'a', text, 'send')).toEqual([
+        expect.objectContaining({ kind: 'judge' }),
+        { kind: 'cue', cue: 'nope' },
+      ]);
+      expect(call.lastLog('command')).toMatchObject({ command: 'send', outcome: 'nothing' });
+    },
+  );
+
+  it.each(['Copy that.', 'Copy.', 'copy that', 'Copy. Copy that.'])(
+    'stays silent on a lone "%s" with nothing unsent and nothing on its way: an acknowledgement, no cue',
+    (text) => {
+      const call = new Call();
+      const [turn] = only(call.sayAnswered(caller, 'a', 'Book a table for eight tonight.'), 'turn');
+      call.feed({ kind: 'turn', key: turn.key, turnId: 't1' });
+      call.feed({ kind: 'reply', replyId: 'r1', turnId: 't1', text: 'Done. Your table is booked for eight tonight.' });
+      call.feed({ kind: 'playback', replyId: 'r1', state: 'started' });
+      call.feed({ kind: 'playback', replyId: 'r1', state: 'completed' });
+      // Jev's split on "Copy that." after a finished answer, live: send over answer, under stay_silent.
+      const result = withdrawn(call, 'b', text, { stay_silent: 0.62, send: 0.34, answer: 0.03, stop: 0.01 });
+      expect(result.filter((c) => c.kind !== 'judge')).toEqual([]);
+      expect(call.lastLog('command')).toMatchObject({ command: 'send', outcome: 'acknowledged' });
+    },
+  );
+
+  it('keeps a lone "Copy that." a send when words are unsent, and a confirmation when a turn is on its way', () => {
+    const unsent = new Call();
+    judged(unsent, 'a', 'And bring the keys.', 'stay_silent');
+    expect(
+      withdrawn(unsent, 'b', 'Copy that.', { stay_silent: 0.62, send: 0.34, answer: 0.03, stop: 0.01 }).filter(
+        (c) => c.kind === 'cue' || c.kind === 'turn',
+      ),
+    ).toEqual([
+      { kind: 'cue', cue: 'sent' },
+      expect.objectContaining({ kind: 'turn', message: 'And bring the keys.' }),
     ]);
-    expect(call.lastLog('command')).toMatchObject({ command: 'send', outcome: 'nothing' });
+    const onItsWay = new Call();
+    const [turn] = only(onItsWay.sayAnswered(caller, 'a', 'What is the weather in Kyiv tomorrow?'), 'turn');
+    onItsWay.feed({ kind: 'turn', key: turn.key, turnId: 't1' });
+    expect(only(judged(onItsWay, 'b', 'Copy that.', 'send'), 'cue')).toEqual([{ kind: 'cue', cue: 'sent' }]);
+    expect(onItsWay.lastLog('command')).toMatchObject({ command: 'send', outcome: 'confirmed' });
   });
 
   it("sends a held turn's continuation with its trigger on send, replacing the answer not started yet", () => {
@@ -787,13 +824,24 @@ describe('spoken commands on a voice call', () => {
     'Okay, scratch that.',
     'Sorry, scratch that.',
     'Ні, scratch that.',
-  ])('takes back a sent turn on "%s": a lead-in is no words to drop, and the answer is shown only', (text) => {
+    'Dan, scratch that.',
+    'Ден, scratch that.',
+    'Hey Dan, scratch that.',
+    'You know what, scratch that.',
+    'Never mind, scratch that.',
+    'Та ні, scratch that.',
+  ])('takes back a sent turn on "%s" when Jev hears no new words: the answer is shown only', (text) => {
     const call = new Call();
     const [turn] = only(call.sayAnswered(caller, 'a', 'Book a table for eight tonight.'), 'turn');
     call.feed({ kind: 'turn', key: turn.key, turnId: 't1' });
-    const result = withdrawn(call, 'b', text, { discard: 0.8, stop: 0.1, stay_silent: 0.06, answer: 0.04 });
+    const result = withdrawn(call, 'b', text, { discard: 0.8, stop: 0.1, stay_silent: 0.06, answer: 0.04 }, 0.03);
     expect(only(result, 'cue')).toEqual([{ kind: 'cue', cue: 'discard' }]);
-    expect(call.lastLog('command')).toMatchObject({ command: 'discard', dropped: false, withdrawn: true });
+    expect(call.lastLog('command')).toMatchObject({
+      command: 'discard',
+      dropped: false,
+      withdrawn: true,
+      newWords: 0.03,
+    });
     expect(call.feed({ kind: 'reply', replyId: 'r1', turnId: 't1', text: 'Booked.' })).toEqual([
       { kind: 'show', replyId: 'r1', text: 'Booked.' },
     ]);
@@ -806,12 +854,13 @@ describe('spoken commands on a voice call', () => {
     const [merged] = only(call.sayAnswered(caller, 'b', 'And book me a taxi for nine.'), 'turn');
     expect(merged.message).toBe('What is the weather in Kyiv tomorrow? And book me a taxi for nine.');
     call.feed({ kind: 'turn', key: merged.key, turnId: 't2' });
-    const result = withdrawn(call, 'c', 'No, scratch that.', {
-      discard: 0.7,
-      stop: 0.2,
-      stay_silent: 0.06,
-      answer: 0.04,
-    });
+    const result = withdrawn(
+      call,
+      'c',
+      'No, scratch that.',
+      { discard: 0.7, stop: 0.2, stay_silent: 0.06, answer: 0.04 },
+      0.02,
+    );
     expect(only(result, 'cue')).toEqual([{ kind: 'cue', cue: 'discard' }]);
     expect(call.lastLog('command')).toMatchObject({ command: 'discard', dropped: false, withdrawn: true });
     expect(call.feed({ kind: 'reply', replyId: 'r2', turnId: 't2', text: 'Sunny; the taxi is booked.' })).toEqual([
@@ -819,18 +868,61 @@ describe('spoken commands on a voice call', () => {
     ]);
   });
 
-  it('stops a playing line on "No, scratch that.", as a stop does', () => {
+  it.each(['No, scratch that.', 'Dan, scratch that.', 'You know what, scratch that.'])(
+    'stops a playing line on "%s" when Jev hears no new words, as a stop does',
+    (text) => {
+      const call = new Call();
+      wakeAndSpeak(call, 'what time is it?', 'Noon.', 1);
+      const result = withdrawn(call, 'u2', text, { discard: 0.5, stop: 0.35, stay_silent: 0.1, answer: 0.05 }, 0.04);
+      expect(only(result, 'stop_playback')).toHaveLength(1);
+      expect(only(result, 'cue')).toEqual([{ kind: 'cue', cue: 'discard' }]);
+      expect(call.lastLog('command')).toMatchObject({ command: 'discard', dropped: false, withdrawn: true });
+    },
+  );
+
+  it('drops the words before the phrase when Jev hears new words there: the sent turn is still answered', () => {
     const call = new Call();
-    wakeAndSpeak(call, 'what time is it?', 'Noon.', 1);
-    const result = withdrawn(call, 'u2', 'No, scratch that.', {
-      discard: 0.5,
-      stop: 0.35,
-      stay_silent: 0.1,
-      answer: 0.05,
-    });
-    expect(only(result, 'stop_playback')).toHaveLength(1);
+    const [turn] = only(call.sayAnswered(caller, 'a', 'Book a table for eight tonight.'), 'turn');
+    call.feed({ kind: 'turn', key: turn.key, turnId: 't1' });
+    const result = withdrawn(
+      call,
+      'b',
+      'Dan, book a taxi, scratch that.',
+      { discard: 0.8, stop: 0.1, stay_silent: 0.06, answer: 0.04 },
+      0.97,
+    );
     expect(only(result, 'cue')).toEqual([{ kind: 'cue', cue: 'discard' }]);
-    expect(call.lastLog('command')).toMatchObject({ command: 'discard', dropped: false, withdrawn: true });
+    expect(call.lastLog('command')).toMatchObject({
+      command: 'discard',
+      dropped: true,
+      withdrawn: false,
+      newWords: 0.97,
+    });
+    expect(call.feed({ kind: 'reply', replyId: 'r1', turnId: 't1', text: 'Booked.' })).toEqual([
+      { kind: 'speak', replyId: 'r1', turnId: 't1', text: 'Booked.' },
+    ]);
+  });
+
+  it('counts the words before the phrase as words to drop when Jev gives no new-words answer', () => {
+    const call = new Call();
+    const [turn] = only(call.sayAnswered(caller, 'a', 'Book a table for eight tonight.'), 'turn');
+    call.feed({ kind: 'turn', key: turn.key, turnId: 't1' });
+    withdrawn(call, 'b', 'Dan, scratch that.', { discard: 0.8, stop: 0.1, stay_silent: 0.06, answer: 0.04 });
+    expect(call.lastLog('command')).toMatchObject({
+      command: 'discard',
+      dropped: true,
+      withdrawn: false,
+      newWords: null,
+    });
+    expect(call.feed({ kind: 'reply', replyId: 'r1', turnId: 't1', text: 'Booked.' })).toEqual([
+      { kind: 'speak', replyId: 'r1', turnId: 't1', text: 'Booked.' },
+    ]);
+  });
+
+  it('withdraws nothing on a bare phrase with no answer on its way, whatever Jev says of new words', () => {
+    const call = new Call();
+    const result = withdrawn(call, 'a', 'Scratch that.', { discard: 0.73, stay_silent: 0.21, answer: 0.03 }, 0.9);
+    expect(result.filter((c) => c.kind !== 'judge')).toEqual([{ kind: 'cue', cue: 'nope' }]);
   });
 
   it('keeps dropped words out of the next turn while the earlier answer is still pending', () => {
@@ -838,7 +930,8 @@ describe('spoken commands on a voice call', () => {
     const [turn] = only(call.sayAnswered(caller, 'a', 'What is the weather in Kyiv tomorrow?'), 'turn');
     call.feed({ kind: 'turn', key: turn.key, turnId: 't1' });
     withdrawn(call, 'b', 'And book me a taxi for nine', { stay_silent: 0.6, answer: 0.25, stop: 0.1, discard: 0.05 });
-    withdrawn(call, 'c', 'No, scratch that.', { discard: 0.62, answer: 0.3, stay_silent: 0.05, stop: 0.03 });
+    // Jev hears no new words in "No, scratch that." itself; the piece before it is still unsent and is dropped.
+    withdrawn(call, 'c', 'No, scratch that.', { discard: 0.62, answer: 0.3, stay_silent: 0.05, stop: 0.03 }, 0.05);
     expect(call.lastLog('command')).toMatchObject({ command: 'discard', dropped: true, withdrawn: false });
     const [judge] = only(call.say(caller, 'd', 'And what about Lviv?'), 'judge');
     expect(judge.state.latest?.text).toBe('What is the weather in Kyiv tomorrow? And what about Lviv?');
@@ -876,15 +969,24 @@ describe('spoken commands on a voice call', () => {
     expect(call.lastLog('command')).toMatchObject({ command: 'send', outcome: 'confirmed' });
   });
 
-  /** `say`, then Jev's verdict with `probabilities` (its top one the choice) on the judge it asked for. */
-  function withdrawn(call: Call, uttId: string, text: string, probabilities: Partial<Verdict['probabilities']>) {
+  /**
+   * `say`, then Jev's verdict with `probabilities` (its top one the choice) on the judge it asked for, and its
+   * `newWords` answer when given.
+   */
+  function withdrawn(
+    call: Call,
+    uttId: string,
+    text: string,
+    probabilities: Partial<Verdict['probabilities']>,
+    newWords?: number,
+  ) {
     const [judge] = only(call.say(caller, uttId, text), 'judge');
     const full = { answer: 0, stay_silent: 0, stop: 0, continue: 0, send: 0, discard: 0, ...probabilities };
     const [action] = Object.entries(full).sort((a, b) => b[1] - a[1])[0] as [Action, number];
     return call.feed({
       kind: 'verdict',
       windowVersion: judge.windowVersion,
-      verdict: { action, probabilities: full, confidence: 0.5 },
+      verdict: { action, probabilities: full, confidence: 0.5, ...(newWords === undefined ? {} : { newWords }) },
       ms: 300,
     });
   }

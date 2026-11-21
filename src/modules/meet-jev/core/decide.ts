@@ -3,7 +3,7 @@
  * the judge in flight), so `reduce` makes it and records its commands in the state; `decide`
  * returns them. Replaying the event log through `reduce` reproduces every decision.
  */
-import { nameSkeleton, phraseEnd, spokenWord, spokenWords, trimSeparators } from './spoken.js';
+import { nameSkeleton, phraseEnd, spokenWord, trimSeparators } from './spoken.js';
 import type {
   Action,
   CallEvent,
@@ -63,17 +63,6 @@ const STOP_WORDS = new Set([
   '\u043f\u043e\u0447\u0435\u043a\u0430\u0439',
   '\u0437\u0430\u0447\u0435\u043a\u0430\u0439',
 ]);
-/**
- * Words said before a discard phrase that only lead into it ("No, scratch that", "Ні, scratch that"), as spoken
- * words (Cyrillic in its Latin sounds: `ni` is \u043d\u0456, `chekay` is \u0447\u0435\u043a\u0430\u0439).
- */
-const DISCARD_LEAD_INS = new Set(
-  (
-    'no nope nah wait actually sorry oh ok okay alright well so hmm hm oops um uh ah erm hold on ' +
-    'ni oy stop chekay zachekay pochekay vybach vybachte hocha tak nu dobre okey'
-  ).split(' '),
-);
-
 export function reduce(prev: CallState, event: CallEvent): CallState {
   const state = structuredClone<CallState>({ ...prev, commands: [] });
   // A retried POST can replay a final the host already has: it changes nothing.
@@ -750,7 +739,12 @@ function onVerdict(state: CallState, version: number, verdict: Verdict | null, m
   const action = chosen(state, verdict, judging.addressedByName, said);
   log(state, 'decision', {
     ...trigger,
-    jev: { choice: verdict.action, probabilities: verdict.probabilities, confidence: verdict.confidence },
+    jev: {
+      choice: verdict.action,
+      probabilities: verdict.probabilities,
+      confidence: verdict.confidence,
+      ...(verdict.newWords === undefined ? {} : { newWords: verdict.newWords }),
+    },
     ms,
     action,
   });
@@ -760,7 +754,9 @@ function onVerdict(state: CallState, version: number, verdict: Verdict | null, m
     const cutOff = `You were cut off after "${state.cutOffAfter ?? ''}"; ${speaker?.name ?? 'the caller'} asked you to go on. Continue briefly from there.`;
     wake(state, judging.speakerId, judging.uttId, judging.trigger, cutOff);
   } else if (
-    !(action === 'send' ? sendUnsent(state, judging) : action === 'discard' && discardUnsent(state, judging))
+    !(action === 'send'
+      ? sendUnsent(state, judging)
+      : action === 'discard' && discardUnsent(state, judging, verdict.newWords))
   ) {
     const held = continuationFor(state, judging.speakerId);
     if (held) held.judged = judging.trigger;
@@ -770,9 +766,10 @@ function onVerdict(state: CallState, version: number, verdict: Verdict | null, m
 
 /**
  * The caller's words not sent to the agent yet, with the command they end with stripped: a held turn's pieces after
- * its trigger, or else everything since their last closed turn or the agent's last line.
+ * its trigger, or else everything since their last closed turn or the agent's last line. `leadInOnly`: the words
+ * before a discard phrase in the judged piece only lead into it ("Dan, scratch that"), no words to drop.
  */
-function unsentWords(state: CallState, judging: Judging, command: CommandAction): string {
+function unsentWords(state: CallState, judging: Judging, command: CommandAction, leadInOnly = false): string {
   const { speakerId } = judging;
   const held = continuationFor(state, speakerId);
   const closedAt = Math.max(
@@ -784,7 +781,7 @@ function unsentWords(state: CallState, judging: Judging, command: CommandAction)
     : state.utterances
         .filter((u) => u.speakerId === speakerId && u.startedAt > closedAt)
         .sort((a, b) => a.startedAt - b.startedAt);
-  const texts = pieces
+  const kept = pieces
     .filter((u) => !u.contextOnly && hasWords(u.text))
     // A discard said without its phrase ("forget it") is the command itself, not words to drop.
     .filter(
@@ -792,14 +789,13 @@ function unsentWords(state: CallState, judging: Judging, command: CommandAction)
         command !== 'discard' ||
         u.uttId !== judging.uttId ||
         spokenCommand(u.text, state.policy)?.command === 'discard',
-    )
-    .map((u) => u.text);
+    );
+  const texts = kept.map((u) => u.text);
   // A piece boundary is a sentence boundary: the command is stripped from the pieces it ends, never across a join.
   for (let i = texts.length - 1; i >= 0; i--) {
     const said = spokenCommand(texts[i], state.policy);
     if (said?.command !== command) break;
-    // "No, scratch that": the lead-in belongs to the take-back, it is no words to drop.
-    texts[i] = command === 'discard' && onlyLeadIn(said.rest) ? '' : said.rest;
+    texts[i] = leadInOnly && kept[i].uttId === judging.uttId ? '' : said.rest;
     if (hasWords(texts[i])) break;
   }
   return texts.filter(hasWords).join(' ');
@@ -811,17 +807,33 @@ function loneCommand(state: CallState, text: string): CommandAction | undefined 
   return said && !hasWords(said.rest) ? said.command : undefined;
 }
 
-const onlyLeadIn = (text: string): boolean => spokenWords(text).every(({ word }) => DISCARD_LEAD_INS.has(word));
+/** `text` is only own-sentence send words ("Copy that.", "Copy."): said alone, an acknowledgement as much as a command. */
+function onlyOwnSentenceSend(state: CallState, text: string): boolean {
+  const phrases = state.policy.commands ?? [];
+  let rest = text;
+  let matched = false;
+  for (let end = phraseEnd(rest, phrases); end && !end.missed; end = phraseEnd(rest, phrases)) {
+    if (end.phrase.command !== 'send' || !end.phrase.ownSentence) return false;
+    matched = true;
+    rest = rest.slice(0, end.at);
+  }
+  return matched && !hasWords(rest);
+}
 
 /**
  * Jev heard the caller end their turn with a send word: the unsent words go to the agent now (with a held turn's
  * trigger, which the new turn replaces), with the `sent` cue. With nothing unsent, a turn of theirs still on its way
- * is confirmed (`sent`, its answer plays without a recheck); with none either, false and the `nope` cue.
+ * is confirmed (`sent`, its answer plays without a recheck); with none either, false and the `nope` cue, or no cue
+ * when the turn is a lone "Copy that." or "Copy.", which a caller also says to acknowledge an answer.
  */
 function sendUnsent(state: CallState, judging: Judging): boolean {
   const words = unsentWords(state, judging, 'send');
   const pending = hasWords(words) ? undefined : unstartedWake(state, judging.speakerId);
-  log(state, 'command', { command: 'send', outcome: hasWords(words) ? 'sent' : pending ? 'confirmed' : 'nothing' });
+  const acknowledged = !hasWords(words) && !pending && onlyOwnSentenceSend(state, judging.trigger);
+  log(state, 'command', {
+    command: 'send',
+    outcome: hasWords(words) ? 'sent' : pending ? 'confirmed' : acknowledged ? 'acknowledged' : 'nothing',
+  });
   if (hasWords(words)) {
     const held = continuationFor(state, judging.speakerId);
     cue(state, 'sent');
@@ -830,7 +842,7 @@ function sendUnsent(state: CallState, judging: Judging): boolean {
   }
   closeTurn(state, judging);
   if (!pending) {
-    cue(state, 'nope');
+    if (!acknowledged) cue(state, 'nope');
     return false;
   }
   pending.rechecked = { outcome: 'speak', since: sinceTrigger(state, pending) };
@@ -843,9 +855,14 @@ function sendUnsent(state: CallState, judging: Judging): boolean {
  * Jev heard the caller discard: their words since their last sent turn are dropped with the `discard` cue, and an
  * answer on its way to that turn still plays. With no such words, an answer pending or playing is withdrawn as by a
  * stop (queued lines revoked, a reply still to come shown only). With neither, false and the `nope` cue.
+ *
+ * Words before the phrase in the judged piece count only when Jev's `newWords` clears its bar: under it they lead
+ * into the take-back ("Dan, scratch that"). Without that answer they count, so no answer is taken back on a guess.
  */
-function discardUnsent(state: CallState, judging: Judging): boolean {
-  const dropped = hasWords(unsentWords(state, judging, 'discard'));
+function discardUnsent(state: CallState, judging: Judging, newWords: number | undefined): boolean {
+  const bar = state.policy.newWords?.p;
+  const leadInOnly = newWords !== undefined && bar !== undefined && newWords < bar;
+  const dropped = hasWords(unsentWords(state, judging, 'discard', leadInOnly));
   const withdrawn = !dropped && (agentSpeaking(state) || pendingAnswer(state));
   const revoked: string[] = [];
   if (withdrawn) {
@@ -859,7 +876,7 @@ function discardUnsent(state: CallState, judging: Judging): boolean {
     if (agentSpeaking(state)) state.commands.push({ kind: 'stop_playback' });
     state.commands.push({ kind: 'status', status: 'idle' });
   }
-  log(state, 'command', { command: 'discard', dropped, withdrawn, revoked });
+  log(state, 'command', { command: 'discard', dropped, withdrawn, revoked, newWords: newWords ?? null });
   closeTurn(state, judging);
   if (!dropped && !withdrawn) {
     cue(state, 'nope');

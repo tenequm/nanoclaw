@@ -33,6 +33,8 @@ export function policyFor(kind: CallKind, agentName: string, agentAliases: strin
       // A meeting's Choice offers no spoken commands.
       ...(kind === 'voice' ? { send: { p: 0.6 }, discard: { p: 0.6 } } : {}),
     },
+    // Live, 6 runs each: a lead-in alone ("Dan, scratch that.") 0.01-0.53, real words before the phrase 0.96-0.99.
+    ...(kind === 'voice' ? { newWords: { p: 0.75 } } : {}),
     recheckShow: { p: 0.75 },
   };
 }
