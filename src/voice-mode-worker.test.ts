@@ -6839,6 +6839,24 @@ describe('jev: the reporter', () => {
     ]);
   });
 
+  it.each([
+    [409, 1],
+    [400, 1],
+    [429, 3],
+    [503, 3],
+  ])('a retried final refused with %i is posted %i time(s)', async (status, times) => {
+    vi.useFakeTimers();
+    const final: JevWorkerEvent = { type: 'utterance', uttId: 'a', text: 'a', final: true, at: 0 };
+    const post = vi.fn(async () => new Response(null, { status }));
+    const reporter = new JevReporter(post, silentLog);
+    reporter.retryFinals = () => true;
+    reporter.report(final);
+    await vi.advanceTimersByTimeAsync(1_000);
+    await reporter.drain();
+    expect(post).toHaveBeenCalledTimes(times);
+    vi.useRealTimers();
+  });
+
   it('without dictation, a final rides with the other events and goes once', async () => {
     const final: JevWorkerEvent = { type: 'utterance', uttId: 'a', text: 'a', final: true, at: 0 };
     const h = heldReporter();
@@ -7428,6 +7446,11 @@ describe('Jev speech evidence gate', () => {
     ['Thanks for watching!', 5, false],
     ['Thanks for watching!', 12, true],
     ['Thank you for the help.', 5, true],
+    // A lone command needs SPEECH_FLOOR_MS of speech: under it, it is the vocabulary's echo.
+    ['Zulu.', 6, false],
+    ['Scratch that.', 9, false],
+    ['Zulu.', 10, true],
+    ['Call Anna, zulu.', 6, true],
   ] as const)('a segment "%s" with %i windows is the caller\'s words: %s', async (words, windows, passes) => {
     const h = jevLoop({ evidence: true });
     h.loop.onSpeech(true, 0);
@@ -8908,6 +8931,29 @@ describe('jev calls', () => {
     await vi.waitFor(() => expect(job.shutdown).toHaveBeenCalledWith('host: hangup'));
     expect(jevEvents(host).flat().map(summary).slice(-2)).toEqual(['hangup', 'final:Corrected, zulu.']);
     expect(host.calls.at(-1)?.url).toMatch(/\/ended$/);
+  });
+
+  it('retries the final of words said while listening, after the mode went off mid-sentence', async () => {
+    const { ctx } = fakeJob({ ...JEV_META, appCall: true, overWords: [...OVER_WORDS] });
+    const host = fakeHostFetch();
+    const v = fakeVoice();
+    await runCall(ctx, callDeps(host.fetchImpl, v));
+    await v.rpc('settings', { listenUntilOver: true });
+    v.events.onSpeech(true, 0);
+    v.interim('And the last');
+    await v.rpc('settings', { listenUntilOver: false });
+    v.transcription.results.push(heard('And the last', 'And the last piece.'));
+    v.transcription.hold = true;
+    v.events.onSpeech(false, 1600);
+    await vi.waitFor(() => expect(jevEvents(host).flat().map(summary)).toContain('speech:off'));
+    host.fetchImpl.mockRejectedValueOnce(new Error('lost acknowledgement'));
+    v.transcription.release();
+    const finalPosts = () =>
+      host.fetchImpl.mock.calls.filter(
+        ([url, init]) => String(url).endsWith('/jev') && String(init?.body).includes('And the last piece.'),
+      ).length;
+    await vi.waitFor(() => expect(finalPosts()).toBe(2));
+    host.endStream();
   });
 
   it.each([false, true])(

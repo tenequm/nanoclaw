@@ -5079,13 +5079,14 @@ const isPartial = (e: JevWorkerEvent): e is Extract<JevWorkerEvent, { type: 'utt
   e.type === 'utterance' && !e.final;
 
 const JEV_POST_ATTEMPTS = 3;
+const JEV_POST_RETRY_BASE_MS = 100;
 
 /**
  * The worker's events to the host's `agent/jev`, in order: what piles up while one POST is in flight
  * goes in the next, MAX_JEV_EVENTS_PER_POST and MAX_JEV_POST_BYTES at a time. A queued partial is
  * replaced by its utterance's next one. A host that cannot be reached, or refuses a batch, loses that
  * batch with a log line: after JEV_POST_ATTEMPTS tries for a settings change, and for finals reported while
- * `retryFinals` holds; after one try for the rest. Audio never waits on it. A backlog sheds partials only:
+ * `retryFinals` holds (a refusal other than 429 or 5xx is not tried again); after one try for the rest. Audio never waits on it. A backlog sheds partials only:
  * speech marks, finals and playback are what the host decides on.
  */
 export class JevReporter {
@@ -5185,11 +5186,14 @@ export class JevReporter {
       if (!batch.length) continue;
       const attempts = this.retryKind(batch[0]) ? JEV_POST_ATTEMPTS : 1;
       let accepted = false;
-      for (let attempt = 0; attempt < attempts && !accepted; attempt++) {
-        if (attempt) await pause(100 * 2 ** (attempt - 1));
+      let retryable = true;
+      for (let attempt = 0; attempt < attempts && !accepted && retryable; attempt++) {
+        if (attempt) await pause(JEV_POST_RETRY_BASE_MS * 2 ** (attempt - 1));
         try {
           const res = await this.post(batch);
           accepted = res.ok;
+          // A refusal (the call is gone, a bad body) stands: only an unreachable or overloaded host is tried again.
+          retryable = res.status >= 500 || res.status === 429;
           void res.body?.cancel().catch(() => undefined);
           if (!accepted)
             this.log.warn('voice-mode worker: the host refused jev events', {
@@ -5474,61 +5478,66 @@ export class JevLoop {
     // Too little evidence for any text to pass the gate: the host need not wait for the transcription.
     if (this.deps.speechEvidence && !utterance.phoneWords && evidenceOf(utterance).strong < JEV_SPEECH_EVIDENCE_WINDOWS)
       this.settleEmpty(utterance);
-    const finalizing = transcriber.end().then(
-      (heard) => {
-        const text = turnText(heard).text || (utterance.phoneWords ? utterance.text || utterance.phoneWords : '');
-        if (!text && !utterance.text) {
-          this.settleEmpty(utterance);
-          utterance.needsPhoneFinal = true;
-          if (audio) {
-            const reason = heard.failed || audio.speechMs >= MIN_LOST_SPEECH_MS ? 'stt' : 'noise';
-            this.deps.recorded?.(utterance.segment, audio, '', reason);
+    const finalizing = transcriber
+      .end()
+      .then(
+        (heard) => {
+          const text = turnText(heard).text || (utterance.phoneWords ? utterance.text || utterance.phoneWords : '');
+          if (!text && !utterance.text) {
+            this.settleEmpty(utterance);
+            utterance.needsPhoneFinal = true;
+            if (audio) {
+              const reason = heard.failed || audio.speechMs >= MIN_LOST_SPEECH_MS ? 'stt' : 'noise';
+              this.deps.recorded?.(utterance.segment, audio, '', reason);
+            }
+            return;
           }
-          return;
-        }
-        if (!this.heardSpeech(utterance, text || utterance.text)) {
-          if (audio) this.deps.recorded?.(utterance.segment, audio, text || utterance.text, 'noise');
-          this.ignoreNoise(utterance, text || utterance.text);
-          return;
-        }
-        // Recorded even when the call ended first: the last words before a hang-up are worth keeping.
-        if (audio) this.deps.recorded?.(utterance.segment, audio, text || utterance.text);
-        this.finishUtterance(utterance, text || (listening() ? utterance.text : ''));
-        if (
-          !utterance.contextOnly &&
-          pausedLine &&
-          this.playing === pausedLine &&
-          !pausedLine.abort.signal.aborted &&
-          takesTurn(text)
-        ) {
-          this.deps.log.info('voice-mode worker: the words of the speech that paused the line came; it is cut', {
-            replyId: pausedLine.replyId,
-          });
-          this.cutSpeech(pausedLine);
-        }
-      },
-      (err: unknown) => {
-        this.deps.log.warn('voice-mode worker: an utterance has no final', { err });
-        if (audio) this.deps.recorded?.(utterance.segment, audio, utterance.text, 'stt');
-        if (utterance.text && !this.heardSpeech(utterance, utterance.text)) {
-          this.ignoreNoise(utterance, utterance.text);
-          return;
-        }
-        if (!utterance.phoneWords) {
-          if (!utterance.text) this.settleEmpty(utterance);
-          else if (beforePlayback || listening()) this.finishUtterance(utterance, utterance.text);
-        }
-        utterance.needsPhoneFinal = true;
-        // No final will come: a keep on its partial is its last word.
-        if (utterance.contextOnly) {
-          utterance.final = true;
-          this.resumeIfKept();
-        }
-        if (utterance.phoneWords) this.finishUtterance(utterance, utterance.text || utterance.phoneWords);
-      },
-    );
+          if (!this.heardSpeech(utterance, text || utterance.text)) {
+            if (audio) this.deps.recorded?.(utterance.segment, audio, text || utterance.text, 'noise');
+            this.ignoreNoise(utterance, text || utterance.text);
+            return;
+          }
+          // Recorded even when the call ended first: the last words before a hang-up are worth keeping.
+          if (audio) this.deps.recorded?.(utterance.segment, audio, text || utterance.text);
+          this.finishUtterance(utterance, text || (listening() ? utterance.text : ''));
+          if (
+            !utterance.contextOnly &&
+            pausedLine &&
+            this.playing === pausedLine &&
+            !pausedLine.abort.signal.aborted &&
+            takesTurn(text)
+          ) {
+            this.deps.log.info('voice-mode worker: the words of the speech that paused the line came; it is cut', {
+              replyId: pausedLine.replyId,
+            });
+            this.cutSpeech(pausedLine);
+          }
+        },
+        (err: unknown) => {
+          this.deps.log.warn('voice-mode worker: an utterance has no final', { err });
+          if (audio) this.deps.recorded?.(utterance.segment, audio, utterance.text, 'stt');
+          if (utterance.text && !this.heardSpeech(utterance, utterance.text)) {
+            this.ignoreNoise(utterance, utterance.text);
+            return;
+          }
+          if (!utterance.phoneWords) {
+            if (!utterance.text) this.settleEmpty(utterance);
+            else if (beforePlayback || listening()) this.finishUtterance(utterance, utterance.text);
+          }
+          utterance.needsPhoneFinal = true;
+          // No final will come: a keep on its partial is its last word.
+          if (utterance.contextOnly) {
+            utterance.final = true;
+            this.resumeIfKept();
+          }
+          if (utterance.phoneWords) this.finishUtterance(utterance, utterance.text || utterance.phoneWords);
+        },
+      )
+      .catch((err: unknown) =>
+        this.deps.log.warn('voice-mode worker: an utterance final could not be handled', { err }),
+      )
+      .finally(() => this.finalizing.delete(utterance));
     this.finalizing.set(utterance, finalizing);
-    void finalizing.finally(() => this.finalizing.delete(utterance));
   }
 
   /** The open activity's whole text so far. */
@@ -5581,7 +5590,10 @@ export class JevLoop {
    */
   private heardSpeech(utterance: JevUtterance, text: string, need = JEV_SPEECH_EVIDENCE_WINDOWS): boolean {
     if (!this.deps.speechEvidence || utterance.phoneWords) return true;
-    return heardAsSpeech(text, evidenceOf(utterance).strong, need);
+    const { strong, voiced } = evidenceOf(utterance);
+    // As on a plain call, a lone command under SPEECH_FLOOR_MS of speech is the transcription's echo of its vocabulary.
+    if (matchCommand(text)?.rest === '' && voiced * VAD_WINDOW_MS < SPEECH_FLOOR_MS) return false;
+    return heardAsSpeech(text, strong, need);
   }
 
   /** What a barge-in may act on: a partial needs more evidence than a final. */
@@ -6189,11 +6201,11 @@ async function runJevCall(s: JevCallSetup): Promise<void> {
   let replies = 0;
   /** A voice call's cues, by the plain call's rules; a meeting gets speech only. */
   const voiceCall = !meta.meeting;
-  /** The page's cue and typing switches, through the `settings` RPC. */
   const overWords = voiceCall ? meta.overWords : undefined;
   let listenUntilOver = false;
   let drainingInput = false;
   let listenChange: Promise<boolean> | undefined;
+  /** The page's cue and typing switches, through the `settings` RPC. */
   let cuesOn = true;
   let typingWanted = true;
   let agentSpeaking = false;
@@ -6250,7 +6262,8 @@ async function runJevCall(s: JevCallSetup): Promise<void> {
       }
     }
   }, callLog);
-  reporter.retryFinals = () => listenUntilOver || drainingInput;
+  // A final of words said while listening is dictation even once the mode is off: the toggle waits for it.
+  reporter.retryFinals = () => listenUntilOver || drainingInput || loop.hasListenInput;
   const languages = callLanguages(meta.languages);
   const transcriber = meta.meeting
     ? undefined
