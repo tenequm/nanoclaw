@@ -277,8 +277,6 @@ export function createJevCall(host: JevCallHost, deps: Partial<JevDeps> = {}): J
       runtime.feed({ kind: 'hangup', at: host.now() });
       return runtime.turnsSettled();
     },
-    end(reason) {
-      runtime.end(reason);
-    },
+    end: (reason) => runtime.end(reason),
   };
 }

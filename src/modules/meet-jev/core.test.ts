@@ -5,7 +5,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { CALL_COMMAND_WORDS } from '../../channels/voice-mode-protocol.js';
-import { beforeMarker, spokenCommand, vocativeOf } from './core/decide.js';
+import { spokenCommand, vocativeOf } from './core/decide.js';
 import { callCore, type CallState } from './core/index.js';
 import type { Action, CallEvent, CallKind, Command, Speaker, Verdict } from './core/types.js';
 import { renderWindow, toJevState } from './core/window.js';
@@ -135,10 +135,16 @@ describe('listen until over', () => {
   }
 
   it('releases on the spoken send words, by their rules', () => {
-    expect(new Call().state.policy.releaseWords).toEqual(
-      CALL_COMMAND_WORDS.send.map(({ say, ownSentence }) => ({ say, ...(ownSentence ? { ownSentence } : {}) })),
+    expect(new Call().state.policy.commands?.map(({ phrase }) => phrase)).toEqual(
+      expect.arrayContaining(
+        CALL_COMMAND_WORDS.send.map(({ say, ownSentence }) => ({
+          command: 'send',
+          say,
+          ...(ownSentence ? { ownSentence } : {}),
+        })),
+      ),
     );
-    expect(new Call('meet').state.policy.releaseWords).toBeUndefined();
+    expect(new Call('meet').state.policy.commands).toBeUndefined();
   });
 
   it.each([
@@ -243,7 +249,8 @@ describe('listen until over', () => {
     ['овер', null],
     ['Next, over.', null],
   ])('reads %s as %s before the release words', (text, rest) => {
-    expect(beforeMarker(text!, new Call().state.policy.releaseWords!)).toBe(rest);
+    const said = spokenCommand(text!, new Call().state.policy);
+    expect(said?.command === 'send' ? said.rest : null).toBe(rest);
   });
 
   it('keeps everyday copy and over in the draft', () => {
@@ -478,8 +485,10 @@ describe('listen until over', () => {
   });
 
   it('takes the discard words from the spoken commands, on a voice call only', () => {
-    expect(new Call().state.policy.discardWords).toEqual(CALL_COMMAND_WORDS.discard.map(({ say }) => ({ say })));
-    expect(new Call('meet').state.policy.discardWords).toBeUndefined();
+    expect(new Call().state.policy.commands?.filter(({ phrase }) => phrase.command === 'discard')).toHaveLength(
+      CALL_COMMAND_WORDS.discard.length,
+    );
+    expect(new Call('meet').state.policy.commands).toBeUndefined();
   });
 
   it.each(CALL_COMMAND_WORDS.discard.map(({ say }) => say))(

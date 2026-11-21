@@ -3,12 +3,13 @@
  * the judge in flight), so `reduce` makes it and records its commands in the state; `decide`
  * returns them. Replaying the event log through `reduce` reproduces every decision.
  */
-import { endPhrases, phraseEnd, spokenWord, type EndPhrase } from './spoken.js';
+import { nameSkeleton, phraseEnd, spokenWord, trimSeparators } from './spoken.js';
 import type {
   Action,
   CallEvent,
   CallPolicy,
   Command,
+  CommandAction,
   CommandCue,
   RecheckVerdict,
   SessionStamp,
@@ -37,6 +38,7 @@ import {
   unmarkHandled,
   unpunctuated,
   unstartedWake,
+  utteranceOf,
   utterancesSince,
   type CallState,
   type ListenPiece,
@@ -167,46 +169,9 @@ export function reduce(prev: CallState, event: CallEvent): CallState {
       }
       break;
     }
-    case 'timer': {
-      const piece = event.key.startsWith(PIECE_TIMER)
-        ? state.listenDraft?.find((item) => item.uttId === event.key.slice(PIECE_TIMER.length))
-        : undefined;
-      if (piece) delete piece.settling;
-      // A piece still being said is timed again from its speech-off.
-      if (piece && !piece.final && !beingSaid(state, piece)) {
-        capturePiece(state, piece.speakerId, piece.uttId, { text: piece.text, final: true });
-      }
-      // A listening draft settles only through its own pieces; turn boundaries and holds wait for its release.
-      if (state.listenDraft) break;
-      if (event.key.startsWith(BOUNDARY_TIMER)) {
-        const speakerId = event.key.slice(BOUNDARY_TIMER.length);
-        if (stillSpeaking(state, speakerId)) break;
-        // A lost final must not hold the turn: its piece counts as said so far.
-        const held = continuationFor(state, speakerId);
-        if (held) for (const piece of continuationPieces(state, held)) piece.final = true;
-        boundary(state, speakerId);
-      } else if (event.key.startsWith(HOLD_TIMER)) {
-        const held = latestWake(state);
-        // The held speaker's own speech is timed again by their next boundary.
-        if (!held?.continuation || event.key !== HOLD_TIMER + held.key || stillSpeaking(state, held.speakerId)) break;
-        const pieces = continuationPieces(state, held);
-        const latest = latestUtterance(state, held.speakerId);
-        // The handled mark, not `state.deferred`: another speaker's decision or deferral can take that slot.
-        const undecided =
-          !!latest &&
-          pieces.includes(latest) &&
-          !latest.contextOnly &&
-          !isHandled(state.speakers[held.speakerId], latest.uttId) &&
-          // A wordless piece adds nothing to a merged turn Jev already judged.
-          (hasWords(latest.text) || openTurnOf(state, held.speakerId).text !== held.judged);
-        if (undecided) {
-          // Words still undecided wait for the floor and any judge in flight; that verdict reaches them itself.
-          if (floorTaken(state) || state.judging) holdBriefly(state, held.speakerId);
-          else boundary(state, held.speakerId);
-        } else if (state.judging?.speakerId !== held.speakerId && pieces.every((u) => u.final)) release(state, held);
-      }
+    case 'timer':
+      onTimer(state, event.key);
       break;
-    }
     case 'verdict':
       onVerdict(state, event.windowVersion, event.verdict, event.ms);
       // A different participant's judge may have taken the floor while the original speaker finished.
@@ -271,22 +236,66 @@ export function reduce(prev: CallState, event: CallEvent): CallState {
     }
   }
   refreshVersion(state);
-  if (state.afterListen && state.listenDraft?.every((piece) => piece.final)) {
-    flushDraft(state, state.listenDraft.splice(0), false);
-    state.listenDraft = null;
-    // A call that is hanging up takes no automatic decision on what was said after the toggle-off.
-    const queued = state.hangingUp ? [] : state.afterListen;
-    delete state.afterListen;
-    if (!state.hangingUp && awaitingAgent(state)) out.push({ kind: 'status', status: 'thinking' });
-    let nextState = state;
-    for (const next of queued) {
-      nextState = reduce(nextState, next);
-      out.push(...nextState.commands);
-    }
-    nextState.commands = out;
-    return nextState;
+  return state.afterListen && state.listenDraft?.every((piece) => piece.final) ? finishToggleOff(state) : state;
+}
+
+/** A timer came due: a piece settles from its partial, or a turn boundary or a hold ends. */
+function onTimer(state: CallState, key: string): void {
+  const piece = key.startsWith(PIECE_TIMER)
+    ? state.listenDraft?.find((item) => item.uttId === key.slice(PIECE_TIMER.length))
+    : undefined;
+  if (piece) delete piece.settling;
+  // A piece still being said is timed again from its speech-off.
+  if (piece && !piece.final && !beingSaid(state, piece)) {
+    capturePiece(state, piece.speakerId, piece.uttId, { text: piece.text, final: true });
   }
-  return state;
+  // A listening draft settles only through its own pieces; turn boundaries and holds wait for its release.
+  if (state.listenDraft) return;
+  if (key.startsWith(BOUNDARY_TIMER)) {
+    const speakerId = key.slice(BOUNDARY_TIMER.length);
+    if (stillSpeaking(state, speakerId)) return;
+    // A lost final must not hold the turn: its piece counts as said so far.
+    const held = continuationFor(state, speakerId);
+    if (held) for (const piece of continuationPieces(state, held)) piece.final = true;
+    boundary(state, speakerId);
+  } else if (key.startsWith(HOLD_TIMER)) {
+    const held = latestWake(state);
+    // The held speaker's own speech is timed again by their next boundary.
+    if (!held?.continuation || key !== HOLD_TIMER + held.key || stillSpeaking(state, held.speakerId)) return;
+    const pieces = continuationPieces(state, held);
+    const latest = latestUtterance(state, held.speakerId);
+    // The handled mark, not `state.deferred`: another speaker's decision or deferral can take that slot.
+    const undecided =
+      !!latest &&
+      pieces.includes(latest) &&
+      !latest.contextOnly &&
+      !isHandled(state.speakers[held.speakerId], latest.uttId) &&
+      // A wordless piece adds nothing to a merged turn Jev already judged.
+      (hasWords(latest.text) || openTurnOf(state, held.speakerId).text !== held.judged);
+    if (undecided) {
+      // Words still undecided wait for the floor and any judge in flight; that verdict reaches them itself.
+      if (floorTaken(state) || state.judging) holdBriefly(state, held.speakerId);
+      else boundary(state, held.speakerId);
+    } else if (state.judging?.speakerId !== held.speakerId && pieces.every((u) => u.final)) release(state, held);
+  }
+}
+
+/** The toggle-off's draft is all final: it goes out once, and the events queued behind it replay in automatic mode. */
+function finishToggleOff(state: CallState): CallState {
+  const out = state.commands;
+  flushDraft(state, state.listenDraft!.splice(0), false);
+  state.listenDraft = null;
+  // A call that is hanging up takes no automatic decision on what was said after the toggle-off.
+  const queued = state.hangingUp ? [] : (state.afterListen ?? []);
+  delete state.afterListen;
+  if (!state.hangingUp && awaitingAgent(state)) out.push({ kind: 'status', status: 'thinking' });
+  let nextState = state;
+  for (const next of queued) {
+    nextState = reduce(nextState, next);
+    out.push(...nextState.commands);
+  }
+  nextState.commands = out;
+  return nextState;
 }
 
 export function decide(state: CallState, _event: CallEvent): Command[] {
@@ -391,9 +400,7 @@ function capturePiece(
   if (!piece) {
     const pending = state.speakers[speakerId].pendingSpeech;
     const startedAt =
-      pending?.uttId === uttId
-        ? pending.startedAt
-        : (state.utterances.find((u) => u.speakerId === speakerId && u.uttId === uttId)?.startedAt ?? state.now);
+      pending?.uttId === uttId ? pending.startedAt : (utteranceOf(state, speakerId, uttId)?.startedAt ?? state.now);
     piece = { speakerId, uttId, startedAt, text: '', final: false, interrupted: agentSpeaking(state) };
     draft.push(piece);
     draft.sort((a, b) => a.startedAt - b.startedAt);
@@ -442,7 +449,7 @@ function endsDraftSpeech(state: CallState, event: Extract<CallEvent, { kind: 'sp
 
 function repeatsFinal(state: CallState, event: CallEvent): boolean {
   if (event.kind !== 'utterance' || !event.final) return false;
-  const utt = state.utterances.find((u) => u.speakerId === event.speaker.id && u.uttId === event.uttId);
+  const utt = utteranceOf(state, event.speaker.id, event.uttId);
   return !!utt?.final && utt.text === event.text.trim() && !!utt.contextOnly === !!event.contextOnly;
 }
 
@@ -471,33 +478,25 @@ function releaseMarkers(state: CallState): void {
 }
 
 /**
- * The spoken command a transcript ends with (`send` by the release words, `discard` by the discard words, each
- * repeat stripped) and the words before it, or null when it ends with neither.
+ * The spoken command a transcript ends with, each repeat stripped (`tell me, zulu, zulu`: `tell me`), and the words
+ * before it, or null when it ends with none; matched as the worker matches its commands.
  */
 export function spokenCommand(
   text: string,
-  policy: Pick<CallPolicy, 'releaseWords' | 'discardWords'>,
-): { command: 'send' | 'discard'; rest: string } | null {
-  const send = beforeMarker(text, policy.releaseWords ?? []);
-  const discard = beforeMarker(text, policy.discardWords ?? []);
-  // Both only when one phrase ends the other: the longer phrase, the shorter rest, was said.
-  if (discard !== null && (send === null || discard.length < send.length)) return { command: 'discard', rest: discard };
-  return send === null ? null : { command: 'send', rest: send };
-}
-
-/**
- * The words before the release words a transcript ends with, each repeat stripped (`tell me, zulu,
- * zulu`: `tell me`), or null when it ends with none; matched as the worker matches its send words.
- */
-export function beforeMarker(text: string, words: readonly EndPhrase[]): string | null {
-  const phrases = endPhrases(words);
+  policy: Pick<CallPolicy, 'commands'>,
+): { command: CommandAction; rest: string } | null {
+  const phrases = policy.commands ?? [];
   let rest = text;
-  let matched = false;
-  for (let end = phraseEnd(rest, phrases); end && !end.missed; end = phraseEnd(rest, phrases)) {
+  let command: CommandAction | undefined;
+  for (
+    let end = phraseEnd(rest, phrases);
+    end && !end.missed && (command ?? end.phrase.command) === end.phrase.command;
+    end = phraseEnd(rest, phrases)
+  ) {
+    command = end.phrase.command;
     rest = rest.slice(0, end.at);
-    matched = true;
   }
-  return matched ? rest.replace(/[\s,;:\u2013\u2014-]+$/gu, '') : null;
+  return command ? { command, rest: trimSeparators(rest) } : null;
 }
 
 function continuationFor(state: CallState, speakerId: string): Wake | undefined {
@@ -757,7 +756,7 @@ function onVerdict(state: CallState, version: number, verdict: Verdict | null, m
  * The caller's words not sent to the agent yet, with the command they end with stripped: a held turn's pieces after
  * its trigger, or else everything since their last closed turn or the agent's last line.
  */
-function unsentWords(state: CallState, judging: Judging, command: 'send' | 'discard'): string {
+function unsentWords(state: CallState, judging: Judging, command: CommandAction): string {
   const { speakerId } = judging;
   const held = continuationFor(state, speakerId);
   const closedAt = Math.max(
@@ -852,9 +851,7 @@ function discardUnsent(state: CallState, judging: Judging): boolean {
 /** The judged utterance closes the caller's turn: dropped words, or a command alone, never join a later one. */
 function closeTurn(state: CallState, judging: Judging): void {
   const speaker = state.speakers[judging.speakerId];
-  const startedAt = state.utterances.find(
-    (u) => u.speakerId === judging.speakerId && u.uttId === judging.uttId,
-  )?.startedAt;
+  const startedAt = utteranceOf(state, judging.speakerId, judging.uttId)?.startedAt;
   if (speaker) speaker.closedAt = Math.max(speaker.closedAt, startedAt ?? state.now);
 }
 
@@ -1020,7 +1017,7 @@ function wake(state: CallState, speakerId: string, uttId: string, message: strin
       ? 'Reply in one or two short spoken sentences. Your reply is read aloud.'
       : 'Reply in one or two short spoken sentences; your reply is read aloud. If nothing needs saying, reply exactly [silent].',
   ].join('\n\n');
-  const triggerAt = state.utterances.find((u) => u.speakerId === speakerId && u.uttId === uttId)?.startedAt;
+  const triggerAt = utteranceOf(state, speakerId, uttId)?.startedAt;
   const speaker = state.speakers[speakerId];
   if (speaker) speaker.closedAt = triggerAt ?? state.now;
   state.wakes = [
@@ -1244,13 +1241,6 @@ export function nameAlone(text: string, names: string[]): boolean {
   );
 }
 
-/** A name's sound: Latin letters, every vowel one mark, doubled letters once (`Ден` and `Dan` agree). */
-function nameKey(word: string): string {
-  return spokenWord(word)
-    .replace(/[aeiouy]/g, '*')
-    .replace(/([^*])\1+/g, '$1');
-}
-
 const scriptOf = (word: string): 'cyrillic' | 'latin' | null =>
   /\p{Script=Cyrillic}/u.test(word) ? 'cyrillic' : /\p{Script=Latin}/u.test(word) ? 'latin' : null;
 
@@ -1264,7 +1254,9 @@ function sameName(word: string, names: string[]): boolean {
   return forms.some((form) =>
     names.some((name) => {
       const [a, b] = [scriptOf(form), scriptOf(name)];
-      return a !== null && b !== null && a !== b ? nameKey(form) === nameKey(name) : form === name;
+      return a !== null && b !== null && a !== b
+        ? nameSkeleton(spokenWord(form)) === nameSkeleton(spokenWord(name))
+        : form === name;
     }),
   );
 }

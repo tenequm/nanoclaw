@@ -121,7 +121,14 @@ import {
 } from './channels/voice-mode-tts-catalog.js';
 import { DATA_DIR } from './config.js';
 import { readEnvFile } from './env.js';
-import { endPhrases, phraseEnd, spokenWord, spokenWords } from './modules/meet-jev/core/spoken.js';
+import {
+  commandPhrases,
+  nameSkeleton,
+  phraseEnd,
+  spokenWord,
+  spokenWords,
+  trimSeparators,
+} from './modules/meet-jev/core/spoken.js';
 import {
   FINAL_GRACE_MS,
   FINAL_TIMEOUT_MS,
@@ -2019,9 +2026,6 @@ async function publishAudioTrack(
   }
 }
 
-/** Vowels as one mark and doubled letters as one: `Andy`, `Endy` and `Енді` sound alike, `and` and `Andy` do not. */
-const nameSkeleton = (word: string): string => word.replace(/[aeiouy]/g, '*').replace(/([^*])\1+/g, '$1');
-
 /** `hey` or `hi`, as the transcription writes it in either script (`гей`, `хей`, `эй`, `хай`). */
 const WAKE_WORDS = new Set(['hey', 'hei', 'hej', 'ey', 'ei', 'hi', 'hai', 'hay']);
 /** Leads a transcription glues to the name (`Heyben`); not `hi`, or `hidden` would be `hi Den`. */
@@ -2084,15 +2088,7 @@ export type CommandMatch = { command: CallCommand; rest: string; ownSentence?: t
  * as their own sentence (`ownSentence`): the whole utterance, or after punctuation. A capital letter
  * alone is no boundary.
  */
-const COMMANDS = endPhrases(
-  (['send', 'discard'] as const).flatMap((command) =>
-    CALL_COMMAND_WORDS[command].map(({ say, ownSentence }) => ({
-      command,
-      say,
-      ...(ownSentence ? { ownSentence } : {}),
-    })),
-  ),
-);
+const COMMANDS = commandPhrases(CALL_COMMAND_WORDS);
 
 /**
  * The command phrase a transcript ends with and what was said before it; `missed` when it is an
@@ -2139,16 +2135,13 @@ export function captionMark(text: string, command: CallCommand): CaptionMark {
   if (end?.command !== command) return { command, words: text.trim() };
   return {
     command,
-    words: text
-      .slice(0, end.at)
-      .replace(/[\s,;:–—-]+$/u, '')
-      .trimStart(),
+    words: trimSeparators(text.slice(0, end.at)).trimStart(),
   };
 }
 
 /** Words before a command, as a sentence: the comma before it gone, a period where none ends them. */
 function sentence(text: string): string {
-  const rest = text.replace(/[\s,;:–—-]+$/u, '').trim();
+  const rest = trimSeparators(text).trim();
   return /[\p{L}\p{N}]$/u.test(rest) ? `${rest}.` : rest;
 }
 
@@ -4549,9 +4542,8 @@ async function publishRoomTracks(local: LocalParticipant, log: WorkerLog) {
 
 export function callControlAttributes(meta: LiveKitJobMetadata) {
   // The app uses the commands version to negotiate settings even on a host-directed call.
-  const settings = !meta.jev || (meta.appCall && !meta.meeting);
   return {
-    [CALL_COMMANDS_ATTRIBUTE]: settings ? CALL_COMMANDS_VERSION : '',
+    [CALL_COMMANDS_ATTRIBUTE]: !meta.jev || (meta.appCall && !meta.meeting) ? CALL_COMMANDS_VERSION : '',
     [CALL_COMMAND_WORDS_ATTRIBUTE]: meta.jev ? '' : COMMAND_WORDS_JSON,
     [CALL_REVIEW_ATTRIBUTE]: meta.jev ? '' : '1',
   };

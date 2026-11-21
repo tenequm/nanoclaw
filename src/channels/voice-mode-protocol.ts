@@ -547,6 +547,13 @@ export const CALL_END_REASONS = [
 ] as const;
 export type CallEndReason = (typeof CALL_END_REASONS)[number];
 
+/** The cues a jev voice call's host asks its worker to play (the worker's `CueKind`s of the same names). */
+export const JEV_COMMAND_CUES = ['sent', 'discard', 'nope'] as const;
+export type JevCommandCue = (typeof JEV_COMMAND_CUES)[number];
+
+/** Why the host answers an overlap request without a verdict. */
+export type OverlapFallback = 'cap' | 'error' | 'mid_band' | 'not_playing' | 'off';
+
 /**
  * One line of the host-to-worker event stream: a complete agent message to
  * speak (`turn`: the host's utterance id of the caller turn it answers, null
@@ -568,13 +575,6 @@ export type CallEndReason = (typeof CALL_END_REASONS)[number];
  * `status`, the agent's `thinking` ticks and each spoken command's `cue`, which its worker plays its
  * cues and typing sound from.
  */
-/** The cues a jev voice call's host asks its worker to play (the worker's `CueKind`s of the same names). */
-export const JEV_COMMAND_CUES = ['sent', 'discard', 'nope'] as const;
-export type JevCommandCue = (typeof JEV_COMMAND_CUES)[number];
-
-/** Why the host answers an overlap request without a verdict. */
-export type OverlapFallback = 'cap' | 'error' | 'mid_band' | 'not_playing' | 'off';
-
 export type LiveKitHostEvent =
   | { type: 'reply'; text: string; turn?: string | null; replyId?: string }
   | { type: 'stop' }

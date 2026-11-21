@@ -1,3 +1,5 @@
+import type { CommandAction } from './types.js';
+
 /**
  * Spoken words as a transcript writes them, in either script, and the phrase a transcript ends with.
  * The worker's spoken commands and the jev loop's release words match through the same rules.
@@ -43,7 +45,7 @@ export interface SpokenPhrase<T extends EndPhrase> {
 }
 
 /** The phrases as their spoken words, longest first: the order phraseEnd tries them in. */
-export function endPhrases<T extends EndPhrase>(phrases: readonly T[]): Array<SpokenPhrase<T>> {
+function endPhrases<T extends EndPhrase>(phrases: readonly T[]): Array<SpokenPhrase<T>> {
   return phrases
     .map((phrase) => ({ phrase, words: spokenWords(phrase.say).map((w) => w.word) }))
     .sort((a, b) => b.words.length - a.words.length);
@@ -63,9 +65,29 @@ export function phraseEnd<T extends EndPhrase>(
     const tail = words.slice(words.length - said.words.length);
     if (!tail.every((w, i) => w.word === said.words[i])) continue;
     const at = tail[0].start;
-    if (said.phrase.ownSentence && !/(^|[.!?,;:–—-])\s*$/u.test(text.slice(0, at)))
+    if (said.phrase.ownSentence && !/(^|[.!?,;:\u2013\u2014-])\s*$/u.test(text.slice(0, at)))
       return { ...said, at, missed: true };
     return { ...said, at };
   }
   return null;
 }
+
+/** A spoken command's phrase, tagged with the command it gives. */
+export interface CommandPhrase extends EndPhrase {
+  command: CommandAction;
+}
+
+/** The send and discard phrases as one list, longest first, each tagged with its command. */
+export function commandPhrases(words: Record<CommandAction, readonly EndPhrase[]>): Array<SpokenPhrase<CommandPhrase>> {
+  return endPhrases(
+    (['send', 'discard'] as const).flatMap((command) =>
+      words[command].map(({ say, ownSentence }) => ({ command, say, ...(ownSentence ? { ownSentence } : {}) })),
+    ),
+  );
+}
+
+/** `text` without the separators it ends with: the words said before a phrase that follows them. */
+export const trimSeparators = (text: string): string => text.replace(/[\s,;:\u2013\u2014-]+$/u, '');
+
+/** Vowels as one mark and doubled letters as one: `Andy`, `Endy` and `Енді` sound alike, `and` and `Andy` do not. */
+export const nameSkeleton = (word: string): string => word.replace(/[aeiouy]/g, '*').replace(/([^*])\1+/g, '$1');

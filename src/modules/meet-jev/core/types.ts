@@ -7,7 +7,7 @@
  * Times (`at`) are host epoch milliseconds; an ingress converts its source's clock (Recall's
  * frame timestamps, the worker's marks) on arrival.
  */
-import type { EndPhrase } from './spoken.js';
+import type { CommandPhrase, SpokenPhrase } from './spoken.js';
 
 export type CallStatus = 'heard' | 'thinking' | 'speaking' | 'idle';
 
@@ -195,10 +195,8 @@ export interface ActionThreshold {
 
 /** Everything that differs between the two kinds; the core knows nothing else about them. */
 export interface CallPolicy {
-  /** Voice: the words that end a listen-until-over draft (the spoken send words). */
-  releaseWords?: EndPhrase[];
-  /** Voice: the spoken discard words, which drop the unsent draft or turn. */
-  discardWords?: EndPhrase[];
+  /** Voice: the spoken send words, which release a draft or turn, and discard words, which drop it. */
+  commands?: Array<SpokenPhrase<CommandPhrase>>;
   kind: CallKind;
   /** The agent's name as people say it, for the vocative fact, the stop rule and the state. */
   agentName: string;

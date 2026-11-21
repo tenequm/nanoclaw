@@ -7,6 +7,7 @@ import type {
   CallEvent,
   CallPolicy,
   Command,
+  CommandAction,
   JevLine,
   JevState,
   RecheckAction,
@@ -127,7 +128,7 @@ export interface ListenPiece {
   /** A timer will settle this activity if its final is lost. */
   settling?: true;
   /** The piece ends with a spoken command: `send` releases the draft through it, `discard` drops it. */
-  command?: 'send' | 'discard';
+  command?: CommandAction;
 }
 
 export interface CallState {
@@ -218,11 +219,12 @@ export const unpunctuated = (text: string): string =>
 /** Text as compared for change: case, Unicode form, punctuation and spacing aside. */
 export const comparable = (text: string): string => unpunctuated(normalize(text));
 
+export const utteranceOf = (state: CallState, speakerId: string, uttId: string): Utterance | undefined =>
+  state.utterances.find((u) => u.speakerId === speakerId && u.uttId === uttId);
+
 export function latestUtterance(state: CallState, speakerId: string): Utterance | undefined {
   const id = state.speakers[speakerId]?.lastUttId;
-  return id === null || id === undefined
-    ? undefined
-    : state.utterances.find((u) => u.speakerId === speakerId && u.uttId === id);
+  return id === null || id === undefined ? undefined : utteranceOf(state, speakerId, id);
 }
 
 /**
@@ -324,7 +326,7 @@ export function applyWindow(state: CallState, event: CallEvent): void {
         event.speaker.id !== state.exchangeSpeakerId
       )
         state.exchangeSpeakerId = null;
-      const utt = state.utterances.find((u) => u.speakerId === event.speaker.id && u.uttId === event.uttId);
+      const utt = utteranceOf(state, event.speaker.id, event.uttId);
       if (utt) {
         // A late final updates its own line; it never makes an older utterance the current one again.
         utt.text = text;

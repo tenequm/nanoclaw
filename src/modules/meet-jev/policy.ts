@@ -1,10 +1,7 @@
 /** What differs between `/voice jev` and `/meet <link> jev`: the policy paragraph and the numbers. */
-import { CALL_COMMAND_WORDS, type CallCommandWord } from '../../channels/voice-mode-protocol.js';
-import type { EndPhrase } from './core/spoken.js';
+import { CALL_COMMAND_WORDS } from '../../channels/voice-mode-protocol.js';
+import { commandPhrases } from './core/spoken.js';
 import type { CallKind, CallPolicy } from './core/types.js';
-
-const endPhrasesOf = (words: readonly CallCommandWord[]): EndPhrase[] =>
-  words.map(({ say, ownSentence }) => ({ say, ...(ownSentence ? { ownSentence } : {}) }));
 
 export function policyFor(kind: CallKind, agentName: string, agentAliases: string[]): CallPolicy {
   const oneCaller = `${agentName} is an AI assistant in a live conversation with one person. ${agentName} answers what the person says, unless they are clearly talking to someone else or have not finished the thought.`;
@@ -15,9 +12,7 @@ export function policyFor(kind: CallKind, agentName: string, agentAliases: strin
   return {
     kind,
     // The caller's spoken commands, by their rules: a send word releases a listen-until-over draft, a discard drops it.
-    ...(kind === 'voice'
-      ? { releaseWords: endPhrasesOf(CALL_COMMAND_WORDS.send), discardWords: endPhrasesOf(CALL_COMMAND_WORDS.discard) }
-      : {}),
+    ...(kind === 'voice' ? { commands: commandPhrases(CALL_COMMAND_WORDS) } : {}),
     agentName,
     agentAliases,
     paragraph,
