@@ -2623,6 +2623,27 @@ describe('/voice jev on the call core', () => {
     worker.close();
   });
 
+  it.each([
+    [undefined, false, undefined],
+    [true, true, 'Dan, book it, scratch that.'],
+  ] as const)(
+    'asks Jev about spoken commands on a voice call only with jevCommands (%s): %s',
+    async (jevCommands, commands, discardLine) => {
+      await h.stop();
+      const judge = vi.fn(async (..._args: unknown[]) => ({ verdict: null, ms: 0 }));
+      h = await startHarness(
+        { accessCheckIntervalMs: 60_000 },
+        { mirrorApi: chat.api, ...(jevCommands ? { jevCommands } : {}), jev: { judge } },
+      );
+      const worker = await startJevCall();
+      await worker.post('jev', { events: [final('u1', 'Dan, book it, scratch that.')] });
+      await vi.waitFor(() => expect(judge).toHaveBeenCalled());
+      expect(judge.mock.calls[0][1]).toMatchObject({ commands });
+      expect((judge.mock.calls[0][1] as { discardLine?: string }).discardLine).toBe(discardLine);
+      worker.close();
+    },
+  );
+
   it('starts a plain call for jev=1 on a host without the Jev key', async () => {
     jevKey.value = '';
     try {
@@ -2660,7 +2681,7 @@ describe('/voice jev on the call core', () => {
     await worker.post('jev', { events: [final('u1', 'Dan, first?')] });
     await vi.waitFor(() => expect(h.routing.hung).toHaveLength(1));
     await worker.post('jev', { events: [final('u2', 'instead: Dan, second?')] });
-    expect(await turnEvent('u1')).toMatchObject({ kind: 'turn_failed', reason: '409: The turn was superseded' });
+    expect(await turnEvent('u1')).toMatchObject({ kind: 'turn_failed', reason: 'superseded' });
     await vi.waitFor(() => expect(h.routing.hung).toHaveLength(2));
     h.routing.hung[1](true);
     expect(await turnEvent('u2')).toMatchObject({ kind: 'turn', turnId: '2' });
@@ -2854,6 +2875,160 @@ describe('/voice jev with the real core', () => {
   });
   afterEach(async () => {
     await h.stop();
+  });
+
+  it('routes three utterances as one explicit turn and mirrors unfinished words on hangup', async () => {
+    expect((await post(`${h.base}/livekit/token?v=6&t=tok123&jev=1`)).status).toBe(200);
+    const worker = await attachWorker(h, h.lk.dispatches.at(-1)!.metadata);
+    await worker.post('joined');
+    const final = (uttId: string, text: string) => ({ type: 'utterance', uttId, text, final: true, at: Date.now() });
+    const mode = (on: boolean) => ({ type: 'listen', on, at: Date.now() });
+    await worker.post('jev', { events: [mode(true), final('a', 'First.'), final('b', 'Second?')] });
+    expect(h.inbound).toHaveLength(0);
+    await worker.post('jev', { events: [final('c', 'Third, прийом.')] });
+    await vi.waitFor(() => expect(chat.posts.map((p) => p.text)).toEqual(['🎙 First. Second? Third']));
+    expect((h.inbound[0].content as { text: string }).text).not.toContain('прийом');
+    await worker.post('jev', { events: [final('d', 'Another thought'), mode(false), mode(false)] });
+    await vi.waitFor(() => expect(chat.posts[1]?.text).toBe('🎙 Another thought'));
+    await worker.post('jev', { events: [mode(true), final('e', 'Unfinished'), final('f', 'thought.')] });
+    await worker.post('ended', { reason: 'caller left' });
+    await vi.waitFor(() => expect(chat.posts[2]?.text).toBe('🎙 Unfinished thought.'));
+    expect(h.inbound).toHaveLength(2);
+    expect(asked).toEqual([]);
+    worker.close();
+  });
+
+  it.each([true, false])(
+    'delivers a corrected final in the original app thread during hangup grace, marker=%s',
+    async (marker) => {
+      const group = { id: 'mg-0', channel_type: 'app', instance: 'app', platform_id: 'room' };
+      chat.state.bound = { group, threadId: 'call-thread' };
+      expect((await post(`${h.base}/livekit/token?v=6&t=tok123&jev=1`)).status).toBe(200);
+      const worker = await attachWorker(h, h.lk.dispatches.at(-1)!.metadata);
+      await worker.post('joined');
+      const utt = (text: string, final: boolean) => ({ type: 'utterance', uttId: 'a', text, final, at: Date.now() });
+      await worker.post('jev', { events: [{ type: 'listen', on: true, at: Date.now() }, utt('The early', false)] });
+      expect((await post(`${h.base}/livekit/end?t=tok123`, { callId: worker.meta.callId })).status).toBe(204);
+      expect(
+        (
+          await worker.post('jev', {
+            events: [utt(marker ? 'The corrected words, zulu.' : 'The corrected words', true)],
+          })
+        ).status,
+      ).toBe(200);
+      await worker.post('ended', { reason: 'caller left' });
+      await vi.waitFor(() =>
+        expect(chat.posts).toEqual([
+          { instance: 'app', platformId: 'room', threadId: 'call-thread', text: '🎙 The corrected words' },
+        ]),
+      );
+      expect(chat.contents[0].voice).toBe('caller');
+      expect(h.inbound).toHaveLength(marker ? 1 : 0);
+      expect(asked).toEqual([]);
+      worker.close();
+    },
+  );
+
+  it.each(['duration', 'daily', 'restart', 'shutdown', 'replacement', 'redial', 'revoked'])(
+    'finishes the old draft on %s with access rechecked',
+    async (reason) => {
+      await h.stop();
+      h = await startHarness(
+        {
+          accessCheckIntervalMs: reason === 'revoked' ? 100 : 60_000,
+          ...(reason === 'duration' ? { maxCallDurationMs: 250 } : {}),
+          ...(reason === 'daily' ? { maxCallMsPerDay: 250 } : {}),
+        },
+        { mirrorApi: chat.api, hangupGraceMs: 1000 },
+      );
+      await post(`${h.base}/livekit/token?v=6&t=tok123&jev=1`);
+      const worker = await attachWorker(h, h.lk.dispatches.at(-1)!.metadata);
+      await worker.post('joined');
+      const utt = (text: string, final: boolean) => ({ type: 'utterance', uttId: 'a', text, final, at: Date.now() });
+      await worker.post('jev', { events: [{ type: 'listen', on: true, at: Date.now() }, utt('Early', false)] });
+      if (reason === 'redial') await post(`${h.base}/livekit/end?t=tok123`, { callId: worker.meta.callId });
+      if (reason === 'replacement' || reason === 'redial') await post(`${h.base}/livekit/token?v=6&t=tok123&jev=1`);
+      if (reason === 'revoked') h.access.enabled = false;
+      const shutdown = reason === 'shutdown' ? h.adapter.teardown() : undefined;
+      if (reason !== 'restart') await worker.streamClosed;
+      const final = await worker.post('jev', { events: [utt('Corrected draft', true)] });
+      expect(final.status).toBe(reason === 'revoked' ? 409 : 200);
+      await worker.post('ended', { reason, restart: reason === 'restart' });
+      await shutdown;
+      if (reason === 'revoked') expect(chat.posts).toEqual([]);
+      else await vi.waitFor(() => expect(chat.posts.map((p) => p.text)).toEqual(['🎙 Corrected draft']));
+      expect(h.inbound).toHaveLength(0);
+      worker.close();
+    },
+  );
+
+  it('saves a release as the caller when teardown stops routing during the hangup grace', async () => {
+    await h.stop();
+    h = await startHarness({ accessCheckIntervalMs: 60_000 }, { mirrorApi: chat.api, hangupGraceMs: 1000 });
+    await post(`${h.base}/livekit/token?v=6&t=tok123&jev=1`);
+    const worker = await attachWorker(h, h.lk.dispatches.at(-1)!.metadata);
+    await worker.post('joined');
+    const utt = (text: string, final: boolean) => ({ type: 'utterance', uttId: 'a', text, final, at: Date.now() });
+    await worker.post('jev', { events: [{ type: 'listen', on: true, at: Date.now() }, utt('Book', false)] });
+    expect((await post(`${h.base}/livekit/end?t=tok123`, { callId: worker.meta.callId })).status).toBe(204);
+    const shutdown = h.adapter.teardown();
+    expect((await worker.post('jev', { events: [utt('Book a table, zulu.', true)] })).status).toBe(200);
+    await worker.post('ended', { reason: 'caller left' });
+    await shutdown;
+    await vi.waitFor(() => expect(chat.posts.map((p) => p.text)).toEqual(['🎙 Book a table']));
+    expect(h.inbound).toHaveLength(0);
+    worker.close();
+  });
+
+  it('finishes routing a release when both hangup and worker end cross its chat lookup', async () => {
+    await post(`${h.base}/livekit/token?v=6&t=tok123&jev=1`);
+    const worker = await attachWorker(h, h.lk.dispatches.at(-1)!.metadata);
+    await worker.post('joined');
+    const lookup = chat.api.boundChat;
+    let resume!: () => void;
+    const held = new Promise<void>((resolve) => {
+      resume = resolve;
+    });
+    let started!: () => void;
+    const looking = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    chat.api.boundChat = async (id) => {
+      started();
+      await held;
+      return lookup(id);
+    };
+    await worker.post('jev', {
+      events: [
+        { type: 'listen', on: true, at: Date.now() },
+        { type: 'utterance', uttId: 'a', text: 'Deliver, zulu.', final: true, at: Date.now() },
+      ],
+    });
+    await looking;
+    await post(`${h.base}/livekit/end?t=tok123`, { callId: worker.meta.callId });
+    await worker.post('ended');
+    expect(h.inbound).toHaveLength(0);
+    resume();
+    await vi.waitFor(() => expect(chat.posts.map((p) => p.text)).toEqual(['🎙 Deliver']));
+    expect(h.inbound).toHaveLength(1);
+    worker.close();
+  });
+
+  it('passes the spoken send words through metadata, recognition and delivery', async () => {
+    await post(`${h.base}/livekit/token?v=6&t=tok123&jev=1`);
+    const meta = h.lk.dispatches.at(-1)!.metadata;
+    expect(meta.overWords).toEqual(['zulu', 'copy', 'copy that', 'прийом']);
+    const worker = await attachWorker(h, meta);
+    await worker.post('joined');
+    const utt = (id: string, text: string) => ({ type: 'utterance', uttId: id, text, final: true, at: Date.now() });
+    await worker.post('jev', {
+      events: [{ type: 'listen', on: true, at: Date.now() }, utt('a', 'Come over'), utt('b', 'send me a copy')],
+    });
+    expect(h.inbound).toHaveLength(0);
+    await worker.post('jev', { events: [utt('c', 'Now, copy that.')] });
+    await vi.waitFor(() => expect(chat.posts.map((p) => p.text)).toEqual(['🎙 Come over send me a copy Now']));
+    await worker.post('ended');
+    worker.close();
   });
 
   it('plays an older-tagged reply as the latest stored turn using its production time', async () => {

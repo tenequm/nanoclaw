@@ -558,10 +558,11 @@ export function createVoiceModeAdapter(config: VoiceModeConfig): VoiceModeChanne
     if (parsed === null) return reply(res, 404, 'Not found');
     const route = parsed;
     try {
+      // A hung-up call's worker still posts its draft's last finals while teardown waits for it.
+      if (setup && route.startsWith('livekit/agent/')) return await livekit.handleAgentHttp(req, res, route, url);
       // The shared webhook server has no unregister; after teardown the routes stay reachable
       // and must refuse rather than start calls for a channel that is no longer running.
       if (!connected || !setup) return reply(res, 503, 'Voice is not running');
-      if (route.startsWith('livekit/agent/')) return await livekit.handleAgentHttp(req, res, route, url);
       if (route === 'livekit' || route.startsWith('livekit/')) return await callPage.handle(req, res, route, url);
       if (route === 'info') {
         // Who answers this line, so the page can greet by name before the call.
@@ -809,6 +810,7 @@ registerChannelAdapter(VOICE_MODE_CHANNEL, {
       'VOICE_MODE_JEV_OVERLAP_VERDICT',
       'VOICE_MODE_JEV_SPEECH_GATE',
       'VOICE_MODE_JEV_DUCK',
+      'VOICE_MODE_JEV_COMMANDS',
       'VOICE_MODE_WAKE_MODEL',
       'VOICE_MODE_WAKE_PHRASE',
       ...RECALL_MEET_ENV_KEYS,
@@ -855,6 +857,7 @@ registerChannelAdapter(VOICE_MODE_CHANNEL, {
         jevOverlapVerdict: !['0', 'false'].includes(env.VOICE_MODE_JEV_OVERLAP_VERDICT ?? ''),
         jevSpeechGate: !['0', 'false'].includes(env.VOICE_MODE_JEV_SPEECH_GATE ?? ''),
         jevDuck: ['1', 'true'].includes(env.VOICE_MODE_JEV_DUCK ?? ''),
+        jevCommands: ['1', 'true'].includes(env.VOICE_MODE_JEV_COMMANDS ?? ''),
         autoCreate: env.LIVEKIT_AUTO_CREATE === '1',
         apiKey: env.LIVEKIT_API_KEY,
         apiSecret: env.LIVEKIT_API_SECRET,

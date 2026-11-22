@@ -10,8 +10,8 @@
  * its VAD marks (the meeting's mixed audio) are logged, never a boundary.
  *
  * On a jev call the host pushes the worker only what the core says to: a `reply` (with its `replyId`)
- * for `speak`, a `revoke` for `revoke`, a `stop` for `stop_playback`, and on a voice call each `status`
- * and the answer to each of the worker's `overlap` requests.
+ * for `speak`, a `revoke` for `revoke`, a `stop` for `stop_playback`, and on a voice call each `status`,
+ * each spoken command's `cue` and the answer to each of the worker's `overlap` requests.
  * `show` and `drop` push nothing: the agent's message is
  * already in the call chat, since a reply reaches this module from the post-delivery hook.
  */
@@ -50,7 +50,11 @@ export interface JevCallHost {
   jevOverlapVerdict?: boolean;
   /** The worker lowers the line's gain during a barge-in instead of pausing it. */
   jevDuck?: boolean;
+  /** Spoken send and discard outside listening mode on a voice call (VOICE_MODE_JEV_COMMANDS); off when left out. */
+  jevCommands?: boolean;
   callerName: string;
+  /** Save unreleased words to this call's thread. */
+  postCaller?(text: string): void;
   agentName: string;
   /** Other names the agent goes by (the vocabulary file's wake names). */
   agentAliases: readonly string[];
@@ -81,6 +85,10 @@ export interface JevCall {
   words(): void;
   /** An agent message for this call: `turnId` is the turn it answers, null when unprompted. */
   reply(text: string, turnId: string | null, produced?: SessionStamp): void;
+  /** Holds the draft for transcripts already in transit when the caller hung up. */
+  drainDraft(): boolean;
+  /** Close transcript input and wait for explicit turns already released. */
+  finishDraft(): Promise<void> | undefined;
   end(reason: string): void;
 }
 
@@ -90,12 +98,16 @@ export function createJevCall(host: JevCallHost, deps: Partial<JevDeps> = {}): J
   const recheck = deps.recheck ?? askStillWanted;
   const kind = host.kind ?? 'voice';
   const judgeOverlap = kind === 'voice' && host.jevOverlapVerdict !== false;
-  const policy = policyFor(kind, host.agentName, [...host.agentAliases]);
+  const commands = kind === 'voice' && host.jevCommands === true;
+  const policy = policyFor(kind, host.agentName, [...host.agentAliases], commands);
   const ingress = createWorkerIngress({ name: host.callerName }, host.maxTextBytes);
   let replies = 0;
   const fields = { callId: host.callId };
   const overlapQuestion = judgeOverlap ? (host.jevDuck ? 'ducked' : 'paused') : undefined;
-  log.info('meet-jev: questions', { ...fields, questions: judgeQuestions(host.agentName, overlapQuestion) });
+  log.info('meet-jev: questions', {
+    ...fields,
+    questions: judgeQuestions(host.agentName, overlapQuestion, commands),
+  });
   const judgedAt: number[] = [];
   const overlapsAt: number[] = [];
   /** Lines the worker reported started and not yet over: `words` reaches it only while one plays. */
@@ -161,8 +173,8 @@ export function createJevCall(host: JevCallHost, deps: Partial<JevDeps> = {}): J
       }
       if (!signal.aborted) host.push({ type: 'overlap', requestId, verdict, ...(reason ? { reason } : {}) });
     },
-    judge: async (state, signal, windowVersion) => {
-      if (!capped()) return judge(state, { signal, ...fields, windowVersion });
+    judge: async (state, signal, windowVersion, discardLine) => {
+      if (!capped()) return judge(state, { signal, ...fields, windowVersion, commands, discardLine });
       log.warn('meet-jev: Jev rate cap reached, judged without Jev', { ...fields, perMinute: MAX_JUDGES_PER_MINUTE });
       log.info('meet-jev: judge', {
         ...fields,
@@ -196,6 +208,11 @@ export function createJevCall(host: JevCallHost, deps: Partial<JevDeps> = {}): J
       });
       return { verdict: null, ms: 0 };
     },
+    // A voice call's worker plays it; a meeting has no cues.
+    cue: (cue) => {
+      if (kind === 'voice') host.push({ type: 'cue', cue });
+    },
+    postCaller: host.postCaller,
     turn: ({ message, note }, signal) => host.submitTurn(message, note, signal),
     speak: (replyId, text, turn) => {
       host.push({ type: 'reply', text, turn, replyId });
@@ -253,6 +270,15 @@ export function createJevCall(host: JevCallHost, deps: Partial<JevDeps> = {}): J
     },
     reply(text, turnId, produced) {
       runtime.feed({ kind: 'reply', replyId: `r${++replies}`, turnId, text, produced, at: host.now() });
+    },
+    drainDraft() {
+      if (!runtime.hasListenDraft) return false;
+      runtime.feed({ kind: 'hangup', draining: true, at: host.now() });
+      return true;
+    },
+    finishDraft() {
+      runtime.feed({ kind: 'hangup', at: host.now() });
+      return runtime.turnsSettled();
     },
     end: (reason) => runtime.end(reason),
   };

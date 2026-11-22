@@ -204,6 +204,50 @@ describe('createJevCall', () => {
     call.end('done');
   });
 
+  it.each([
+    ['voice', true, true, [[{ type: 'cue', cue: 'nope' }]]],
+    // Off, only listening mode's cues reach the worker; the Jev request is main's.
+    ['voice', undefined, false, [[{ type: 'cue', cue: 'nope' }]]],
+    ['meet', true, false, []],
+  ] as const)(
+    'asks Jev with the spoken commands on a %s call with VOICE_MODE_JEV_COMMANDS %s: %s; cues reach a voice worker',
+    async (kind, jevCommands, commands, cues) => {
+      const push = vi.fn();
+      const judge = vi.fn(async () => ({ verdict: null, ms: 1 }));
+      const core: CallCore<null> = {
+        initial: () => null,
+        reduce: () => null,
+        decide: (_state, event) =>
+          event.kind === 'reply'
+            ? [
+                { kind: 'cue', cue: 'nope' },
+                { kind: 'judge', windowVersion: 1, state: {} as never, discardLine: 'Andy, scratch that.' },
+              ]
+            : [],
+      };
+      const call = createJevCall(
+        {
+          callId: 'c1',
+          kind,
+          jevCommands,
+          callerName: 'Ethan',
+          agentName: 'Andy',
+          agentAliases: [],
+          maxTextBytes: 4096,
+          submitTurn: async () => ({ ok: false, reason: 'test' }),
+          push,
+          now: () => 1_000_000,
+        },
+        { core, judge },
+      );
+      call.reply('Hello.', null);
+      await flush();
+      expect(judge).toHaveBeenCalledWith({}, expect.objectContaining({ commands, discardLine: 'Andy, scratch that.' }));
+      expect(push.mock.calls.filter(([event]) => event.type === 'cue')).toEqual(cues);
+      call.end('test');
+    },
+  );
+
   it('logs both question texts once per call', async () => {
     vi.mocked(log.info).mockClear();
     const { call, say } = jevCall();

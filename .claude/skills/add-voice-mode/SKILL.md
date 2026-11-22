@@ -315,14 +315,41 @@ line to the wake phrase and send word until the caller sends `/voice` (or
 returns the line to jev. A client's `?jev=0` on `livekit/token` makes one call
 plain, and `?jev=1` one jev call. Without the key every call is plain.
 
+On a Jev voice call, enable **Listen until over** to dictate across pauses.
+The agent waits for a send word, the same words and rules as auto mode's:
+`zulu` or `прийом` at the end of an utterance (in either script), `copy` or
+`copy that` only as their own sentence. It receives one message with the
+marker removed. A marker alone releases a pending draft
+and is silent when the draft is empty. Switching the mode off sends the draft
+once the utterance being said ends.
+At call end, unfinished words are posted to the caller's thread unless access
+was revoked. At hangup the worker waits up to 3 s for outstanding finals, so a
+marker said just before it still sends the turn.
+Replies are spoken and the caller can interrupt them or say
+`stop`. Typing, the working indicator and the end-of-turn cue stay silent.
+The mode starts off on each call. Meetings use their usual Jev policy.
+
+Outside listening mode the spoken commands are experimental and off by
+default: with `VOICE_MODE_JEV_COMMANDS=1`, Jev is also offered `send` (a send
+word ends the turn now) and `discard` (a discard phrase drops the words not
+sent yet, or takes back an answer on its way), and the call plays their cues.
+Off, a Jev voice call outside listening mode decides as before the commands
+existed: the same four-option request, no command cues. Listening mode's
+release and discard work either way.
+
+Jev app calls advertise commands version `3`. The app sends `listenUntilOver`
+with its settings and shows the toggle when the reply contains both the current
+boolean and the display list `overWords` (the send words, `zulu` first).
+Omitting the switch keeps its value.
+
 If the speaker who prompted an answer continues before playback, the host holds
 the reply's first audio through their final transcript; one that never comes
 counts as heard so far once the boundary timer fires. Jev judges the original
 request and the continuation together. An answer replaces the pending turn, a
 stop drops it, and an acknowledgement alone releases the original answer. When
-Jev chooses silence the answer is released after a few seconds of quiet, and
-when Jev fails at once; either way it goes through the usual answer-ready
-check. The worker synthesizes a held reply meanwhile. Before its first audio,
+Jev chooses silence, or nothing new is left to judge (a cough, words held over
+a playing line), the answer is released after a few seconds of quiet, and when
+Jev fails at once; either way it goes through the usual answer-ready check. The worker synthesizes a held reply meanwhile. Before its first audio,
 each queued line waits for the host to confirm it can play. Fresh caller
 speech invalidates that confirmation.
 
@@ -481,6 +508,7 @@ fake LiveKit/Gemini boundaries and cannot prove the microphone or media route.
 | `VOICE_MODE_JEV_OVERLAP_VERDICT`                                | on                                     | `0` or `false` disables Jev barge-in decisions for new Jev voice calls.                                                                                                                                                                                                                                                                                                                                                 |
 | `VOICE_MODE_JEV_SPEECH_GATE`                                    | on                                     | `0` or `false` lets caller words on new Jev voice calls through without Silero's evidence of real speech.                                                                                                                                                                                                                                                                                                               |
 | `VOICE_MODE_JEV_DUCK`                                           | off                                    | `1` or `true` lowers speech gain during a barge-in on new Jev voice calls.                                                                                                                                                                                                                                                                                                                                              |
+| `VOICE_MODE_JEV_COMMANDS`                                       | off                                    | `1` or `true` acts on spoken send and discard outside listening mode on new Jev voice calls (experimental).                                                                                                                                                                                                                                                                                                             |
 | `VOICE_MODE_RECORDINGS_DAYS`                                    | `0`                                    | Optional private caller/reply recordings in `data/voice-recordings`: one file per turn on a plain call, one per utterance on a jev call (those with no transcript included), and each spoken reply. Meetings record nothing.                                                                                                                                                                                            |
 | `VOICE_MODE_CALL_RECORDING`                                     | off                                    | Debug: `true` or `1` also records each caller's whole call, waiting for the wake phrase included, as `data/voice-recordings/<agent>/<date>/<callId>-call.wav` (16 kHz mono; a plain call keeps the agent's speech as silence, a jev call keeps the caller's audio throughout) with a `.json` of wake detections. Local only, owner-only files; pruned by `VOICE_MODE_RECORDINGS_DAYS` when that is set, kept otherwise. |
 | `RECALL_API_KEY`                                                | none                                   | Recall.ai API key; `/meet` is off without it, or with the two URLs below missing or invalid.                                                                                                                                                                                                                                                                                                                            |

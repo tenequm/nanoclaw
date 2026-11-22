@@ -96,6 +96,8 @@ export interface LiveKitJobMetadata {
   callerIdentity: string;
   /** The host confirms each Jev reply immediately before its first audio. */
   confirmPlayout?: true;
+  /** Jev voice calls supporting explicit turn release: OVER_WORDS, in display order. */
+  overWords?: string[];
   /** A call started through the app API. */
   appCall?: boolean;
   /** Spelling hints for the transcription: VOICE_MODE_VOCABULARY plus the agent's voice.vocabulary.txt. */
@@ -134,6 +136,10 @@ export interface LiveKitJobMetadata {
  * on `/voice jev` everything heard is the caller.
  */
 export type JevWorkerEvent =
+  /** The worker is finishing its outstanding transcriptions. */
+  | { type: 'hangup'; at: number }
+  /** Ordered with speech so both ends apply the setting at the same boundary. */
+  | { type: 'listen'; on: boolean; at: number }
   /** Words heard: partials of one `uttId` update it, its final replaces it. */
   | { type: 'utterance'; uttId: string; text: string; final: boolean; contextOnly?: true; at: number }
   | { type: 'overlap'; requestId: string; replyId: string; played: string; text: string; at: number }
@@ -335,6 +341,14 @@ export const CALL_COMMAND_WORDS: CallCommandWords = {
   discard: [{ say: 'scratch that', hint: true }, { say: 'discard turn' }, { say: 'discard this turn' }],
 };
 /**
+ * Listen until over's release words as the app shows them (it quotes the first): the send words,
+ * the `hint` ones first. The jev loop releases a draft on the same words by the same rules.
+ */
+export const OVER_WORDS: readonly string[] = [
+  ...CALL_COMMAND_WORDS.send.filter((word) => word.hint),
+  ...CALL_COMMAND_WORDS.send.filter((word) => !word.hint),
+].map((word) => word.say);
+/**
  * The worker's participant attribute with CALL_COMMAND_WORDS as compact JSON, set with
  * CALL_COMMANDS_ATTRIBUTE.
  */
@@ -412,6 +426,8 @@ export interface CallReviewState {
 
 /** `gen` is the page's own operation counter, echoed back; `draft` names the draft an operation is for. */
 export interface ReviewRequest {
+  /** Jev voice settings only. Omission preserves the current mode. */
+  listenUntilOver?: boolean;
   gen: number;
   draft?: number;
   /** For `mode`: the mode to switch to; absent, the worker only sends its state again. */
@@ -434,6 +450,14 @@ export interface ReviewRequest {
  * to review, a turn auto mode had already sent after `afterTurn`. `error`: why nothing happened.
  */
 export interface ReviewReply {
+  /** Together with overWords, confirms support for explicit release. */
+  listenUntilOver?: boolean;
+  /** The call's release words in display order (OVER_WORDS). */
+  overWords?: string[];
+  /** Current sound cue preference. */
+  cues?: boolean;
+  /** Current typing sound preference. */
+  typing?: boolean;
   gen: number;
   ok: boolean;
   seq: number;
@@ -523,6 +547,13 @@ export const CALL_END_REASONS = [
 ] as const;
 export type CallEndReason = (typeof CALL_END_REASONS)[number];
 
+/** The cues a jev voice call's host asks its worker to play (the worker's `CueKind`s of the same names). */
+export const JEV_COMMAND_CUES = ['sent', 'discard', 'nope'] as const;
+export type JevCommandCue = (typeof JEV_COMMAND_CUES)[number];
+
+/** Why the host answers an overlap request without a verdict. */
+export type OverlapFallback = 'cap' | 'error' | 'mid_band' | 'not_playing' | 'off';
+
 /**
  * One line of the host-to-worker event stream: a complete agent message to
  * speak (`turn`: the host's utterance id of the caller turn it answers, null
@@ -541,11 +572,9 @@ export type CallEndReason = (typeof CALL_END_REASONS)[number];
  * already playing plays on unless the reflex paused it, which cuts it); `words` says a participant's
  * words beyond acknowledgements arrived (`takesTurn`), the reflex's text confirmation where the
  * worker has no transcript of its own. A jev voice call also gets the loop's
- * `status` and the agent's `thinking` ticks, which its worker plays its cues and typing sound from.
+ * `status`, the agent's `thinking` ticks and each spoken command's `cue`, which its worker plays its
+ * cues and typing sound from.
  */
-/** Why the host answers an overlap request without a verdict. */
-export type OverlapFallback = 'cap' | 'error' | 'mid_band' | 'not_playing' | 'off';
-
 export type LiveKitHostEvent =
   | { type: 'reply'; text: string; turn?: string | null; replyId?: string }
   | { type: 'stop' }
@@ -559,6 +588,11 @@ export type LiveKitHostEvent =
   | { type: 'working' }
   /** A jev voice call's state as the host's loop sees it: the worker plays its cues from it. */
   | { type: 'status'; status: 'heard' | 'thinking' | 'speaking' | 'idle' }
+  /**
+   * A jev voice call's spoken command, as the host's loop acted on it: `sent` as a turn goes out on a send word,
+   * `discard` when a discard dropped words, `nope` when the command had nothing to act on.
+   */
+  | { type: 'cue'; cue: JevCommandCue }
   | { type: 'chat'; chat: boolean }
   | { type: 'turn-stored'; turnKey: string; id: string }
   | { type: 'end'; reason: string }

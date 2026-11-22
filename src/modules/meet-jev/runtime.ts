@@ -13,6 +13,7 @@ import type {
   CallPolicy,
   CallStatus,
   Command,
+  CommandCue,
   JevState,
   RecheckState,
   RecheckVerdict,
@@ -26,8 +27,16 @@ export type JevTurnResult = { ok: true; turnId: string; stored?: SessionStamp } 
 export interface RuntimePorts {
   overlap(command: Extract<Command, { kind: 'overlap' }>, signal: AbortSignal): Promise<void>;
   now(): number;
-  /** Never rejects in practice (askAction answers null on any failure); a rejection counts as a null verdict. */
-  judge(state: JevState, signal: AbortSignal, windowVersion: number): Promise<{ verdict: Verdict | null; ms: number }>;
+  /**
+   * Never rejects in practice (askAction answers null on any failure); a rejection counts as a null verdict.
+   * `discardLine`: the judge command's, the caller's line Jev's `new_words` question is about.
+   */
+  judge(
+    state: JevState,
+    signal: AbortSignal,
+    windowVersion: number,
+    discardLine?: string,
+  ): Promise<{ verdict: Verdict | null; ms: number }>;
   /** The answer-ready check; never rejects in practice either, and a rejection counts as a null verdict. */
   recheck(
     state: RecheckState,
@@ -42,7 +51,10 @@ export interface RuntimePorts {
   drop(replyId: string): void;
   revoke(replyId: string): void;
   stopPlayback(): void;
+  postCaller?(text: string): void;
   status(status: CallStatus): void;
+  /** A spoken command's cue; a call without cues leaves it out. */
+  cue?(cue: CommandCue): void;
   log(event: string, fields: Record<string, unknown>): void;
   /** Every event as it is processed, numbered from 1: the call's replayable log. */
   record(seq: number, event: CallEvent): void;
@@ -52,6 +64,10 @@ export interface CallRuntime {
   feed(event: CallEvent): void;
   /** Stops processing, clears every timer, aborts what is in flight; idempotent. */
   end(reason: string): void;
+  /** The reducer is collecting a draft or settling a toggle-off. */
+  readonly hasListenDraft: boolean;
+  /** Resolves when the last released turn has finished routing. */
+  turnsSettled(): Promise<void> | undefined;
   readonly ended: boolean;
 }
 
@@ -66,6 +82,8 @@ interface PendingTurn {
   message: string;
   note: string;
   abort: AbortController;
+  /** Aborted by a newer turn: its failure is reported as `superseded`, whatever the host answered. */
+  superseded?: true;
 }
 
 export function createCallRuntime<S>(core: CallCore<S>, policy: CallPolicy, ports: RuntimePorts): CallRuntime {
@@ -79,6 +97,8 @@ export function createCallRuntime<S>(core: CallCore<S>, policy: CallPolicy, port
   const judges = new Set<AbortController>();
   const rechecks = new Set<AbortController>();
   const turnQueue: PendingTurn[] = [];
+  let notifyTurnsSettled: (() => void) | undefined;
+  let turnsSettled: Promise<void> | undefined;
   let turnInFlight: PendingTurn | null = null;
 
   const enqueue = (item: Queued): void => {
@@ -142,8 +162,10 @@ export function createCallRuntime<S>(core: CallCore<S>, policy: CallPolicy, port
       }
       case 'status':
         return ports.status(command.status);
+      case 'cue':
+        return ports.cue?.(command.cue);
       case 'judge':
-        return judge(command.windowVersion, command.state);
+        return judge(command.windowVersion, command.state, command.discardLine);
       case 'recheck':
         return recheck(command.wakeKey, command.state, command.windowVersion);
       case 'wait':
@@ -152,6 +174,8 @@ export function createCallRuntime<S>(core: CallCore<S>, policy: CallPolicy, port
         clearTimeout(timers.get(command.key)?.handle);
         timers.delete(command.key);
         return;
+      case 'post_caller':
+        return ports.postCaller?.(command.text);
       case 'turn':
         return turn(command);
       case 'speak':
@@ -172,13 +196,13 @@ export function createCallRuntime<S>(core: CallCore<S>, policy: CallPolicy, port
   };
 
   /** Only the newest window's verdict can be acted on, so a new judge aborts the ones in flight. */
-  const judge = (windowVersion: number, jevState: JevState): void => {
+  const judge = (windowVersion: number, jevState: JevState, discardLine?: string): void => {
     for (const inFlight of judges) inFlight.abort();
     judges.clear();
     const abort = new AbortController();
     judges.add(abort);
     void Promise.resolve()
-      .then(() => ports.judge(jevState, abort.signal, windowVersion))
+      .then(() => ports.judge(jevState, abort.signal, windowVersion, discardLine))
       .catch(() => ({ verdict: null, ms: 0 }))
       .then(({ verdict, ms }) => {
         judges.delete(abort);
@@ -226,6 +250,7 @@ export function createCallRuntime<S>(core: CallCore<S>, policy: CallPolicy, port
         turnQueue.splice(queued, 1);
         enqueue({ event: { kind: 'turn_failed', key: replaced, reason: 'superseded', at: ports.now() } });
       } else if (turnInFlight?.key === replaced) {
+        turnInFlight.superseded = true;
         turnInFlight.abort.abort();
       }
     }
@@ -237,7 +262,12 @@ export function createCallRuntime<S>(core: CallCore<S>, policy: CallPolicy, port
   const pumpTurns = (): void => {
     if (turnInFlight || ended) return;
     const next = turnQueue.shift();
-    if (!next) return;
+    if (!next) {
+      notifyTurnsSettled?.();
+      notifyTurnsSettled = undefined;
+      turnsSettled = undefined;
+      return;
+    }
     turnInFlight = next;
     void Promise.resolve()
       .then(() => ports.turn({ message: next.message, note: next.note }, next.abort.signal))
@@ -248,7 +278,7 @@ export function createCallRuntime<S>(core: CallCore<S>, policy: CallPolicy, port
         enqueue({
           event: result.ok
             ? { kind: 'turn', key: next.key, turnId: result.turnId, stored: result.stored, at }
-            : { kind: 'turn_failed', key: next.key, reason: result.reason, at },
+            : { kind: 'turn_failed', key: next.key, reason: next.superseded ? 'superseded' : result.reason, at },
         });
         pumpTurns();
       });
@@ -256,6 +286,15 @@ export function createCallRuntime<S>(core: CallCore<S>, policy: CallPolicy, port
 
   return {
     feed: (event) => enqueue({ event }),
+    get hasListenDraft() {
+      return !ended && !!core.hasListenDraft?.(state);
+    },
+    turnsSettled() {
+      if (!turnInFlight) return undefined;
+      return (turnsSettled ??= new Promise<void>((resolve) => {
+        notifyTurnsSettled = resolve;
+      }));
+    },
     end(reason) {
       if (ended) return;
       ended = true;
@@ -268,6 +307,7 @@ export function createCallRuntime<S>(core: CallCore<S>, policy: CallPolicy, port
       turnInFlight?.abort.abort();
       for (const pending of turnQueue) pending.abort.abort();
       turnQueue.length = 0;
+      notifyTurnsSettled?.();
       safely('log', () => ports.log('call_end', { reason, events: seq }));
     },
     get ended() {

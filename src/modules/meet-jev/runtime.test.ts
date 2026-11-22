@@ -163,6 +163,30 @@ describe('createCallRuntime', () => {
     await vi.waitFor(() => expect(core.seen.at(-1)).toMatchObject({ kind: 'verdict', windowVersion: 7, ms: 412 }));
   });
 
+  it("hands the judge command's discard line to the judge port", async () => {
+    const asked: Array<string | undefined> = [];
+    const { ports } = fakePorts({
+      judge: async (_state, _signal, _version, discardLine) => {
+        asked.push(discardLine);
+        return { verdict: null, ms: 0 };
+      },
+    });
+    const core = scriptedCore((event) =>
+      event.kind === 'utterance' && event.text === 'a'
+        ? [{ kind: 'judge', windowVersion: 1, state: STATE, discardLine: 'Dan, scratch that.' }]
+        : event.kind === 'utterance'
+          ? [{ kind: 'judge', windowVersion: 2, state: STATE }]
+          : [],
+    );
+    const runtime = createCallRuntime(core, POLICY, ports);
+    runtime.feed(utt('a'));
+    await flush();
+    runtime.feed(utt('b'));
+    await flush();
+    expect(asked).toEqual(['Dan, scratch that.', undefined]);
+    runtime.end('test');
+  });
+
   it('aborts the judges in flight when a newer one starts', async () => {
     const { ports, judges } = fakePorts();
     let version = 0;
@@ -258,6 +282,10 @@ describe('createCallRuntime', () => {
     });
     turns[0].resolve({ ok: false, reason: '409: The turn was superseded' });
     await vi.waitFor(() => expect(turns.map((t) => t.message)).toEqual(['one', 'three']));
+    // The aborted turn reports `superseded` too, not the host's refusal: the core keeps its words only once.
+    expect(core.seen.filter((e) => e.kind === 'turn_failed' && e.key === 'k-one')).toEqual([
+      { kind: 'turn_failed', key: 'k-one', reason: 'superseded', at: expect.any(Number) },
+    ]);
   });
 
   it('keeps running after the core or a port throws', () => {

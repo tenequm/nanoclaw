@@ -19,6 +19,7 @@ vi.mock('../../config.js', async () => {
   };
 });
 
+import { CALL_COMMAND_WORDS } from '../../channels/voice-mode-protocol.js';
 import { log } from '../../log.js';
 import type { JevState } from './core/types.js';
 import { askAction, askOverlap, askStillWanted, judgeQuestions, parseAction, parseStillWanted } from './judge.js';
@@ -536,5 +537,112 @@ describe('the request to Jev', () => {
 
   it('names every question it can ask, as Jev gets them', () => {
     expect(judgeQuestions('Dan')).toStrictEqual({ ...pinnedActionQuestions, ...pinnedStillWantedQuestions });
+  });
+
+  it("offers a voice call's spoken commands, their words from the command table, and keeps the rest", async () => {
+    const fetchMock = respond({});
+    await askAction(state, { commands: true });
+    const sent = JSON.parse((fetchMock.mock.calls[0] as [string, RequestInit])[1].body as string);
+    const criteria = sent.questions.action.criteria as Record<string, { what: string; not_for: string }>;
+    const pinned = pinnedActionQuestions.action.criteria;
+    expect(Object.keys(criteria)).toEqual(['answer', 'stay_silent', 'stop', 'continue', 'send', 'discard']);
+    expect(sent.questions.action.instructions).toBe(pinnedActionQuestions.action.instructions);
+    expect({ stop: criteria.stop, continue: criteria.continue }).toStrictEqual({
+      stop: pinned.stop,
+      continue: pinned.continue,
+    });
+    const bare = ` A spoken command alone ("zulu", "copy", "copy that", "прийом", "scratch that", "discard turn", "discard this turn") is no question or request to Dan: that is send or discard.`;
+    for (const option of ['answer', 'stay_silent'] as const) {
+      expect(criteria[option]).toStrictEqual({ what: pinned[option].what, not_for: pinned[option].not_for + bare });
+    }
+    for (const { say } of CALL_COMMAND_WORDS.send) expect(criteria.send.what).toContain(`"${say}"`);
+    for (const { say } of CALL_COMMAND_WORDS.discard) expect(criteria.discard.what).toContain(`"${say}"`);
+    expect(criteria.send.not_for).toContain('"send me a copy"');
+    expect(criteria.discard.not_for).toContain('scratch that idea');
+    // Which answer still plays is the reducer's; Jev reads a take-back, which an "answer still comes" made it doubt.
+    expect(criteria.discard.what).toContain('an answer Dan has not started saying is no longer wanted');
+    expect(judgeQuestions('Dan', undefined, true).action).toStrictEqual(sent.questions.action);
+  });
+
+  it("asks a voice call's new_words Noul about the discard line the reducer names, quoted, beside the shadows", async () => {
+    const said = {
+      ...state,
+      latest: { speaker: 'Misha', text: 'Book a table for eight tonight. Dan, scratch that.' },
+      window: [
+        { t: 3.4, speaker: 'Misha', text: 'Book a table for eight tonight.' },
+        { t: 1.1, speaker: 'Misha', text: 'Dan, scratch that.' },
+        { t: 0.2, speaker: 'Misha', text: '', partial: true as const },
+      ],
+    };
+    const fetchMock = respond({});
+    await askAction(said, { commands: true, discardLine: 'Dan, scratch that.' });
+    const sent = JSON.parse((fetchMock.mock.calls[0] as [string, RequestInit])[1].body as string);
+    expect(sent.state).toEqual(said);
+    expect(Object.keys(sent.questions)).toEqual([
+      'action',
+      'wants_reply_now',
+      'for_someone_else',
+      'unfinished',
+      'already_answered',
+      'new_words',
+    ]);
+    const { new_words: noul } = sent.questions;
+    expect(noul.type).toBe('noul');
+    expect(noul.instructions).toMatch(/^The caller's newest line is "Dan, scratch that\."\. /);
+    for (const { say } of CALL_COMMAND_WORDS.discard) expect(noul.instructions).toContain(`"${say}"`);
+    expect(noul.criteria.true).toContain('Забронюй');
+    expect(noul.criteria.false).toContain('"Dan, scratch that"');
+    const template = judgeQuestions('Dan', undefined, true).new_words;
+    expect({
+      ...template,
+      instructions: template.instructions.replace('"{the caller\'s newest line}"', '"Dan, scratch that."'),
+    }).toStrictEqual(noul);
+    expect(judgeQuestions('Dan')).not.toHaveProperty('new_words');
+  });
+
+  it('asks no new_words without a discard line: the voice request is the action Choice and the shadows alone', async () => {
+    const fetchMock = respond({});
+    await askAction(state, { commands: true });
+    const sent = JSON.parse((fetchMock.mock.calls[0] as [string, RequestInit])[1].body as string);
+    const { new_words: _template, still_wanted: _recheck, ...asked } = judgeQuestions('Dan', undefined, true);
+    expect(sent.questions).toStrictEqual(asked);
+  });
+
+  it("sends main's four-option request on a voice call with the spoken commands off, even with a discard line", async () => {
+    const fetchMock = respond({});
+    await askAction(state, { commands: false, discardLine: 'Dan, scratch that.' });
+    expect(JSON.parse((fetchMock.mock.calls[0] as [string, RequestInit])[1].body as string)).toStrictEqual({
+      state,
+      model: 'jev-1.14',
+      questions: pinnedActionQuestions,
+    });
+  });
+
+  it.each([
+    ['a well-formed Noul', { type: 'noul', noul: 0.04 }, 0.04],
+    ['no Noul', undefined, undefined],
+    ['a malformed Noul', { type: 'noul', noul: 1.4 }, undefined],
+    ['a Choice in its place', choice, undefined],
+  ])("reads the new-words answer from %s into a voice call's verdict", async (_label, newWords, expected) => {
+    const probabilities = { answer: 0.03, stay_silent: 0.05, stop: 0.12, continue: 0, send: 0, discard: 0.8 };
+    respond({ answers: { action: { ...choice, choice: 'discard', probabilities }, new_words: newWords } });
+    const { verdict } = await askAction(state, { commands: true, discardLine: 'Dan, scratch that.' });
+    expect(verdict).toEqual({
+      action: 'discard',
+      probabilities,
+      confidence: 0.72,
+      ...(expected === undefined ? {} : { newWords: expected }),
+    });
+    expect(vi.mocked(log.info).mock.calls[0][1]).toMatchObject({ new_words: newWords ?? null });
+  });
+
+  it("reads a voice call's verdict over all six options", async () => {
+    const probabilities = { answer: 0.05, stay_silent: 0.05, stop: 0, continue: 0, send: 0.85, discard: 0.05 };
+    respond({ answers: { action: { ...choice, choice: 'send', probabilities } } });
+    expect((await askAction(state, { commands: true })).verdict).toEqual({
+      action: 'send',
+      probabilities,
+      confidence: 0.72,
+    });
   });
 });

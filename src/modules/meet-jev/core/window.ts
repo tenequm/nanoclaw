@@ -7,6 +7,7 @@ import type {
   CallEvent,
   CallPolicy,
   Command,
+  CommandAction,
   JevLine,
   JevState,
   RecheckAction,
@@ -22,6 +23,8 @@ export interface Utterance {
   contextOnly?: boolean;
   startedAt: number;
   at: number;
+  /** The text Jev heard only lead into the discard phrase it ends with ("Dan, scratch that"): no words to drop. */
+  leadIn?: string;
 }
 
 /** An agent line and how the caller received it. */
@@ -50,6 +53,8 @@ export interface SpeakerState {
   speeches: number;
   /** The speech start whose utterance was seen during that speech; null before any. */
   claimed: number | null;
+  /** Latest VAD activity still awaiting a final, including speech that began before explicit release was enabled. */
+  pendingSpeech?: { uttId: string; startedAt: number };
   /** Utterances that started at or before this belong to a closed turn: answered, or a stop. */
   closedAt: number;
 }
@@ -80,6 +85,12 @@ export interface Wake {
   started?: boolean;
   /** The speaker is finishing the pending turn: its lines get no playback grant until that turn's boundary decides. */
   continuation?: true;
+  /** The merged turn a verdict during the hold found needs no new answer: a wordless piece leaving it asks nothing. */
+  judged?: string;
+  /** When the hold is released at the latest without a new verdict (`now` clock). */
+  holdUntil?: number;
+  /** Sent from a listen-until-over draft: its words exist nowhere else if the agent never takes them. */
+  fromDraft?: true;
   /** The utterance it answers and when that started: people speaking after it make a landed answer rechecked. */
   trigger: string;
   triggerAt: number;
@@ -93,7 +104,8 @@ export interface Recheck {
   wakeKey: string;
   /** `utterancesSince` the trigger when the check was asked. */
   since: number;
-  replies: { replyId: string; text: string }[];
+  /** `queued`: taken from playout by a release; once its line left playout, the verdict has nothing to do for it. */
+  replies: { replyId: string; text: string; queued?: true }[];
 }
 
 /** The `judge` in flight: one at a time, the newest boundary's. */
@@ -106,9 +118,30 @@ export interface Judging {
   addressedByName: boolean;
   seq: number;
   retried: boolean;
+  /** The piece the judge's `discardLine` quotes, as quoted: Jev's `newWords` is about it, whatever piece is judged. */
+  discard?: { uttId: string; text: string };
+}
+
+export interface ListenPiece {
+  speakerId: string;
+  uttId: string;
+  text: string;
+  final: boolean;
+  startedAt: number;
+  interrupted: boolean;
+  /** A timer will settle this activity if its final is lost. */
+  settling?: true;
+  /** The piece ends with a spoken command: `send` releases the draft through it, `discard` drops it. */
+  command?: CommandAction;
 }
 
 export interface CallState {
+  /** Speech-start order, including activities whose final has yet to arrive. Null in automatic mode. */
+  listenDraft: ListenPiece[] | null;
+  /** Events for automatic mode waiting behind a toggle-off's unfinished transcriptions. */
+  afterListen?: CallEvent[];
+  /** Only in-flight input is accepted while the worker finishes. */
+  hangingUp?: true;
   policy: CallPolicy;
   /** The newest event's time; `t` in the Jev window counts back from it. */
   now: number;
@@ -124,9 +157,10 @@ export interface CallState {
   agentLines: AgentLine[];
   /**
    * Replies sent to `speak` that have not finished playing: replyId -> text, the wake, the worker's pending
-   * playback request, and `held` while the answer-ready check decides whether it plays.
+   * playback request, `held` while the answer-ready check decides whether it plays, and `granted` once its
+   * request was granted and no newer one came.
    */
-  playout: Record<string, { text: string; wakeKey: string | null; requestId?: string; held?: true }>;
+  playout: Record<string, { text: string; wakeKey: string | null; requestId?: string; held?: true; granted?: true }>;
   /** Replies a stop took out of `playout` before the host heard them start: the worker still reports them. */
   stoppedPlayout: Record<string, { text: string; wakeKey: string | null }>;
   /** The newest few wakes, oldest first. */
@@ -150,6 +184,7 @@ export interface CallState {
 export function initial(policy: CallPolicy, at: number): CallState {
   const state: CallState = {
     policy,
+    listenDraft: null,
     now: at,
     seq: 0,
     windowVersion: 0,
@@ -188,11 +223,12 @@ export const unpunctuated = (text: string): string =>
 /** Text as compared for change: case, Unicode form, punctuation and spacing aside. */
 export const comparable = (text: string): string => unpunctuated(normalize(text));
 
+export const utteranceOf = (state: CallState, speakerId: string, uttId: string): Utterance | undefined =>
+  state.utterances.find((u) => u.speakerId === speakerId && u.uttId === uttId);
+
 export function latestUtterance(state: CallState, speakerId: string): Utterance | undefined {
   const id = state.speakers[speakerId]?.lastUttId;
-  return id === null || id === undefined
-    ? undefined
-    : state.utterances.find((u) => u.speakerId === speakerId && u.uttId === id);
+  return id === null || id === undefined ? undefined : utteranceOf(state, speakerId, id);
 }
 
 /**
@@ -284,6 +320,7 @@ export function applyWindow(state: CallState, event: CallEvent): void {
     case 'utterance': {
       const speaker = touchSpeaker(state, event.speaker.id, event.speaker.name);
       speaker.lastHeardAt = event.at;
+      if (event.final && speaker.pendingSpeech?.uttId === event.uttId) delete speaker.pendingSpeech;
       const text = event.text.trim();
       if (
         event.final &&
@@ -293,7 +330,7 @@ export function applyWindow(state: CallState, event: CallEvent): void {
         event.speaker.id !== state.exchangeSpeakerId
       )
         state.exchangeSpeakerId = null;
-      const utt = state.utterances.find((u) => u.speakerId === event.speaker.id && u.uttId === event.uttId);
+      const utt = utteranceOf(state, event.speaker.id, event.uttId);
       if (utt) {
         // A late final updates its own line; it never makes an older utterance the current one again.
         utt.text = text;
@@ -325,7 +362,13 @@ export function applyWindow(state: CallState, event: CallEvent): void {
     case 'speech': {
       const speaker = touchSpeaker(state, event.speaker.id, event.speaker.name);
       if (event.on && !speaker.speaking) speaker.speeches += 1;
-      if (event.on && event.uttId && event.uttId !== speaker.lastUttId && unstartedWake(state, event.speaker.id)) {
+      if (event.on && event.uttId) speaker.pendingSpeech = { uttId: event.uttId, startedAt: event.at };
+      if (
+        event.on &&
+        event.uttId &&
+        event.uttId !== speaker.lastUttId &&
+        (state.listenDraft || unstartedWake(state, event.speaker.id))
+      ) {
         // Identify this activity before any final from an earlier transcription can arrive.
         state.utterances.push({
           speakerId: event.speaker.id,
